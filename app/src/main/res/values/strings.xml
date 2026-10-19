@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="module_name">HyperHomeAnimation</string>
-    <string name="module_description">Launcher animation tuning for HyperOS home screen.</string>
+    <string name="module_description">3D perspective tilt for the HyperOS home screen app-open animation.</string>
 </resources>

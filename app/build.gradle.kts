@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "ng.lst.hha"
     compileSdk = 37
+    ndkVersion = "30.0.14904198"
 
     defaultConfig {
         applicationId = "ng.lst.hha"
@@ -14,6 +15,17 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "1.0.0"
+
+        // The launcher is arm64-only and the native_init payload matches that ABI.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_static")
+            }
+        }
     }
 
     buildTypes {
@@ -33,6 +45,17 @@ android {
         resources {
             // Make sure the libxposed entry descriptors reach the APK untouched.
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+        // libxposed maps META-INF/xposed/native_init.list to this library name.
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 }

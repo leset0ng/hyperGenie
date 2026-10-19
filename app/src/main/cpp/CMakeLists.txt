@@ -1,0 +1,45 @@
+cmake_minimum_required(VERSION 3.22)
+
+project(hha_native LANGUAGES CXX)
+
+if(NOT ANDROID)
+    message(FATAL_ERROR "hha_native must be built with the Android NDK toolchain")
+endif()
+
+if(NOT "${ANDROID_ABI}" STREQUAL "arm64-v8a")
+    message(FATAL_ERROR "Only arm64-v8a is supported; got '${ANDROID_ABI}'")
+endif()
+
+set(HHA_SOURCES hha_native.cpp)
+set(HHA_TARGET hha_native)
+
+add_library(${HHA_TARGET} SHARED ${HHA_SOURCES})
+
+target_compile_features(${HHA_TARGET} PRIVATE cxx_std_17)
+target_compile_options(${HHA_TARGET} PRIVATE
+    -fno-exceptions
+    -fno-rtti
+    -fno-threadsafe-statics
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+    -ffunction-sections
+    -fdata-sections
+    -Wall
+    -Wextra
+    -Werror
+)
+
+target_link_options(${HHA_TARGET} PRIVATE
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map"
+    -Wl,--gc-sections
+    -Wl,--no-undefined
+    -Wl,-z,relro
+    -Wl,-z,now
+)
+
+target_link_libraries(${HHA_TARGET} PRIVATE log dl)
+
+set_target_properties(${HHA_TARGET} PROPERTIES
+    CXX_EXTENSIONS OFF
+    OUTPUT_NAME "${HHA_TARGET}"
+)

@@ -38,6 +38,11 @@ class HookEntry : XposedModule() {
         val loader = param.classLoader
         log(Log.INFO, TAG, "packageReady ${param.packageName}, installing hooks")
 
+        // Android 17 / HyperOS 4 ships the launcher without any dex, so this class
+        // never loads there and the real work happens in libhha_native.so
+        // (see META-INF/xposed/native_init.list). These Java hooks only apply to
+        // older HyperOS builds that still ship a dex-based launcher.
+
         // TODO: the class/method names below are placeholders. Verify them against the
         // target build (obfuscation changes between HyperOS releases) before hooking.
         runCatching {
