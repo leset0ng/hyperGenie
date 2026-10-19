@@ -1,0 +1,3 @@
+# Fully-qualified names of io.github.libxposed.api.XposedModule entry classes.
+# Exactly one entry class is required for hot reload support (autoHotReload=true).
+ng.lst.hha.HookEntry

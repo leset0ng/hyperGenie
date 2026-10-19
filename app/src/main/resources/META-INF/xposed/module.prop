@@ -1,0 +1,17 @@
+# libxposed module metadata (Java Properties format).
+# Read by the framework when the module app is installed / updated.
+
+# Minimum Xposed API version this module can run on.
+minApiVersion=101
+# API version this module was written against.
+targetApiVersion=102
+
+# Do not let users enable the module for apps outside META-INF/xposed/scope.list.
+staticScope=true
+
+# protected (default) swallows hooker exceptions and logs them; passthrough rethrows.
+exceptionMode=protected
+
+# API 102+: allow hot reload when the module app is updated.
+# Requires exactly one Java entry class and onHotReloading() returning true.
+autoHotReload=true
