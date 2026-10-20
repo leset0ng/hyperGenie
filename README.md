@@ -1,7 +1,7 @@
 # HyperHomeAnimation
 
 A libxposed / LSPosed API 102 module integrating the recovered iOS Genie
-content animation into the verified Android 17 / HyperOS 4 launcher.
+content animation into compatible HyperOS 4+ launchers.
 
 The module runs in **launcher + system_server only**. Target applications need no
 hooks or LSPosed scope. The former constant perspective MVP and Settings-specific
@@ -188,9 +188,19 @@ SurfaceFlinger dumps, source-footprint comparisons and module logs.
 | Build | compileSdk 37, NDK 30.0.14904198, CMake 3.22.1 |
 | Toolchain | AGP 9.4.1, Gradle 9.8.1, JDK 21 |
 
-Private native ABI use is gated to the verified ROM fingerprint. Other builds
-keep stock behavior. The module declares minSdk 29 for packaging, which does not
-mean private animation integration is supported on Android 10.
+The physical pandora / 25098PN5AC on `OS4.0.4.0.XBLCNXM` and launcher
+`RELEASE-8.01.02.8565-260918-10121010-R` also passes the runtime animation
+layout probe. After installation and reboot, both launcher hooks and the
+system-server/icon SELF renderers initialized, and real open/close/retarget
+requests reached them. This confirms activation, not visual fidelity for cold
+launches or rapid App switching.
+
+Private native integration checks HyperOS 4+ and arm64, then verifies the
+required interfaces and animation parameter layout before installing hooks.
+There is no device, fingerprint, launcher-release or exact Android API whitelist.
+Missing capabilities keep stock behavior. OS version alone does not prove that
+an OEM private ABI is compatible. The module declares minSdk 29 for packaging,
+which does not mean private animation integration is supported on Android 10.
 
 Ordinary full-screen icon launches are the implemented path. Source-free opens,
 big widgets, secure windows and non-full-screen tasks are rejected where they

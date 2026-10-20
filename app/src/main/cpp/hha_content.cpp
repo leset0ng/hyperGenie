@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// Real content-layer renderer owned by system_server on the verified ROM.
+// Real content-layer renderer owned by system_server on compatible HyperOS.
+#include "hha_compat.h"
 #include "hha_genie.h"
 #include "hha_viewport.h"
 #include "hha_renderer.h"
 
-#include <android/api-level.h>
 #include <android/choreographer.h>
 #include <android/log.h>
 #include <android/looper.h>
 #include <android/surface_control.h>
 #include <dlfcn.h>
 #include <jni.h>
-#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -31,9 +30,6 @@
 
 namespace {
 constexpr char kTag[] = "HHA.Content";
-constexpr char kFingerprint[] =
-    "Xiaomi/hongkong/hongkong:17/CP2A.260605.016/"
-    "17OS4.0.261009.103256994.QCPECN.S:user/release-keys";
 constexpr char kRegister[] =
     "_ZN7android21SurfaceComposerClient14registerShaderERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_";
 constexpr char kPost[] =
@@ -576,18 +572,7 @@ void Worker(Controller* controller) {
 bool Initialize() {
     std::lock_guard<std::mutex> lock(g_initialize_mutex);
     if (g_controller.load(std::memory_order_acquire) != nullptr) return true;
-    std::string fingerprint;
-    const prop_info* property = __system_property_find("ro.build.fingerprint");
-    if (property != nullptr) {
-        __system_property_read_callback(property,
-            [](void* context, const char*, const char* value, uint32_t) {
-                *static_cast<std::string*>(context) = value;
-            }, &fingerprint);
-    }
-    if (android_get_device_api_level() != 37 || fingerprint != kFingerprint) {
-        __android_log_print(ANDROID_LOG_WARN, kTag, "unverified ROM; content ABI disabled: %s", fingerprint.c_str());
-        return false;
-    }
+    if (!hha::CheckHyperOS(kTag)) return false;
     void* gui = dlopen("libgui.so", RTLD_NOW | RTLD_LOCAL);
     void* utils = dlopen("libutils.so", RTLD_NOW | RTLD_LOCAL);
     // A module ClassLoader has an isolated linker namespace. The public NDK
@@ -608,7 +593,7 @@ bool Initialize() {
     g_dec_strong = reinterpret_cast<StrongFn>(dlsym(utils, "_ZNK7android7RefBase9decStrongEPKv"));
     g_on_commit = reinterpret_cast<CommitFn>(dlsym(platform, "ASurfaceTransaction_setOnCommit"));
     if (!reg || !g_post || !g_border || !g_layer_id || !g_inc_strong || !g_dec_strong || !g_on_commit) {
-        __android_log_print(ANDROID_LOG_WARN, kTag, "required ROM symbols missing; content animation disabled");
+        __android_log_print(ANDROID_LOG_WARN, kTag, "required SELF interfaces missing; content animation disabled");
         return false;
     }
     BinderResult token = reg(std::string("hha_genie_")+std::to_string(getpid()), std::string(kShader));

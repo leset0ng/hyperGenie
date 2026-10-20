@@ -3,10 +3,11 @@
 #include "hha_bridge.h"
 #include "hha_viewport.h"
 #include "hha_renderer.h"
+#include "hha_compat.h"
+#include "hha_abi.h"
 
 #include <android/log.h>
 #include <dlfcn.h>
-#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -32,9 +33,6 @@ constexpr char kReparent[] =
     "_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_";
 constexpr char kStop[] =
     "_ZN7android21SurfaceComposerClient11Transaction15stopSFAnimationERKNS_2spINS_14SurfaceControlEEEi";
-constexpr char kFingerprint[] =
-    "Xiaomi/hongkong/hongkong:17/CP2A.260605.016/"
-    "17OS4.0.261009.103256994.QCPECN.S:user/release-keys";
 
 struct NativeAPIEntries {
     uint32_t version;
@@ -519,8 +517,16 @@ void Install(void* handle) {
     void* blast=dlsym(handle,kBlastUpdate);
     g_layer=reinterpret_cast<LayerFn>(dlsym(handle,"_ZNK7android14SurfaceControl10getLayerIdEv"));
     g_name=reinterpret_cast<NameFn>(dlsym(handle,"_ZNK7android14SurfaceControl7getNameEv"));
-    if (!start || !adjust || !stop || !reparent || !blast || !g_layer) {
-        __android_log_print(ANDROID_LOG_WARN,kTag,"verified animation symbols unavailable");
+    if (!start || !adjust || !stop || !reparent || !blast || !g_layer || !g_name) {
+        __android_log_print(ANDROID_LOG_WARN,kTag,"required launcher interfaces missing; keeping stock");
+        return;
+    }
+    void* utils=dlopen("libutils.so",RTLD_NOW|RTLD_NOLOAD);
+    const char* reason=nullptr;
+    const bool compatible=hha::abi::ProbeAnimation(handle,utils?utils:handle,&reason);
+    if(utils) dlclose(utils);
+    if(!compatible) {
+        __android_log_print(ANDROID_LOG_WARN,kTag,"%s; keeping stock",reason);
         return;
     }
     int status=g_api->hookFunc(start,reinterpret_cast<void*>(Start),reinterpret_cast<void**>(&g_start));
@@ -558,6 +564,11 @@ void Install(void* handle) {
         g_api->unhookFunc(start);
         return;
     }
+    // Warm only after all launcher capabilities have been accepted. native_init
+    // must return before shader Binder registration and the renderer's self-load.
+    std::thread([] {
+        g_icon_ready.store(hha::WarmIconRenderer(),std::memory_order_release);
+    }).detach();
     __android_log_print(ANDROID_LOG_INFO,kTag,"central Genie launcher hooks installed pid=%d uid=%d",getpid(),getuid());
 }
 void OnLoaded(const char* name,void* handle) {
@@ -579,23 +590,8 @@ Loaded native_init(const NativeAPIEntries* entries) {
     // Native init also runs for a module scoped to system_server. The Java
     // central entry owns that process; never intercept its libgui transactions.
     if (getuid()<10000) return nullptr;
-    std::string fingerprint;
-    if (const prop_info* property=__system_property_find("ro.build.fingerprint")) {
-        __system_property_read_callback(property,
-            [](void* context,const char*,const char* value,uint32_t) {
-                *static_cast<std::string*>(context)=value;
-            },&fingerprint);
-    }
-    if (fingerprint!=kFingerprint) {
-        __android_log_print(ANDROID_LOG_WARN,kTag,"unverified launcher ABI; keeping stock");
-        return nullptr;
-    }
+    if (!hha::CheckHyperOS(kTag)) return nullptr;
     g_api=entries;
-    // native_init runs inside the framework/linker bootstrap. Shader Binder
-    // registration and self-dlopen must run only after that callback unwinds.
-    std::thread([] {
-        g_icon_ready.store(hha::WarmIconRenderer(),std::memory_order_release);
-    }).detach();
     void* handle=dlopen("libgui.so",RTLD_NOW|RTLD_NOLOAD);
     if (handle) {Install(handle);dlclose(handle);}
     return OnLoaded;
