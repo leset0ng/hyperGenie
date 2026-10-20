@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "hha_genie.h"
+#include "hha_bridge.h"
+#include "hha_viewport.h"
 
 #include <cmath>
 #include <cstdio>
@@ -451,6 +453,84 @@ void ParentScalarAndGestureSettings() {
         {std::numeric_limits<double>::quiet_NaN(), 0.0}, &settings), "nonfinite gesture rejected");
     Check(!hha::genie::SettingsForGesture(0.5, {0.0, 0.0}, nullptr), "null gesture result rejected");
 }
+void HostContourEndpoints() {
+    for(const auto& icon:std::array<hha::genie::Rect,3>{{{869,1657,171,171},{83,806,165,165},{606,1372,171,171}}}) {
+        const hha::genie::Rect window{0,0,1120,2436};
+        hha::genie::Rect host{};
+        Check(hha::genie::HostViewportForIcon(icon,window,&host),"contour host derives from raw mesh");
+        Parameters p;Animation seed;
+        Check(hha::genie::ParametersForIcon(icon,window,&p)&&seed.Reset(p,true),"raw icon seed initializes");
+        const auto mesh=hha::genie::ContourMesh(seed,p);
+        Near(host.left+mesh[0].x*host.width,icon.left,1e-10,"raw contour left matches icon");
+        Near(host.top+mesh[0].y*host.height,icon.top,1e-10,"raw contour top matches icon");
+        Near((mesh[2].x-mesh[0].x)*host.width,icon.width,1e-10,"raw contour width matches icon");
+        Near((mesh[6].y-mesh[0].y)*host.height,icon.height,1e-10,"raw contour height matches icon");
+        Near(host.height/host.width,window.height/window.width,1e-12,"host avoids aspect crop");
+        seed.Retarget(false);seed.Advance(.06);
+        const auto before=hha::genie::ContourMesh(seed,p);
+        p.response=hha::genie::kClosingResponse;
+        Check(seed.Retarget(p,true),"contour reverses");
+        const auto after=hha::genie::ContourMesh(seed,p);
+        for(std::size_t i=0;i<before.size();++i) {
+            Near(before[i].x,after[i].x,0,"contour x stays continuous");
+            Near(before[i].y,after[i].y,0,"contour y stays continuous");
+        }
+        seed.Retarget(p,false);seed.Advance(5);
+        const auto full=hha::genie::ContourMesh(seed,p);
+        Near(full[0].x,0,1e-12,"full contour left restores");
+        Near(full[8].y,1,1e-12,"full contour bottom restores");
+
+    }
+}
+
+void IconPairingAfterRepeatedLaunches() {
+    std::array<hha::AnimationSource,4> sources{};
+    // Replay a reused ID after a cold open, a key-driven close and then a
+    // gesture close. The gesture host must start at its released presentation.
+    sources[0].valid=true;sources[0].animation_id=7;
+    sources[0].transition.event_ns=1000000000LL;
+    sources[0].transition.geometry={869,1657,171,171,0,0,1120,2436};
+    sources[1]=sources[0];sources[1].transition.event_ns=2000000000LL;
+    sources[1].transition.closing=true;
+    sources[1].transition.geometry={0,0,1120,2436,869,1657,171,171};
+    sources[2]=sources[1];sources[2].transition.event_ns=3000000000LL;
+    sources[2].transition.geometry={284.7f,361.3f,550.5f,1197.4f,869,1657,171,171};
+    const auto* current=hha::FindIconSource(sources,7,3001000000LL);
+    Check(current==&sources[2],"reused ID pairs icon with latest gesture, not historical open");
+    Near(current->transition.geometry[2],550.5,1e-5,"icon inherits released host width");
+    Near(current->transition.geometry[3],1197.4,1e-4,"icon inherits released host height");
+    sources[3]=sources[2];sources[3].transition.event_ns=3000500000LL;
+    Check(hha::FindIconSource(sources,7,3001000000LL)==&sources[3],"newest matching epoch wins");
+    sources[3].valid=false;
+    Check(hha::FindIconSource(sources,7,3001000000LL)==&sources[2],"retired source cannot steal icon");
+    Check(!hha::FindIconSource(sources,8,3001000000LL),"unmatched ID keeps stock icon");
+    Check(!hha::FindIconSource(sources,7,4000000000LL),"expired ID cannot restart an old mesh");
+    Check(!hha::FindIconSource(sources,7,500000000LL),"future source cannot pair with icon");
+}
+
+void TransitionQueueOrdering() {
+    hha::PendingTransitions pending;
+    Check(!pending.Ready() && !pending.Take(),"empty dispatcher has no command");
+    hha::BridgeCommand a,b;
+    a.transition.leash_layer=10;a.transition.event_ns=100;
+    b.transition.leash_layer=20;b.transition.event_ns=200;
+    Check(pending.Post(a)&&pending.Post(b),"replacement transition queues");
+    auto cancel=a;cancel.cancel=true;cancel.transition.event_ns=300;
+    Check(!pending.Post(cancel),"old leash stop cannot discard queued replacement");
+    auto result=pending.Take();
+    Check(result && result->transition.leash_layer==20 && !result->cancel,"replacement survives old stop");
+    Check(!pending.Ready(),"take consumes queued command");
+    Check(pending.Post(b),"next transition queues");
+    Check(!pending.Post(a),"stale geometry cannot replace new request");
+    cancel=b;cancel.cancel=true;cancel.transition.event_ns=400;
+    Check(pending.Post(cancel),"same leash cancellation replaces pending transition");
+    result=pending.Take();
+    Check(result && result->cancel && result->transition.leash_layer==20,"same leash stop delivered");
+    pending.Post(b);cancel.transition.leash_layer=-1;
+    Check(pending.Post(cancel),"global disable cancels pending transition");
+    result=pending.Take();
+    Check(result && result->cancel && result->transition.leash_layer==-1,"global cancellation delivered");
+}
 }  // namespace
 
 int main() {
@@ -464,6 +544,9 @@ int main() {
     IconParameterFactory();
     UpdatedParametersAndCancel();
     ParentScalarAndGestureSettings();
+    TransitionQueueOrdering();
+    IconPairingAfterRepeatedLaunches();
+    HostContourEndpoints();
     std::printf("Genie kernel: %d checks passed\n", checks);
     return 0;
 }

@@ -1,580 +1,584 @@
 // SPDX-License-Identifier: Apache-2.0
-//
-// HyperHomeAnimation — native MVP for the HyperOS launcher's app-open animation.
-//
-// What it does
-// ------------
-// Adds a real 3D perspective tilt to the app window while the launcher's stock
-// open animation runs. The stock animation is not replaced: its transaction is
-// kept and one extra RotateState is written onto the same transaction.
-//
-//   launcher (Rust/Flutter)
-//     hyper_os_ui::SurfaceControlTransaction::start_sf_animation
-//       libhyper_os_ui_public.so  SurfaceControlTransaction_start_sf_animation
-//         libhyper_os_ui_private.dylib.so  transaction_abi_impl::start_sf_animation
-//           libgui.so  Transaction::startSFAnimation(sc, params)   <-- hooked
-//             original()                       stock morph, untouched
-//             setSurfaceRotation(sc, ...)      this module's tilt
-//           libgui.so  Transaction::apply()
-//             SurfaceFlinger  MiRenderEngine::applyRotateState()
-//               real X/Y/Z rotation + perspective on the Skia canvas
-//
-// Why native, and why this hook point
-// -----------------------------------
-// On Android 17 / HyperOS 4 the launcher ships without any dex: it is a
-// Rust/Flutter program started by /system_ext/bin/hyos_spawner, so java_init.list
-// class hooks never run in it. The native_init entry is the only option.
-//
-// Among the native candidates, libgui's Transaction::startSFAnimation is the one
-// safe boundary:
-//   * The public Rust wrapper takes nine arguments with a register/stack split; a
-//     mismatched trampoline silently corrupts the callee's stack.
-//   * transaction_abi_impl::start_sf_animation is Rust and builds SfAnimationParams
-//     through an sret (x8) return; a plain function pointer cannot express that.
-//   * Transaction::startSFAnimation is an ordinary C++ member function taking two
-//     sp<> by reference and returning *this, so it round-trips cleanly.
-//
-// RotateState slot layout (verified against the SF consumer)
-// ---------------------------------------------------------
-//   0..2  X/Y/Z angles in RADIANS (the Java wrapper calls them rotDegrees)
-//   3..4  rotation anchor offsets from the bounds centre
-//   5..7  extra X/Y/Z translation
-//   8     camera field-of-view in degrees
-//   9     camera distance (not a ratio of window height)
-//
-// Runtime tuning
-// --------------
-// /data/local/tmp/hha.conf is re-read at most every 250 ms, so angles can be
-// changed over adb without rebuilding or restarting the launcher.
+// Native-only HyperOS launcher integration. Target Apps install no hooks.
+#include "hha_bridge.h"
+#include "hha_viewport.h"
+#include "hha_renderer.h"
 
 #include <android/log.h>
 #include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
+#include <sys/system_properties.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <string>
+#include <thread>
 
 namespace {
+constexpr char kTag[] = "HHA";
+constexpr char kStart[] =
+    "_ZN7android21SurfaceComposerClient11Transaction16startSFAnimationERKNS_2spINS_14SurfaceControlEEERKNS2_INS_3gui17SfAnimationParamsEEE";
+constexpr char kAdjust[] =
+    "_ZN7android21SurfaceComposerClient11Transaction17adjustSFAnimationERKNS_2spINS_14SurfaceControlEEERKNS2_INS_3gui17SfAnimationParamsEEE";
+constexpr char kBlastUpdate[] =
+    "_ZN7android16BLASTBufferQueue6updateERKNS_2spINS_14SurfaceControlEEEjji";
+constexpr char kReparent[] =
+    "_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_";
+constexpr char kStop[] =
+    "_ZN7android21SurfaceComposerClient11Transaction15stopSFAnimationERKNS_2spINS_14SurfaceControlEEEi";
+constexpr char kFingerprint[] =
+    "Xiaomi/hongkong/hongkong:17/CP2A.260605.016/"
+    "17OS4.0.261009.103256994.QCPECN.S:user/release-keys";
 
-constexpr char kLogTag[] = "HHA";
-constexpr char kConfigPrimary[] = "/data/local/tmp/hha.conf";
-constexpr char kConfigFallback[] = "/data/adb/hha.conf";
-
-// libxposed native module ABI: the framework passes this to native_init.
 struct NativeAPIEntries {
     uint32_t version;
-    int (*hookFunc)(void* target, void* replacement, void** backup);
-    int (*unhookFunc)(void* target);
+    int (*hookFunc)(void*, void*, void**);
+    int (*unhookFunc)(void*);
 };
+using Loaded = void (*)(const char*, void*);
+using AnimationFn = void* (*)(void*, const void*, const void*);
+using StopFn = void* (*)(void*, const void*, int32_t);
+using BlastUpdateFn = void* (*)(void*,const void*,uint32_t,uint32_t,int32_t);
+using LayerFn = int32_t (*)(const void*);
+using NameFn = const std::string& (*)(const void*);
+AnimationFn g_start = nullptr;
+AnimationFn g_adjust = nullptr;
+AnimationFn g_reparent = nullptr;
+StopFn g_stop = nullptr;
+BlastUpdateFn g_blast_update = nullptr;
+std::atomic<bool> g_icon_ready{false};
+std::atomic<bool> g_native_entered{false};
+LayerFn g_layer = nullptr;
+NameFn g_name = nullptr;
+const NativeAPIEntries* g_api = nullptr;
+std::atomic<bool> g_installed{false};
+std::mutex g_mutex;
 
-using NativeOnModuleLoaded = void (*)(const char* name, void* handle);
-
-//-----------------------------------------------------------------------------
-// libgui symbols
-//-----------------------------------------------------------------------------
-
-constexpr char kSymStart[] =
-        "_ZN7android21SurfaceComposerClient11Transaction16startSFAnimation"
-        "ERKNS_2spINS_14SurfaceControlEEERKNS2_INS_3gui17SfAnimationParamsEEE";
-constexpr char kSymAdjust[] =
-        "_ZN7android21SurfaceComposerClient11Transaction17adjustSFAnimation"
-        "ERKNS_2spINS_14SurfaceControlEEERKNS2_INS_3gui17SfAnimationParamsEEE";
-constexpr char kSymSetRotation[] =
-        "_ZN7android21SurfaceComposerClient11Transaction18setSurfaceRotation"
-        "ERKNS_2spINS_14SurfaceControlEEEffffffffff";
-constexpr char kSymGetLayerId[] = "_ZNK7android14SurfaceControl10getLayerIdEv";
-
-// Note: libhyper_os_ui_private.dylib.so's transaction_abi_impl::start_sf_animation
-// is deliberately NOT hooked. See the header comment for why.
-//
-// SfAnimationParams::create is likewise not hooked: it returns sp<> through x8.
-
-using StartSFAnimationFn = void* (*)(void* transaction, const void* surface_control_ref,
-                                     const void* params);
-using AdjustSFAnimationFn = void* (*)(void* transaction, const void* surface_control_ref,
-                                      const void* params);
-using SetSurfaceRotationFn = void* (*)(void* transaction, const void* surface_control_ref,
-                                       float rot_x, float rot_y, float rot_z, float center_x,
-                                       float center_y, float offset_x, float offset_y,
-                                       float offset_z, float camera_degrees,
-                                       float camera_distance);
-using GetLayerIdFn = int32_t (*)(const void* surface_control);
-
-SetSurfaceRotationFn g_set_surface_rotation = nullptr;
-GetLayerIdFn g_get_layer_id = nullptr;
-StartSFAnimationFn g_original_start = nullptr;
-AdjustSFAnimationFn g_original_adjust = nullptr;
-
-std::atomic<uint32_t> g_start_hits{0};
-std::atomic<uint32_t> g_adjust_hits{0};
-std::atomic<uint32_t> g_logged_hits{0};
-
-//-----------------------------------------------------------------------------
-// Tunables
-//-----------------------------------------------------------------------------
-
-struct Config {
-    bool enabled = true;
-    // Degrees here; RotateState stores radians.
-    float rot_x_deg = 0.0f;
-    float rot_y_deg = 26.0f;
-    float rot_z_deg = 0.0f;
-    float center_x = 0.0f;
-    float center_y = 0.0f;
-    float offset_x = 0.0f;
-    float offset_y = 0.0f;
-    float offset_z = 0.0f;
-    float camera_degrees = 45.0f;
-    float camera_distance = 1600.0f;
-    bool normalize_icon_perspective = true;
-    // Rotate only while the animation is being submitted; the animator keeps
-    // re-asserting it on every adjust, and SurfaceFlinger clears the state itself
-    // when the animation ends.
-    bool tilt_adjusts = true;
-    // Rotate the app window (type 2) and floating icon (type 1). The icon uses
-    // native icon units, so its camera distance and anchor need normalization
-    // before both surfaces can share the same parent-space projection.
-    bool tilt_app_type = true;
-    bool tilt_icon_type = true;
-    bool verbose = true;
-};
-
+int64_t Now() {
+    timespec value{};
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return static_cast<int64_t>(value.tv_sec)*1000000000LL+value.tv_nsec;
+}
+struct Config { bool enabled = true; bool content = true; bool verbose = true; };
 Config g_config;
-std::atomic<uint64_t> g_config_stamp{0};
-std::atomic<int64_t> g_config_next_check_ns{0};
+int64_t g_next_config = 0;
 
-int64_t MonotonicNs() {
-    struct timespec ts {};
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
-    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
-}
-
-float ParseFloat(const char* value, float fallback) {
-    if (value == nullptr || *value == '\0') return fallback;
-    char* end = nullptr;
-    const float parsed = strtof(value, &end);
-    if (end == value) return fallback;
-    return parsed;
-}
-
-bool ParseBool(const char* value, bool fallback) {
-    if (value == nullptr) return fallback;
-    if (strcmp(value, "0") == 0 || strcmp(value, "false") == 0) return false;
-    if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0) return true;
-    return fallback;
-}
-
-void Trim(char* text) {
-    if (text == nullptr) return;
-    size_t length = strlen(text);
-    while (length > 0 && (text[length - 1] == '\n' || text[length - 1] == '\r' ||
-                          text[length - 1] == ' ' || text[length - 1] == '\t')) {
-        text[--length] = '\0';
+Config ReadConfig() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (Now() < g_next_config) return g_config;
+    g_next_config = Now()+250000000;
+    FILE* file = std::fopen("/data/local/tmp/hha.conf", "re");
+    if (!file) file = std::fopen("/data/adb/hha.conf", "re");
+    if (!file) return g_config;
+    Config next;
+    char line[256], key[64], value[32];
+    while (std::fgets(line, sizeof(line), file)) {
+        if (char* comment = std::strchr(line, '#')) *comment = '\0';
+        if (std::sscanf(line, " %63[^= \t] = %31s", key, value) != 2) continue;
+        const bool on = std::strcmp(value,"1")==0 || std::strcmp(value,"true")==0;
+        const bool off = std::strcmp(value,"0")==0 || std::strcmp(value,"false")==0;
+        if (!on && !off) continue;
+        if (!std::strcmp(key,"enabled")) next.enabled = on;
+        else if (!std::strcmp(key,"content_enabled")) next.content = on;
+        else if (!std::strcmp(key,"verbose")) next.verbose = on;
     }
-    size_t start = 0;
-    while (text[start] == ' ' || text[start] == '\t') ++start;
-    if (start != 0) memmove(text, text + start, length - start + 1);
-}
-
-void RefreshConfig() {
-    const int64_t now = MonotonicNs();
-    if (now < g_config_next_check_ns.load(std::memory_order_relaxed)) return;
-    g_config_next_check_ns.store(now + 250000000LL, std::memory_order_relaxed);
-
-    struct stat info {};
-    const char* path = kConfigPrimary;
-    if (stat(path, &info) != 0) {
-        path = kConfigFallback;
-        if (stat(path, &info) != 0) return;
-    }
-
-    const uint64_t stamp = (static_cast<uint64_t>(info.st_mtime) << 32) ^
-                           static_cast<uint64_t>(info.st_size);
-    if (stamp == g_config_stamp.load(std::memory_order_relaxed)) return;
-
-    FILE* file = fopen(path, "re");
-    if (file == nullptr) return;
-
-    Config next = g_config;
-    char line[512];
-    while (fgets(line, sizeof(line), file) != nullptr) {
-        Trim(line);
-        if (line[0] == '\0' || line[0] == '#') continue;
-        char* separator = strchr(line, '=');
-        if (separator == nullptr) continue;
-        *separator = '\0';
-        Trim(line);
-        char* value = separator + 1;
-        Trim(value);
-        if (strcmp(line, "enabled") == 0) {
-            next.enabled = ParseBool(value, next.enabled);
-        } else if (strcmp(line, "x_deg") == 0) {
-            next.rot_x_deg = ParseFloat(value, next.rot_x_deg);
-        } else if (strcmp(line, "y_deg") == 0) {
-            next.rot_y_deg = ParseFloat(value, next.rot_y_deg);
-        } else if (strcmp(line, "z_deg") == 0) {
-            next.rot_z_deg = ParseFloat(value, next.rot_z_deg);
-        } else if (strcmp(line, "center_x") == 0) {
-            next.center_x = ParseFloat(value, next.center_x);
-        } else if (strcmp(line, "center_y") == 0) {
-            next.center_y = ParseFloat(value, next.center_y);
-        } else if (strcmp(line, "offset_x") == 0) {
-            next.offset_x = ParseFloat(value, next.offset_x);
-        } else if (strcmp(line, "offset_y") == 0) {
-            next.offset_y = ParseFloat(value, next.offset_y);
-        } else if (strcmp(line, "offset_z") == 0) {
-            next.offset_z = ParseFloat(value, next.offset_z);
-        } else if (strcmp(line, "camera_degrees") == 0) {
-            next.camera_degrees = ParseFloat(value, next.camera_degrees);
-        } else if (strcmp(line, "camera_distance") == 0) {
-            next.camera_distance = ParseFloat(value, next.camera_distance);
-        } else if (strcmp(line, "tilt_adjusts") == 0) {
-            next.tilt_adjusts = ParseBool(value, next.tilt_adjusts);
-        } else if (strcmp(line, "tilt_app_type") == 0) {
-            next.tilt_app_type = ParseBool(value, next.tilt_app_type);
-        } else if (strcmp(line, "tilt_icon_type") == 0) {
-            next.tilt_icon_type = ParseBool(value, next.tilt_icon_type);
-        } else if (strcmp(line, "normalize_icon_perspective") == 0) {
-            next.normalize_icon_perspective = ParseBool(value, next.normalize_icon_perspective);
-        } else if (strcmp(line, "verbose") == 0) {
-            next.verbose = ParseBool(value, next.verbose);
-        }
-    }
-    fclose(file);
-
+    std::fclose(file);
     g_config = next;
-    g_config_stamp.store(stamp, std::memory_order_relaxed);
-    __android_log_print(ANDROID_LOG_INFO, kLogTag,
-                        "config loaded from %s enabled=%d rot=(%.2f,%.2f,%.2f) cam=%.1f/%.1f",
-                        path, next.enabled ? 1 : 0, next.rot_x_deg, next.rot_y_deg,
-                        next.rot_z_deg, next.camera_degrees, next.camera_distance);
+    return next;
 }
 
-inline float DegreesToRadians(float degrees) { return degrees * 0.017453292519943295f; }
-
-// android::gui::SfAnimationParams layout, confirmed from the accessors in
-// libhyper_os_sys.dylib.so: `anim_type()` compiles to `ldr w0,[x0,#0x40]` and
-// `adjust_anim_type()` to `ldr w0,[x0,#0x44]`. The hook receives an sp<> by
-// reference, so the object sits one dereference further in.
-constexpr size_t kSfAnimationParamsAnimTypeOffset = 0x40;
-
-// SfAnimationType discriminants as used by the launcher's submission calls.
-constexpr int32_t kAnimTypeIcon = 1;
-constexpr int32_t kAnimTypeApp = 2;
-
-int32_t AnimTypeOf(const void* params_ref) {
-    if (params_ref == nullptr) return -1;
-    const void* object = *reinterpret_cast<const void* const*>(params_ref);
-    if (object == nullptr) return -1;
-    return *reinterpret_cast<const int32_t*>(static_cast<const char*>(object) +
-                                             kSfAnimationParamsAnimTypeOffset);
-}
-
-bool ShouldTilt(int32_t anim_type) {
-    if (anim_type == kAnimTypeApp) return g_config.tilt_app_type;
-    if (anim_type == kAnimTypeIcon) return g_config.tilt_icon_type;
-    // Leave unsupported animation types unchanged.
-    return false;
-}
-
-int32_t LayerIdOf(const void* surface_control_ref) {
-    if (g_get_layer_id == nullptr || surface_control_ref == nullptr) return -1;
-    // sp<SurfaceControl> is a single pointer; the id lives on the control itself.
-    const void* surface_control = *reinterpret_cast<const void* const*>(surface_control_ref);
-    if (surface_control == nullptr) return -1;
-    return g_get_layer_id(surface_control);
-}
-
-// The two maps use the ROM's arm64 libc++ tree layout. Read existing nodes
-// only: no foreign C++ constructors, allocations, or ownership changes.
-const unsigned char* FindParam(const void* params_ref, size_t root_offset,
-                               const char* key) {
-    if (params_ref == nullptr) return nullptr;
-    const auto* object = *static_cast<const unsigned char* const*>(params_ref);
-    if (object == nullptr) return nullptr;
-    const auto* node = *reinterpret_cast<const unsigned char* const*>(object + root_offset);
-    const size_t length = strlen(key);
-    for (unsigned depth = 0; node != nullptr && depth < 64; ++depth) {
-        const unsigned char tag = node[0x20];
-        const bool is_long = (tag & 1) != 0;
-        const size_t size = is_long ? *reinterpret_cast<const size_t*>(node + 0x28) : tag >> 1;
-        if (size > 256) return nullptr;
-        const char* data = is_long ? *reinterpret_cast<const char* const*>(node + 0x30)
-                                   : reinterpret_cast<const char*>(node + 0x21);
-        if (data == nullptr) return nullptr;
-        int comparison = memcmp(key, data, length < size ? length : size);
-        if (comparison == 0) comparison = length < size ? -1 : length > size ? 1 : 0;
-        if (comparison == 0) return node + 0x38;
-        node = *reinterpret_cast<const unsigned char* const*>(node + (comparison > 0 ? 8 : 0));
+// Verified ROM libc++ map and SpringProperty layouts. No foreign allocations or
+// ownership changes; only the submitted parameters' scalar values are inspected.
+const unsigned char* Find(const void* reference, size_t root, const char* key) {
+    if (!reference) return nullptr;
+    const auto* object = *static_cast<const unsigned char* const*>(reference);
+    if (!object) return nullptr;
+    const auto* node = *reinterpret_cast<const unsigned char* const*>(object+root);
+    const size_t length = std::strlen(key);
+    for (unsigned depth=0; node && depth<64; ++depth) {
+        const unsigned tag = node[0x20];
+        const size_t size = tag&1 ? *reinterpret_cast<const size_t*>(node+0x28) : tag>>1;
+        if (size>256) return nullptr;
+        const char* data = tag&1 ? *reinterpret_cast<const char* const*>(node+0x30) :
+            reinterpret_cast<const char*>(node+0x21);
+        if (!data) return nullptr;
+        int comparison = std::memcmp(key,data,length<size?length:size);
+        if (!comparison) comparison=length<size?-1:length>size?1:0;
+        if (!comparison) return node+0x38;
+        node=*reinterpret_cast<const unsigned char* const*>(node+(comparison>0?8:0));
     }
     return nullptr;
 }
-
-float FixedParam(const void* params_ref, const char* key) {
-    const auto* value = FindParam(params_ref, 0x30, key);
-    return value != nullptr ? *reinterpret_cast<const float*>(value) : 0.0f;
+float Fixed(const void* parameters,const char* key) {
+    const auto* value=Find(parameters,0x30,key);
+    float result=0;
+    if(value) std::memcpy(&result,value,sizeof(result));
+    return result;
 }
 
-float SpringExtent(const void* params_ref, const char* key) {
-    const auto* value = FindParam(params_ref, 0x18, key);
-    if (value == nullptr) return 0.0f;
-    const auto* property = *reinterpret_cast<const unsigned char* const*>(value);
-    if (property == nullptr) return 0.0f;
-    const float start = *reinterpret_cast<const float*>(property + 0x10);
-    const float end = *reinterpret_cast<const float*>(property + 0x14);
-    return std::isfinite(start) && std::isfinite(end) ? fmaxf(start, end) : 0.0f;
-}
-
-struct TiltTarget {
-    int32_t id = -1;
-    int32_t type = -1;
-    float camera_scale = 1.0f;
-    int64_t started_ns = 0;
+struct Property {
+    float start = 0;
+    float end = 0;
+    float velocity = 0;
+    bool valid = false;
 };
-std::mutex g_targets_mutex;
-TiltTarget g_targets[64];
-size_t g_next_target = 0;
+Property Spring(const void* parameters, const char* key) {
+    const auto* value = Find(parameters,0x18,key);
+    const auto* property = value ? *reinterpret_cast<const unsigned char* const*>(value) : nullptr;
+    if (!property) return {};
+    Property result;
+    std::memcpy(&result.start,property+0x10,4);
+    std::memcpy(&result.end,property+0x14,4);
+    std::memcpy(&result.velocity,property+0x1c,4);
+    result.valid=std::isfinite(result.start)&&std::isfinite(result.end)&&std::isfinite(result.velocity);
+    return result;
+}
 
-TiltTarget RememberTarget(const void* surface_control_ref,
-                          const void* params_ref, int32_t type) {
-    const int64_t now = MonotonicNs();
-    TiltTarget target{LayerIdOf(surface_control_ref), type, 1.0f, now};
-    if (type == kAnimTypeIcon && g_config.normalize_icon_perspective) {
-        const bool width_based = FixedParam(params_ref, "tileType") != 0.0f;
-        const float icon_far = FixedParam(params_ref, width_based ? "validIconWidth" : "validIconHeight");
-        const float icon_near = FixedParam(params_ref, width_based ? "validIconLeft" : "validIconTop");
-        const float icon_span = icon_far - icon_near;
-        const float app_extent = SpringExtent(params_ref, width_based ? "width" : "height");
-        // SF uses -1 / (distance * length(basisY)). The icon expands from its
-        // native span to the app extent, so equal raw distances are unequal
-        // physical cameras. Convert icon units; do not weaken the app camera.
-        if (std::isfinite(app_extent) && std::isfinite(icon_span) &&
-                std::isfinite(icon_near) && std::isfinite(icon_far) &&
-                app_extent > 0.0f && icon_span > 0.0f) {
-            target.camera_scale = icon_span / app_extent;
+using Last = hha::AnimationSource;
+std::array<Last,32> g_last{};
+size_t g_next = 0;
+hha::genie::Rect g_window{0,0,0,0};
+
+struct IconBuffer {
+    void* surface=nullptr;
+    int32_t parent=-1;
+    int width=0,height=0;
+    int32_t animation_id=-1;
+};
+std::array<IconBuffer,16> g_icons{};
+size_t g_next_icon=0;
+
+void* BlastUpdate(void* queue,const void* reference,uint32_t width,uint32_t height,int32_t format) {
+    void* result=g_blast_update(queue,reference,width,height,format);
+    const void* surface=reference?*static_cast<const void* const*>(reference):nullptr;
+    if(g_icon_ready && surface && g_name && width>0 && height>0 && width<=1024 && height<=1024) {
+        const std::string& name=g_name(surface);
+        int parent=-1;
+        if(std::sscanf(name.c_str(),"[BBQ] FloatingIcon_all#%d",&parent)==1 && parent>=0) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            IconBuffer* entry=nullptr;
+            for(auto& icon:g_icons) if(icon.parent==parent) {entry=&icon;break;}
+            if(!entry) entry=&g_icons[g_next_icon++%g_icons.size()];
+            if(entry->surface!=surface) {
+                hha::ReleaseIconSurface(entry->surface,entry);
+                entry->surface=const_cast<void*>(surface);
+                hha::RetainIconSurface(entry->surface,entry);
+            }
+            entry->parent=parent;entry->width=width;entry->height=height;
+            __android_log_print(ANDROID_LOG_INFO,kTag,"icon BBQ parent=%d layer=%d extent=%ux%u",parent,
+                g_layer(surface),width,height);
         }
-        if (g_config.verbose) {
-            __android_log_print(ANDROID_LOG_INFO, kLogTag,
-                                "projection layer=%d axis=%s appExtent=%.2f iconSpan=%.2f scale=%.6f",
-                                target.id, width_based ? "width" : "height", app_extent,
-                                icon_span, target.camera_scale);
-        }
-    }
-    if (target.id >= 0 && (type == kAnimTypeApp || type == kAnimTypeIcon)) {
-        std::lock_guard<std::mutex> lock(g_targets_mutex);
-        g_targets[g_next_target++ % 64] = target;
-    }
-    return target;
-}
-
-TiltTarget FindTarget(int32_t id) {
-    std::lock_guard<std::mutex> lock(g_targets_mutex);
-    const int64_t now = MonotonicNs();
-    for (size_t i = 0; i < 64; ++i) {
-        const auto& target = g_targets[(g_next_target + 63 - i) % 64];
-        if (target.id == id && now - target.started_ns < 10000000000LL) return target;
-    }
-    return {};
-}
-
-void ApplyTilt(void* transaction, const void* surface_control_ref, const char* phase,
-               float camera_scale) {
-    if (g_set_surface_rotation == nullptr || transaction == nullptr ||
-            surface_control_ref == nullptr) {
-        return;
-    }
-    const Config config = g_config;
-    g_set_surface_rotation(transaction, surface_control_ref,
-                           DegreesToRadians(config.rot_x_deg),
-                           DegreesToRadians(config.rot_y_deg),
-                           DegreesToRadians(config.rot_z_deg), config.center_x * camera_scale,
-                           config.center_y * camera_scale, config.offset_x, config.offset_y,
-                           config.offset_z, config.camera_degrees,
-                           config.camera_distance * camera_scale);
-
-    if (config.verbose && g_logged_hits.fetch_add(1, std::memory_order_relaxed) < 40) {
-        __android_log_print(ANDROID_LOG_INFO, kLogTag, "%s layer=%d rot=%.2f cam=%.0f/%.0f",
-                            phase, LayerIdOf(surface_control_ref), config.rot_y_deg,
-                            config.camera_degrees, config.camera_distance * camera_scale);
-    }
-}
-
-//-----------------------------------------------------------------------------
-// Hooks
-//-----------------------------------------------------------------------------
-
-void* HookStartSFAnimation(void* transaction, const void* surface_control_ref,
-                           const void* params) {
-    void* result = nullptr;
-    if (g_original_start != nullptr) {
-        result = g_original_start(transaction, surface_control_ref, params);
-    }
-    RefreshConfig();
-    g_start_hits.fetch_add(1, std::memory_order_relaxed);
-    const int32_t anim_type = AnimTypeOf(params);
-    const TiltTarget target = RememberTarget(surface_control_ref, params, anim_type);
-    if (g_config.enabled && ShouldTilt(anim_type)) {
-        ApplyTilt(transaction, surface_control_ref, "start", target.camera_scale);
-    } else if (g_config.verbose && g_logged_hits.fetch_add(1, std::memory_order_relaxed) < 40) {
-        __android_log_print(ANDROID_LOG_INFO, kLogTag, "start layer=%d animType=%d skipped",
-                            LayerIdOf(surface_control_ref), anim_type);
     }
     return result;
 }
 
-void* HookAdjustSFAnimation(void* transaction, const void* surface_control_ref,
-                            const void* params) {
-    void* result = nullptr;
-    if (g_original_adjust != nullptr) {
-        result = g_original_adjust(transaction, surface_control_ref, params);
-    }
-    RefreshConfig();
-    g_adjust_hits.fetch_add(1, std::memory_order_relaxed);
-    const TiltTarget target = FindTarget(LayerIdOf(surface_control_ref));
-    if (g_config.enabled && g_config.tilt_adjusts && ShouldTilt(target.type)) {
-        ApplyTilt(transaction, surface_control_ref, "adjust", target.camera_scale);
+struct Anchor { int32_t leash=-1,container=-1,task=-1; };
+std::array<Anchor,32> g_anchors{};
+size_t g_next_anchor=0;
+
+Anchor ReadAnchor(const void* control) {
+    Anchor result;
+    if(!g_name || !control) return result;
+    const std::string& name=g_name(control);
+    if(name.size()>512) return result;
+    int task=-1,container=-1;
+    if(std::sscanf(name.c_str(),"Surface(name=Task=%d#%d)",&task,&container)==2 ||
+       std::sscanf(name.c_str(),"Task=%d#%d",&task,&container)==2) {
+        if(task>=0 && container>=0) {result.task=task;result.container=container;}
     }
     return result;
 }
 
-//-----------------------------------------------------------------------------
-// Installation
-//-----------------------------------------------------------------------------
-
-const NativeAPIEntries* g_api = nullptr;
-std::atomic<bool> g_installed{false};
-
-bool InstallInlineHook(void* target, void* replacement, void** backup, const char* label) {
-    if (g_api == nullptr || g_api->hookFunc == nullptr) return false;
-    if (target == nullptr || replacement == nullptr || backup == nullptr) return false;
-    *backup = nullptr;
-    const int status = g_api->hookFunc(target, replacement, backup);
-    if (status != 0 || *backup == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "hook failed for %s (status=%d)", label,
-                            status);
-        if (status == 0 && *backup == nullptr && g_api->unhookFunc != nullptr) {
-            g_api->unhookFunc(target);
+void Observe(const void* surface, const void* parameters, bool adjust) {
+    if (!parameters || !surface || !g_layer) return;
+    const auto* object = *static_cast<const unsigned char* const*>(parameters);
+    const void* control = *static_cast<const void* const*>(surface);
+    if (!object || !control) return;
+    int32_t type,adjust_type,animation_id;
+    std::memcpy(&type,object+0x40,4);
+    std::memcpy(&adjust_type,object+0x44,4);
+    std::memcpy(&animation_id,object+0x48,4);
+    const int32_t id = g_layer(control);
+    Last cached;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(const auto& slot:g_last) if(slot.valid && slot.transition.leash_layer==id) {cached=slot;break;}
+    }
+    if (type!=2 && !(adjust && type==-1 && adjust_type==1 && cached.valid)) return;
+    if(Fixed(parameters,"isNoSourceAnim")!=0 || Fixed(parameters,"bigIcon")!=0) return;
+    // Match SF's target-ID ordering before assigning a new local timestamp.
+    if (adjust && cached.valid && animation_id<=cached.animation_id) return;
+    const Config config = ReadConfig();
+    if (!config.enabled || !config.content) {
+        hha::QueueCancel(id,Now());
+        hha::CancelIconRenderer();
+        return;
+    }
+    const auto x=Spring(parameters,"centerX"), y=Spring(parameters,"centerY");
+    const auto w=Spring(parameters,"width"), h=Spring(parameters,"height");
+    const auto ratio=Spring(parameters,"ratio");
+    const auto radius=Spring(parameters,"radius");
+    const auto corner=Spring(parameters,"cornerTLX");
+    const auto radius_ratio=Spring(parameters,"radiusRatio");
+    if (!x.valid || !y.valid || !w.valid || !h.valid ||
+        !ratio.valid || ratio.start<=0 || ratio.end<=0 ||
+        w.start<=0 || w.end<=0 || h.start<=0 || h.end<=0) return;
+    const float start_width=std::min(w.start,h.start/ratio.start);
+    const float start_height=std::min(h.start,w.start*ratio.start);
+    const float end_width=std::min(w.end,h.end/ratio.end);
+    const float end_height=std::min(h.end,w.end*ratio.end);
+    const float start_area=start_width*start_height, end_area=end_width*end_height;
+    const float small_width=start_area<end_area?start_width:end_width;
+    const float small_height=start_area<end_area?start_height:end_height;
+    if(!(adjust && cached.valid) &&
+       (small_width/small_height<0.8f || small_width/small_height>1.25f)) return;
+    if (!std::isfinite(start_area) || !std::isfinite(end_area) ||
+        (!(adjust && cached.valid) && std::max(start_area,end_area)<4*std::min(start_area,end_area))) return;
+    hha::Transition request;
+    request.leash_layer=id;
+    request.container_layer=id;
+    if (g_name) {
+        const std::string& name=g_name(control);
+        int task=-1,container=-1;
+        // Shell wraps the actual task in an external transition leash which is
+        // absent from WMS's Java ancestor tree. Its verified name carries the
+        // wrapped Task SC identity; WMS validates BOTH against its own objects.
+        if (name.size()<512 && name.find("_transition-leash")!=std::string::npos &&
+            std::sscanf(name.c_str(),"Surface(name=Task=%d",&task)==1 && task>=0) {
+            request.task_id=task;
+            request.container_layer=-1;
+            if(std::sscanf(name.c_str(),"Surface(name=Task=%d#%d)",&task,&container)==2 && container>=0)
+                request.container_layer=container;
         }
-        return false;
+        if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
+            "source leash=%d task=%d container=%d name=%.200s",id,request.task_id,request.container_layer,name.c_str());
     }
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "hooked %s", label);
-    return true;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(const auto& anchor:g_anchors) if(anchor.leash==id && anchor.task>=0) {
+            request.container_layer=anchor.container;
+            request.task_id=anchor.task;
+            break;
+        }
+    }
+    request.closing=end_area<start_area;
+    request.event_ns=Now();
+    request.geometry={x.start-start_width/2,y.start-start_height/2,start_width,start_height,
+                      x.end-end_width/2,y.end-end_height/2,end_width,end_height,
+                      x.velocity,y.velocity,corner.valid?corner.start*std::hypot(start_width,start_height):radius.start,
+                      corner.valid?corner.end*std::hypot(end_width,end_height):radius.end};
+    if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
+        "corner layer=%d radius=%.2f->%.2f corner=%.2f->%.2f ratio=%.3f->%.3f",
+        id,radius.start,radius.end,corner.start,corner.end,radius_ratio.start,radius_ratio.end);
+    if (adjust && cached.valid) {
+        // Direction uses the stable full domain. The supplied start is the live
+        // gesture presentation and must survive both close and open retargets.
+        const double full_area=cached.window.width*cached.window.height;
+        if(full_area>0) request.closing=end_area<0.5*full_area;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        Last* previous=nullptr;
+        for(auto& slot:g_last) if(slot.valid && slot.transition.leash_layer==id) {previous=&slot;break;}
+        if (adjust && previous && animation_id<=previous->animation_id) return;
+        if (!previous) previous=&g_last[g_next++%g_last.size()];
+        if(!request.closing) g_window={request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
+        previous->window=g_window;
+        previous->transition=request;
+        previous->animation_id=animation_id;
+        previous->valid=true;
+    }
+    if (config.verbose) {
+        __android_log_print(ANDROID_LOG_INFO,kTag,
+            "%s layer=%d direction=%s rect=(%.1f,%.1f %.1fx%.1f)->(%.1f,%.1f %.1fx%.1f) velocity=(%.2f,%.2f)",
+            adjust?"adjust":"start",id,request.closing?"close":"open",
+            request.geometry[0],request.geometry[1],w.start,h.start,
+            request.geometry[4],request.geometry[5],w.end,h.end,x.velocity,y.velocity);
+    }
+    // A pre-start surface has no Task identity yet. Its reparent hook forwards
+    // this immutable request as soon as Shell supplies the actual Task leash.
+    if(request.task_id<0 && g_name && g_name(control).find("Pre startup opening leash")==0) return;
+    hha::QueueTransition(request);
 }
-
-void WriteDefaultConfigIfMissing() {
-    struct stat info {};
-    if (stat(kConfigPrimary, &info) == 0) return;
-    FILE* file = fopen(kConfigPrimary, "we");
-    if (file == nullptr) {
-        // The launcher runs as the app UID and normally cannot create files under
-        // /data/local/tmp; the fallback path in /data/adb is only writable by root,
-        // so defaults simply stay in the compiled-in Config.
-        __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                            "cannot create %s (%s); using built-in defaults", kConfigPrimary,
-                            strerror(errno));
+void SetSpring(const void* parameters,const char* key,float start,float end) {
+    const auto* value=Find(parameters,0x18,key);
+    auto* property=value?*reinterpret_cast<unsigned char* const*>(value):nullptr;
+    if(!property) return;
+    std::memcpy(property+0x10,&start,4);
+    std::memcpy(property+0x14,&end,4);
+}
+void SetVelocity(const void* parameters,const char* key,float velocity) {
+    const auto* value=Find(parameters,0x18,key);
+    auto* property=value?*reinterpret_cast<unsigned char* const*>(value):nullptr;
+    if(property) std::memcpy(property+0x1c,&velocity,4);
+}
+void SetFixed(const void* parameters,const char* key,float number) {
+    auto* value=const_cast<unsigned char*>(Find(parameters,0x30,key));
+    if(value) std::memcpy(value,&number,4);
+}
+void TuneParent(void* transaction,const void* surface,const void* parameters) {
+    const Config config=ReadConfig();
+    if (!config.enabled || !config.content || !parameters) return;
+    const auto* object=*static_cast<const unsigned char* const*>(parameters);
+    if (!object) return;
+    int32_t type=0,animation_id=0;
+    std::memcpy(&type,object+0x40,4);
+    std::memcpy(&animation_id,object+0x48,4);
+    if (type!=1 && type!=2 && type!=-1) return;
+    if(type==1) {
+        if(surface && g_name) {
+            const void* control=*static_cast<const void* const*>(surface);
+            const auto x=Spring(parameters,"centerX"),y=Spring(parameters,"centerY");
+            const auto alpha=Spring(parameters,"alpha");
+            __android_log_print(ANDROID_LOG_INFO,kTag,
+                "icon source=%s center=(%.1f,%.1f)->(%.1f,%.1f) alpha=%.2f->%.2f",control?g_name(control).c_str():"?",
+                x.start,y.start,x.end,y.end,alpha.start,alpha.end);
+        }
+    }
+    if(Fixed(parameters,"isNoSourceAnim")!=0 || Fixed(parameters,"bigIcon")!=0) return;
+    const auto w=Spring(parameters,"width"),h=Spring(parameters,"height");
+    const auto ratio=Spring(parameters,"ratio");
+    if (!w.valid || !h.valid || !ratio.valid || ratio.start<=0 || ratio.end<=0 ||
+        w.start<=0 || h.start<=0 || w.end<=0 || h.end<=0) return;
+    const float start_width=std::min(w.start,h.start/ratio.start);
+    const float start_height=std::min(h.start,w.start*ratio.start);
+    const float end_width=std::min(w.end,h.end/ratio.end);
+    const float end_height=std::min(h.end,w.end*ratio.end);
+    const bool closing=end_width*end_height<start_width*start_height;
+    const float small_aspect=closing?end_width/end_height:start_width/start_height;
+    if(type!=-1 && (small_aspect<0.8f || small_aspect>1.25f)) return;
+    // Preserve native listeners/IDs while replacing the app's crop viewport.
+    // The visible contour is produced by the same mesh as the content.
+    if(surface && g_layer) {
+        const void* control=*static_cast<const void* const*>(surface);
+        const int32_t layer=control?g_layer(control):-1;
+        const bool is_icon=type==1 || (control && g_name && g_name(control).find("FloatingIcon_all")==0);
+        Last snapshot;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if(is_icon) {
+                if(const auto* source=hha::FindIconSource(g_last,animation_id,Now())) snapshot=*source;
+            } else {
+                for(const auto& entry:g_last) if(entry.valid && entry.transition.leash_layer==layer) {
+                    snapshot=entry;break;
+                }
+            }
+        }
+        if(!snapshot.valid) return;
+        const auto& geometry=snapshot.transition.geometry;
+        const size_t small=snapshot.transition.closing?4:0;
+        const size_t full=snapshot.transition.closing?0:4;
+        const hha::genie::Rect icon{geometry[small],geometry[small+1],geometry[small+2],geometry[small+3]};
+        const hha::genie::Rect window=snapshot.window.width>0?snapshot.window:
+            hha::genie::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
+        hha::genie::Rect minimized;
+        if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) return;
+        if(is_icon) {
+            bool rendering=false;
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for(auto& source:g_icons) if(source.surface && source.parent==layer) {
+                rendering=hha::RenderIcon(transaction,source.surface,const_cast<void*>(control),source.width,source.height,
+                    static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition);
+                if(rendering) source.animation_id=animation_id;
+                break;
+            }
+            // A stock icon must retain its stock host/corners if no real child
+            // accepted the mesh; otherwise it becomes a tall rectangular plate.
+            if(!rendering) return;
+        }
+        const hha::genie::Rect original_start{geometry[0],geometry[1],geometry[2],geometry[3]};
+        const auto start=snapshot.transition.closing?original_start:minimized;
+        const auto end=snapshot.transition.closing?minimized:window;
+        SetSpring(parameters,"centerX",start.left+start.width/2,end.left+end.width/2);
+        SetSpring(parameters,"centerY",start.top+start.height/2,end.top+end.height/2);
+        SetSpring(parameters,"width",start.width,end.width);
+        SetSpring(parameters,"height",start.height,end.height);
+        const float aspect=window.height/window.width;
+        SetVelocity(parameters,"height",w.velocity*aspect);
+        SetSpring(parameters,"ratio",aspect,aspect);
+        SetVelocity(parameters,"ratio",0);
+        SetFixed(parameters,"needDrawWindowMask",0);
+        for(const char* key:{"radius","radiusRatio","cornerTLX","cornerTLY","cornerTRX","cornerTRY",
+                            "cornerBRX","cornerBRY","cornerBLX","cornerBLY"}) {
+            SetSpring(parameters,key,0,0);
+            SetVelocity(parameters,key,0);
+        }
+        __android_log_print(ANDROID_LOG_INFO,kTag,"mesh viewport layer=%d animation=%d source=%d epoch=%lld start=%.1fx%.1f end=%.1fx%.1f",layer,
+            animation_id,snapshot.transition.leash_layer,static_cast<long long>(snapshot.transition.event_ns),
+            start.width,start.height,end.width,end.height);
+    }
+    constexpr const char* keys[]={"centerX","centerY","width","height","ratio",
+        "radius","radiusRatio","cornerTLX","cornerTLY","cornerTRX","cornerTRY",
+        "cornerBRX","cornerBRY","cornerBLX","cornerBLY"};
+    for (const char* key:keys) {
+        const auto* value=Find(parameters,0x18,key);
+        auto* property=value?*reinterpret_cast<unsigned char* const*>(value):nullptr;
+        if (!property) continue;
+        const float damping=1.0f, response=closing?0.336f:0.24f;
+        std::memcpy(property+0x20,&damping,4);
+        std::memcpy(property+0x24,&response,4);
+    }
+}
+void* Start(void* transaction,const void* surface,const void* parameters) {
+    Observe(surface,parameters,false);
+    TuneParent(transaction,surface,parameters);
+    return g_start(transaction,surface,parameters);
+}
+void* Adjust(void* transaction,const void* surface,const void* parameters) {
+    Observe(surface,parameters,true);
+    TuneParent(transaction,surface,parameters);
+    return g_adjust(transaction,surface,parameters);
+}
+void* Reparent(void* transaction,const void* child,const void* parent) {
+    if(child && parent && g_name && g_layer) {
+        const void* child_control=*static_cast<const void* const*>(child);
+        const void* parent_control=*static_cast<const void* const*>(parent);
+        if(child_control && parent_control &&
+           g_name(parent_control).find("Pre startup opening leash") == 0) {
+            const Anchor anchor=ReadAnchor(child_control);
+            if(anchor.task>=0 && ReadConfig().enabled && ReadConfig().content) {
+                const int32_t parent_id=g_layer(parent_control);
+                hha::Transition updated;
+                bool dispatch=false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    g_anchors[g_next_anchor++%g_anchors.size()]={parent_id,anchor.container,anchor.task};
+                    for(auto& last:g_last) {
+                        if(last.valid && last.transition.leash_layer==parent_id &&
+                           Now()-last.transition.event_ns<500000000LL) {
+                            last.transition.container_layer=anchor.container;
+                            last.transition.task_id=anchor.task;
+                            updated=last.transition;
+                            dispatch=true;
+                            break;
+                        }
+                    }
+                }
+                __android_log_print(ANDROID_LOG_INFO,kTag,
+                    "prestart anchor leash=%d task=%d container=%d dispatch=%d",
+                    parent_id,anchor.task,anchor.container,dispatch);
+                if(dispatch) hha::QueueTransition(updated);
+            }
+        }
+    }
+    return g_reparent(transaction,child,parent);
+}
+void* Stop(void* transaction,const void* surface,int32_t animation_id) {
+    if (surface && g_layer) {
+        const void* control=*static_cast<const void* const*>(surface);
+        const int32_t id=control?g_layer(control):-1;
+        bool cancel=false,icon_cancel=false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for(const auto& source:g_icons) if(source.parent==id && source.animation_id==animation_id) {
+                icon_cancel=true;break;
+            }
+            for(auto& slot:g_last) {
+                if(slot.valid && slot.transition.leash_layer==id && slot.animation_id==animation_id) {
+                    slot.valid=false;
+                    cancel=true;
+                    break;
+                }
+            }
+        }
+        if(cancel) hha::QueueCancel(id,Now());
+        if(icon_cancel) hha::CancelIconRenderer();
+    }
+    return g_stop(transaction,surface,animation_id);
+}
+void Install(void* handle) {
+    if (!handle || g_installed.exchange(true)) return;
+    void* start=dlsym(handle,kStart);
+    void* adjust=dlsym(handle,kAdjust);
+    void* stop=dlsym(handle,kStop);
+    void* reparent=dlsym(handle,kReparent);
+    void* blast=dlsym(handle,kBlastUpdate);
+    g_layer=reinterpret_cast<LayerFn>(dlsym(handle,"_ZNK7android14SurfaceControl10getLayerIdEv"));
+    g_name=reinterpret_cast<NameFn>(dlsym(handle,"_ZNK7android14SurfaceControl7getNameEv"));
+    if (!start || !adjust || !stop || !reparent || !blast || !g_layer) {
+        __android_log_print(ANDROID_LOG_WARN,kTag,"verified animation symbols unavailable");
         return;
     }
-    const Config defaults;
-    fprintf(file,
-            "# HyperHomeAnimation tunables. Rotations are degrees; RotateState stores\n"
-            "# radians internally. Re-read at most every 250 ms.\n"
-            "enabled=%d\n"
-            "x_deg=%.2f\n"
-            "y_deg=%.2f\n"
-            "z_deg=%.2f\n"
-            "center_x=%.2f\n"
-            "center_y=%.2f\n"
-            "offset_x=%.2f\n"
-            "offset_y=%.2f\n"
-            "offset_z=%.2f\n"
-            "camera_degrees=%.2f\n"
-            "camera_distance=%.2f\n"
-            "tilt_adjusts=%d\n"
-            "tilt_app_type=%d\n"
-            "tilt_icon_type=%d\n"
-            "normalize_icon_perspective=%d\n"
-            "verbose=%d\n",
-            defaults.enabled ? 1 : 0, defaults.rot_x_deg, defaults.rot_y_deg,
-            defaults.rot_z_deg, defaults.center_x, defaults.center_y, defaults.offset_x,
-            defaults.offset_y, defaults.offset_z, defaults.camera_degrees,
-            defaults.camera_distance, defaults.tilt_adjusts ? 1 : 0,
-            defaults.tilt_app_type ? 1 : 0, defaults.tilt_icon_type ? 1 : 0,
-            defaults.normalize_icon_perspective ? 1 : 0, defaults.verbose ? 1 : 0);
-    fclose(file);
-    chmod(kConfigPrimary, 0666);
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "wrote default config to %s",
-                        kConfigPrimary);
-}
-
-void InstallHooks(void* handle) {
-    if (g_api == nullptr || g_api->hookFunc == nullptr) return;
-    if (g_installed.exchange(true, std::memory_order_acq_rel)) return;
-
-    void* start = dlsym(handle, kSymStart);
-    void* adjust = dlsym(handle, kSymAdjust);
-    void* set_rotation = dlsym(handle, kSymSetRotation);
-    void* get_layer_id = dlsym(handle, kSymGetLayerId);
-
-    if (set_rotation == nullptr || start == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, kLogTag,
-                            "required libgui symbols missing (start=%p rotate=%p); this ROM "
-                            "cannot be patched by this build",
-                            start, set_rotation);
+    int status=g_api->hookFunc(start,reinterpret_cast<void*>(Start),reinterpret_cast<void**>(&g_start));
+    if (status || !g_start) {
+        if (!status) g_api->unhookFunc(start);
         return;
     }
-    g_set_surface_rotation = reinterpret_cast<SetSurfaceRotationFn>(set_rotation);
-    g_get_layer_id = reinterpret_cast<GetLayerIdFn>(get_layer_id);
-
-    WriteDefaultConfigIfMissing();
-    g_config_stamp.store(0, std::memory_order_relaxed);
-    RefreshConfig();
-
-    InstallInlineHook(start, reinterpret_cast<void*>(&HookStartSFAnimation),
-                      reinterpret_cast<void**>(&g_original_start),
-                      "Transaction::startSFAnimation");
-    if (adjust != nullptr) {
-        InstallInlineHook(adjust, reinterpret_cast<void*>(&HookAdjustSFAnimation),
-                          reinterpret_cast<void**>(&g_original_adjust),
-                          "Transaction::adjustSFAnimation");
+    status=g_api->hookFunc(adjust,reinterpret_cast<void*>(Adjust),reinterpret_cast<void**>(&g_adjust));
+    if (status || !g_adjust) {
+        if (!status) g_api->unhookFunc(adjust);
+        g_api->unhookFunc(start);
+        return;
     }
+    status=g_api->hookFunc(stop,reinterpret_cast<void*>(Stop),reinterpret_cast<void**>(&g_stop));
+    if(status || !g_stop) {
+        if(!status) g_api->unhookFunc(stop);
+        g_api->unhookFunc(adjust);
+        g_api->unhookFunc(start);
+        return;
+    }
+    status=g_api->hookFunc(reparent,reinterpret_cast<void*>(Reparent),reinterpret_cast<void**>(&g_reparent));
+    if(status || !g_reparent) {
+        if(!status) g_api->unhookFunc(reparent);
+        g_api->unhookFunc(stop);
+        g_api->unhookFunc(adjust);
+        g_api->unhookFunc(start);
+        return;
+    }
+    status=g_api->hookFunc(blast,reinterpret_cast<void*>(BlastUpdate),reinterpret_cast<void**>(&g_blast_update));
+    if(status || !g_blast_update) {
+        if(!status) g_api->unhookFunc(blast);
+        g_api->unhookFunc(reparent);
+        g_api->unhookFunc(stop);
+        g_api->unhookFunc(adjust);
+        g_api->unhookFunc(start);
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO,kTag,"central Genie launcher hooks installed pid=%d uid=%d",getpid(),getuid());
 }
-
-void OnLibraryLoaded(const char* name, void* handle) {
-    if (name == nullptr || handle == nullptr) return;
-    if (strstr(name, "libgui.so") != nullptr) InstallHooks(handle);
+void OnLoaded(const char* name,void* handle) {
+    if (name && std::strstr(name,"libgui.so")) Install(handle);
 }
-
-void BackfillLoadedLibrary(const char* name) {
-    if (name == nullptr) return;
-    void* handle = dlopen(name, RTLD_NOW | RTLD_NOLOAD);
-    if (handle == nullptr) return;
-    OnLibraryLoaded(name, handle);
-    dlclose(handle);
-}
-
 }  // namespace
 
-extern "C" __attribute__((visibility("default"), unused))
-NativeOnModuleLoaded native_init(const NativeAPIEntries* entries) {
-    if (entries == nullptr || entries->hookFunc == nullptr ||
-            entries->unhookFunc == nullptr) {
-        __android_log_print(ANDROID_LOG_ERROR, kLogTag, "native_init rejected: bad entries");
+bool hha::LauncherAnimationEnabled() {
+    const auto config=ReadConfig();
+    return config.enabled && config.content;
+}
+
+extern "C" __attribute__((visibility("default"),unused))
+Loaded native_init(const NativeAPIEntries* entries) {
+    if (!entries || !entries->hookFunc || !entries->unhookFunc) return nullptr;
+    // LSPosed can reenter native_init when the renderer pins its own library.
+    // Never recurse into renderer initialization while its mutex is held.
+    if(g_native_entered.exchange(true,std::memory_order_acq_rel)) return nullptr;
+    // Native init also runs for a module scoped to system_server. The Java
+    // central entry owns that process; never intercept its libgui transactions.
+    if (getuid()<10000) return nullptr;
+    std::string fingerprint;
+    if (const prop_info* property=__system_property_find("ro.build.fingerprint")) {
+        __system_property_read_callback(property,
+            [](void* context,const char*,const char* value,uint32_t) {
+                *static_cast<std::string*>(context)=value;
+            },&fingerprint);
+    }
+    if (fingerprint!=kFingerprint) {
+        __android_log_print(ANDROID_LOG_WARN,kTag,"unverified launcher ABI; keeping stock");
         return nullptr;
     }
-    g_api = entries;
-    __android_log_print(ANDROID_LOG_INFO, kLogTag, "native_init api=%u pid=%d uid=%d",
-                        entries->version, getpid(), getuid());
-    // libgui is usually already mapped by the time the module is injected here, so
-    // the on-library-loaded callback alone would miss it.
-    BackfillLoadedLibrary("libgui.so");
-    return &OnLibraryLoaded;
+    g_api=entries;
+    // native_init runs inside the framework/linker bootstrap. Shader Binder
+    // registration and self-dlopen must run only after that callback unwinds.
+    std::thread([] {
+        g_icon_ready.store(hha::WarmIconRenderer(),std::memory_order_release);
+    }).detach();
+    void* handle=dlopen("libgui.so",RTLD_NOW|RTLD_NOLOAD);
+    if (handle) {Install(handle);dlclose(handle);}
+    return OnLoaded;
 }

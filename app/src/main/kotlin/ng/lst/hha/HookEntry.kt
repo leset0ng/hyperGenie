@@ -8,6 +8,7 @@ import io.github.libxposed.api.XposedModuleInterface.HotReloadedParam
 import io.github.libxposed.api.XposedModuleInterface.HotReloadingParam
 import io.github.libxposed.api.XposedModuleInterface.ModuleLoadedParam
 import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam
+import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 
 /**
@@ -20,6 +21,17 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 class HookEntry : XposedModule() {
 
     private var installed = false
+    private var centralBridge: CentralBridge? = null
+
+    override fun onSystemServerStarting(param: SystemServerStartingParam) {
+        runCatching {
+            CentralBridge(this, param.classLoader).also { it.install() }
+        }.onSuccess {
+            centralBridge = it
+        }.onFailure {
+            log(Log.ERROR, TAG, "central content bridge unavailable; keeping stock animation", it)
+        }
+    }
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
         log(Log.INFO, TAG, "loaded in ${param.processName} (systemServer=${param.isSystemServer})")
@@ -77,8 +89,12 @@ class HookEntry : XposedModule() {
         log(Log.INFO, TAG, "hot reloaded, old hooks=${param.oldHookHandles.size}")
     }
 
-    /** Runs in the old generation. No target-App hooks are installed. */
-    override fun onHotReloading(param: HotReloadingParam): Boolean = true
+    /** Retire worker requests and detach effects before replacing bridge hooks. */
+    override fun onHotReloading(param: HotReloadingParam): Boolean {
+        centralBridge?.close()
+        centralBridge = null
+        return true
+    }
 
     private companion object {
         const val TAG = "HyperHomeAnimation"

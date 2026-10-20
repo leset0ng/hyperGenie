@@ -12,6 +12,6 @@ staticScope=true
 # protected (default) swallows hooker exceptions and logs them; passthrough rethrows.
 exceptionMode=protected
 
-# API 102+: allow hot reload when the module app is updated.
-# Requires exactly one Java entry class and onHotReloading() returning true.
-autoHotReload=true
+# Native display-event workers pin their library for the process lifetime.
+# Restart launcher/system_server after updates instead of mixing generations.
+autoHotReload=false
