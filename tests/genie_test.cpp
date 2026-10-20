@@ -2,6 +2,7 @@
 #include "hha_genie.h"
 #include "hha_bridge.h"
 #include "hha_viewport.h"
+#include "hha_renderer.h"
 
 #include <cmath>
 #include <cstdio>
@@ -508,6 +509,31 @@ void IconPairingAfterRepeatedLaunches() {
     Check(!hha::FindIconSource(sources,7,500000000LL),"future source cannot pair with icon");
 }
 
+void RenderRetirementAndCancellation() {
+    // A size-changing replacement can keep the same primary; a handoff can
+    // also promote an old companion to primary or demote the old primary.
+    const std::vector<int32_t> companions{20,30};
+    Check(hha::RetainsLayer(10,10,companions),"extent replacement retains existing primary");
+    Check(hha::RetainsLayer(20,10,companions),"replacement retains shared companion");
+    Check(hha::RetainsLayer(10,20,{10,30}),"starting primary survives as a companion");
+    Check(hha::RetainsLayer(20,20,{30}),"starting companion survives promotion to primary");
+    Check(!hha::RetainsLayer(40,10,companions),"removed surface is eligible for detachment");
+    Check(!hha::RetainsLayer(-1,-1,{-1}),"invalid identity cannot retain an unrelated surface");
+
+    const hha::RenderIdentity a{100,1000},b{200,2000},b_retarget{200,3000};
+    hha::RenderCancellation cancel;
+    Check(!cancel.Due(a,100),"new renderer has no cancellation");
+    cancel.Request(a,48);
+    Check(!cancel.Due(a,47),"matching icon retains its cancellation grace");
+    Check(cancel.Due(a,48),"matching icon retires after grace");
+    Check(!cancel.Due(b,100),"late stop for old icon cannot retire a new icon");
+    cancel.Request(b,148);
+    Check(!cancel.Due(b_retarget,200),"reused parent with new request survives old stop");
+    Check(cancel.Due(b,200),"original parent and request still match");
+    cancel.Clear();
+    Check(!cancel.Due(b,300),"new submission clears the old cancellation");
+}
+
 void TransitionQueueOrdering() {
     hha::PendingTransitions pending;
     Check(!pending.Ready() && !pending.Take(),"empty dispatcher has no command");
@@ -546,6 +572,7 @@ int main() {
     ParentScalarAndGestureSettings();
     TransitionQueueOrdering();
     IconPairingAfterRepeatedLaunches();
+    RenderRetirementAndCancellation();
     HostContourEndpoints();
     std::printf("Genie kernel: %d checks passed\n", checks);
     return 0;

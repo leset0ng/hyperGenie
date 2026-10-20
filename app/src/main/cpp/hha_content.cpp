@@ -52,6 +52,8 @@ RotateFn g_rotate = nullptr;
 LayerIdFn g_layer_id = nullptr;
 using CommitFn = void (*)(ASurfaceTransaction*,void*,ASurfaceTransaction_OnCommit);
 CommitFn g_on_commit = nullptr;
+using CompleteFn = void (*)(ASurfaceTransaction*,void*,ASurfaceTransaction_OnComplete);
+CompleteFn g_on_complete = ASurfaceTransaction_setOnComplete;
 
 // Nontrivial destructor preserves registerShader's AAPCS64 x8 return ABI.
 // IBinder virtually inherits RefBase: the offset is vtable[-3], not a virtual
@@ -140,6 +142,7 @@ struct Session {
     int texture_width = 0;
     int texture_height = 0;
     int64_t started_ns = 0;
+    int64_t request_ns = 0;  // Submission identity, independent of the preserved motion clock.
     int64_t last_ns = 0;
     double elapsed = 0;
     uint64_t frames = 0;
@@ -162,12 +165,14 @@ struct Session {
 struct Controller {
     std::mutex mutex;
     std::unique_ptr<Session> pending;
+    std::vector<std::unique_ptr<Session>> retiring;
     bool command = false;
-    std::atomic<int64_t> cancel_deadline{0};
+    hha::RenderCancellation cancellation;
     std::atomic<bool> has_active{false};
     std::atomic<bool> working{false};
     std::atomic<uint64_t> submitted_serial{0};
     std::atomic<uint64_t> cleared_serial{0};
+    std::atomic<uint64_t> detaches_pending{0};
     ALooper* looper = nullptr;  // Owned by the persistent rendering thread.
     AChoreographer* choreographer = nullptr;
     bool callback_pending = false;  // Rendering-thread fields below.
@@ -186,22 +191,41 @@ void ClearSurface(ASurfaceTransaction* transaction, void* surface) {
 }
 
 bool Submit(Controller& controller, Session& session, bool detach,
-            ASurfaceTransaction* supplied = nullptr) {
+            ASurfaceTransaction* supplied = nullptr, const Session* preserve = nullptr) {
     ASurfaceTransaction* transaction = supplied ? supplied : ASurfaceTransaction_create();
     if (transaction == nullptr) return false;
     if (detach) {
         // A null shader clears ePostProcessChanged's token and uniforms. Identity
         // alone would leave the effect attached and can keep this layer CLIENT.
-        ClearSurface(transaction,session.surface);
-        for(const auto& companion:session.companions) ClearSurface(transaction,companion.surface);
-        struct Completion {Controller* controller;uint64_t serial;};
-        auto* completion=new Completion{&controller,controller.submitted_serial.load(std::memory_order_acquire)};
-        ASurfaceTransaction_setOnComplete(transaction,completion,
+        std::vector<int32_t> kept;
+        if(preserve) for(const auto& companion:preserve->companions) kept.push_back(companion.layer);
+        unsigned cleared=0;
+        auto clear = [&](void* surface, int32_t layer) {
+            if(surface && (!preserve || !hha::RetainsLayer(layer,preserve->layer,kept))) {
+                ClearSurface(transaction,surface);
+                ++cleared;
+            }
+        };
+        clear(session.surface,session.layer);
+        for(const auto& companion:session.companions) clear(companion.surface,companion.layer);
+        if(!cleared) {
+            if(!supplied) ASurfaceTransaction_delete(transaction);
+            return true;
+        }
+        // A serial watermark alone cannot cover multiple independent detaches:
+        // every submitted retirement stays outstanding until its own completion.
+        struct Completion {Controller* controller;uint64_t serial;bool complete_detach;};
+        auto* completion=new Completion{&controller,controller.submitted_serial.load(std::memory_order_acquire),!preserve};
+        controller.detaches_pending.fetch_add(1,std::memory_order_release);
+        g_on_complete(transaction,completion,
             [](void* context,ASurfaceTransactionStats*) {
                 std::unique_ptr<Completion> completion(static_cast<Completion*>(context));
-                auto& cleared=completion->controller->cleared_serial;
-                uint64_t old=cleared.load();
-                while(old<completion->serial && !cleared.compare_exchange_weak(old,completion->serial)) {}
+                if(completion->complete_detach) {
+                    auto& cleared=completion->controller->cleared_serial;
+                    uint64_t old=cleared.load();
+                    while(old<completion->serial && !cleared.compare_exchange_weak(old,completion->serial)) {}
+                }
+                completion->controller->detaches_pending.fetch_sub(1,std::memory_order_release);
             });
     } else {
         const auto vertices=hha::genie::ContourMesh(session.animation,session.parameters);
@@ -251,14 +275,15 @@ bool Submit(Controller& controller, Session& session, bool detach,
     return true;
 }
 
-void Finish(Controller& controller, const char* reason) {
+void Finish(Controller& controller, const char* reason, const Session* successor = nullptr) {
     if (!controller.active) return;
     auto& session = *controller.active;
-    const bool detached = !session.attached || Submit(controller, session, true);
+    const bool detached = !session.attached || Submit(controller, session, true, nullptr, successor);
     __android_log_print(ANDROID_LOG_INFO, kTag,
-        "finish layer=%d reason=%s callbacks=%llu elapsed=%.4f detachSubmitted=%d",
-        session.layer, reason, static_cast<unsigned long long>(session.frames),
-        session.elapsed, detached);
+        "finish layer=%d request=%lld reason=%s callbacks=%llu elapsed=%.4f detachSubmitted=%d retained=%d",
+        session.layer,static_cast<long long>(session.request_ns),reason,
+        static_cast<unsigned long long>(session.frames),session.elapsed,detached,
+        successor && successor->layer==session.layer);
     controller.active.reset();
     controller.has_active.store(false,std::memory_order_release);
 }
@@ -269,35 +294,65 @@ void DetachLostSurfaces(const Session& previous,const Session& next) {
     if(!transaction) return;
     std::vector<Companion> surfaces{{previous.surface,previous.layer}};
     surfaces.insert(surfaces.end(),previous.companions.begin(),previous.companions.end());
+    std::vector<int32_t> kept;
+    for(const auto& companion:next.companions) kept.push_back(companion.layer);
     for(const auto& item:surfaces) {
-        const bool kept=item.layer==next.layer || std::any_of(next.companions.begin(),next.companions.end(),
-            [&](const Companion& companion) {return companion.layer==item.layer;});
-        if(item.layer>=0 && !kept) ClearSurface(transaction,item.surface);
+        if(item.layer>=0 && !hha::RetainsLayer(item.layer,next.layer,kept))
+            ClearSurface(transaction,item.surface);
     }
     ASurfaceTransaction_apply(transaction);
     ASurfaceTransaction_delete(transaction);
 }
 
-void ConsumeCommand(Controller& controller) {
-    std::unique_ptr<Session> next;
-    {
-        std::lock_guard<std::mutex> lock(controller.mutex);
-        if (!controller.command) return;
-        if (controller.pending && controller.pending->committed &&
-            !controller.pending->committed->load(std::memory_order_acquire)) return;
-        controller.working.store(true,std::memory_order_release);
-        next = std::move(controller.pending);
-        controller.command = false;
+// A primed external transaction can commit after its pending command was
+// superseded or stopped. Retain that session until the worker can retire it.
+void RetirePending(Controller& controller) {
+    if(controller.pending && controller.pending->attached)
+        controller.retiring.push_back(std::move(controller.pending));
+    else controller.pending.reset();
+}
+
+void RetireCommitted(Controller& controller) {
+    // The active session alone is a sufficient preserve set after adoption.
+    // Wait while an incoming initial transaction still owns a pending handoff.
+    if(controller.pending) return;
+    for(auto it=controller.retiring.begin();it!=controller.retiring.end();) {
+        auto& retired=**it;
+        if(retired.committed && !retired.committed->load(std::memory_order_acquire)) {
+            ++it;
+            continue;
+        }
+        if(!Submit(controller,retired,true,nullptr,controller.active.get())) {
+            ++it;
+            continue;
+        }
+        __android_log_print(ANDROID_LOG_INFO,kTag,"retire pending layer=%d request=%lld",
+            retired.layer,static_cast<long long>(retired.request_ns));
+        it=controller.retiring.erase(it);
     }
+}
+
+// Caller holds controller.mutex throughout command adoption and all SF writes.
+void ConsumeCommand(Controller& controller) {
+    if (!controller.command) return;
+    if (controller.pending && controller.pending->committed &&
+        !controller.pending->committed->load(std::memory_order_acquire)) return;
+    controller.working.store(true,std::memory_order_release);
+    auto next = std::move(controller.pending);
+    controller.command = false;
     struct Working {
         Controller& controller;
         ~Working() {controller.working.store(false,std::memory_order_release);}
     } working{controller};
-    if(next && !controller.active && NowNs()-next->started_ns>500000000LL) return;
+    // A primed icon transaction already owns a visible effect, even if commit
+    // delivery was late. Adopt it so the normal frame/deadline path detaches it.
+    if(next && !controller.active && !next->attached &&
+       NowNs()-next->started_ns>500000000LL) return;
     if (next && controller.active && next->layer==controller.active->layer &&
         next->width==controller.active->width && next->height==controller.active->height) {
         auto& current=*controller.active;
-        if (next->started_ns<current.started_ns) return;
+        if (next->request_ns<current.request_ns) return;
+        current.request_ns=next->request_ns;
         const bool companions_changed=current.companions.size()!=next->companions.size() ||
             !std::equal(current.companions.begin(),current.companions.end(),next->companions.begin(),
                 [](const Companion& a,const Companion& b) {return a.layer==b.layer;});
@@ -367,7 +422,7 @@ void ConsumeCommand(Controller& controller) {
         controller.active=std::move(next);
         return;
     }
-    Finish(controller, next ? "replaced" : "cancelled");
+    Finish(controller, next ? "replaced" : "cancelled", next.get());
     controller.active = std::move(next);
     controller.has_active.store(controller.active!=nullptr,std::memory_order_release);
     if (controller.active) {
@@ -390,17 +445,16 @@ void ConsumeCommand(Controller& controller) {
 
 void Frame(int64_t frame_time, void* context) {
     auto& controller = *static_cast<Controller*>(context);
+    std::lock_guard<std::mutex> lock(controller.mutex);
     controller.callback_pending = false;
     ConsumeCommand(controller);
-    {
-        std::lock_guard<std::mutex> lock(controller.mutex);
-        if(controller.pending && controller.pending->committed &&
-           !controller.pending->committed->load(std::memory_order_acquire)) return;
-    }
+    if(controller.pending && controller.pending->committed &&
+       !controller.pending->committed->load(std::memory_order_acquire)) return;
+    RetireCommitted(controller);
     if (!controller.active) return;
-    const int64_t cancel=controller.cancel_deadline.load(std::memory_order_acquire);
-    if(cancel && NowNs()>=cancel) {
-        controller.cancel_deadline.store(0,std::memory_order_release);
+    const auto& active=*controller.active;
+    if(controller.cancellation.Due({active.parent_layer,active.request_ns},NowNs())) {
+        controller.cancellation.Clear();
         Finish(controller,"icon-cancelled");
         return;
     }
@@ -444,10 +498,14 @@ void Worker(Controller* controller) {
         controller->choreographer = choreographer;
     }
     for (;;) {
-        ConsumeCommand(*controller);
-        if (controller->active && !controller->callback_pending) {
-            controller->callback_pending = true;
-            AChoreographer_postFrameCallback64(choreographer, Frame, controller);
+        {
+            std::lock_guard<std::mutex> lock(controller->mutex);
+            ConsumeCommand(*controller);
+            RetireCommitted(*controller);
+            if (controller->active && !controller->callback_pending) {
+                controller->callback_pending = true;
+                AChoreographer_postFrameCallback64(choreographer, Frame, controller);
+            }
         }
         ALooper_pollOnce(-1, nullptr, nullptr, nullptr);
     }
@@ -565,16 +623,22 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
             next->companions.push_back({overlay,layer});
             g_inc_strong(overlay,next.get());
         }
-    }    next->width=width;
+    }
+    next->width=width;
     next->height=height;
     next->texture_width=texture_width;
     next->texture_height=texture_height;
-    next->started_ns=next->last_ns=event_ns;
+    next->started_ns=next->last_ns=next->request_ns=event_ns;
     __android_log_print(ANDROID_LOG_INFO,kTag,
         "transition content=%d parent=%d close=%d icon=(%.1f,%.1f %.1fx%.1f) I=(%.1f,%.1f) G=%.4f scale=%.4f lagMs=%.1f",
         next->layer,next->parent_layer,closing,values[icon],values[icon+1],values[icon+2],values[icon+3],
         parameters.icon_x,parameters.icon_y,parameters.genie_amount_y,parameters.minimized_scale,
         static_cast<double>(now-event_ns)/1e6);
+    // Initial transaction construction/publication and worker writes share one
+    // lock. A frame cannot retire an old session after its successor is primed.
+    std::lock_guard<std::mutex> lock(controller->mutex);
+    if((controller->pending && event_ns<controller->pending->request_ns) ||
+       (controller->active && event_ns<controller->active->request_ns)) return false;
     if(initial_transaction) {
         // Queue the first SELF state in the exact transaction that installs the
         // virtual icon host. No frame may expose the unwarped tall backing plate.
@@ -594,8 +658,8 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
             if(commit->controller->looper) ALooper_wake(commit->controller->looper);
         });
     }
-    std::lock_guard<std::mutex> lock(controller->mutex);
-    controller->cancel_deadline.store(0,std::memory_order_release);
+    controller->cancellation.Clear();
+    RetirePending(*controller);
     controller->pending=std::move(next);
     controller->command=true;
     if(controller->looper) ALooper_wake(controller->looper);
@@ -628,8 +692,25 @@ bool RenderIcon(void* transaction,void* surface,void* parent,int texture_width,i
         {},false,texture_width,texture_height,transaction);
 }
 void CancelIconRenderer() {
-    if(auto* controller=g_controller.load(std::memory_order_acquire))
-        controller->cancel_deadline.store(NowNs()+48000000LL,std::memory_order_release);
+    if(auto* controller=g_controller.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(controller->mutex);
+        controller->cancellation.Clear();
+        RetirePending(*controller);
+        controller->command=true;
+        if(controller->looper) ALooper_wake(controller->looper);
+    }
+}
+void CancelIconRenderer(RenderIdentity identity) {
+    if(auto* controller=g_controller.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(controller->mutex);
+        auto matches = [&](const std::unique_ptr<Session>& session) {
+            return session && SameRender(identity,{session->parent_layer,session->request_ns});
+        };
+        if(controller->pending && !matches(controller->pending)) return;
+        if(!matches(controller->pending) && !matches(controller->active)) return;
+        controller->cancellation.Request(identity,NowNs()+48000000LL);
+        if(controller->looper) ALooper_wake(controller->looper);
+    }
 }
 }
 
@@ -638,7 +719,9 @@ Java_ng_lst_hha_ContentAnimator_nativeRunning(JNIEnv*,jclass) {
     auto* controller=g_controller.load(std::memory_order_acquire);
     if(!controller) return JNI_FALSE;
     std::lock_guard<std::mutex> lock(controller->mutex);
-    return controller->pending || controller->has_active.load() || controller->working.load() ||
+    return controller->pending || !controller->retiring.empty() ||
+        controller->detaches_pending.load(std::memory_order_acquire)>0 ||
+        controller->has_active.load() || controller->working.load() ||
         controller->submitted_serial.load()>controller->cleared_serial.load()?JNI_TRUE:JNI_FALSE;
 }
 
@@ -648,7 +731,8 @@ Java_ng_lst_hha_ContentAnimator_nativeStop(JNIEnv*, jclass) {
     if (target == nullptr) return;
     auto& controller = *target;
     std::lock_guard<std::mutex> lock(controller.mutex);
-    controller.pending.reset();
+    controller.cancellation.Clear();
+    RetirePending(controller);
     controller.command = true;
     if (controller.looper != nullptr) ALooper_wake(controller.looper);
 }

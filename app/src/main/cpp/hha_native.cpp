@@ -150,6 +150,7 @@ struct IconBuffer {
     int32_t parent=-1;
     int width=0,height=0;
     int32_t animation_id=-1;
+    int64_t request_ns=0;
 };
 std::array<IconBuffer,16> g_icons{};
 size_t g_next_icon=0;
@@ -168,6 +169,8 @@ void* BlastUpdate(void* queue,const void* reference,uint32_t width,uint32_t heig
             if(entry->surface!=surface) {
                 hha::ReleaseIconSurface(entry->surface,entry);
                 entry->surface=const_cast<void*>(surface);
+                entry->animation_id=-1;
+                entry->request_ns=0;
                 hha::RetainIconSurface(entry->surface,entry);
             }
             entry->parent=parent;entry->width=width;entry->height=height;
@@ -385,7 +388,10 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             for(auto& source:g_icons) if(source.surface && source.parent==layer) {
                 rendering=hha::RenderIcon(transaction,source.surface,const_cast<void*>(control),source.width,source.height,
                     static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition);
-                if(rendering) source.animation_id=animation_id;
+                if(rendering) {
+                    source.animation_id=animation_id;
+                    source.request_ns=snapshot.transition.event_ns;
+                }
                 break;
             }
             // A stock icon must retain its stock host/corners if no real child
@@ -474,9 +480,11 @@ void* Stop(void* transaction,const void* surface,int32_t animation_id) {
         const void* control=*static_cast<const void* const*>(surface);
         const int32_t id=control?g_layer(control):-1;
         bool cancel=false,icon_cancel=false;
+        hha::RenderIdentity icon_identity;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             for(const auto& source:g_icons) if(source.parent==id && source.animation_id==animation_id) {
+                icon_identity={source.parent,source.request_ns};
                 icon_cancel=true;break;
             }
             for(auto& slot:g_last) {
@@ -488,7 +496,7 @@ void* Stop(void* transaction,const void* surface,int32_t animation_id) {
             }
         }
         if(cancel) hha::QueueCancel(id,Now());
-        if(icon_cancel) hha::CancelIconRenderer();
+        if(icon_cancel) hha::CancelIconRenderer(icon_identity);
     }
     return g_stop(transaction,surface,animation_id);
 }
