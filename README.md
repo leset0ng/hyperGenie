@@ -1,9 +1,16 @@
 # HyperHomeAnimation
 
-A libxposed (LSPosed, API 102) module that changes the HyperOS home screen
-(`com.miui.home`) app-open animation.
+A libxposed (LSPosed, API 102) module for HyperOS app-open animations.
 
-The MVP in this repository adds a **real 3D perspective tilt** to the app window
+The current implementation includes a **real Settings content-layer Genie mesh**:
+19 independent animated scalars, a native Choreographer loop, and lifecycle
+cleanup through the formal LSPosed entry. It is narrowly verified on the
+Android 17 / HyperOS 4 AVD. The stock launcher still controls overall motion,
+startup snapshots and floating icons; this is the first content integration,
+not yet the complete iOS launch trajectory. See
+[Settings setup, validation and remaining work](docs/settings-content-animation.md).
+
+The legacy launcher integration adds a **real 3D perspective tilt** to the app window
 while the launcher's stock open animation runs. The stock animation is kept;
 one extra `RotateState` is written onto the same SurfaceFlinger transaction.
 The app camera distance remains `1600`. Floating-icon distance and anchor offsets
@@ -15,8 +22,9 @@ icon background aligned with the app throughout the morph.
 On Android 17 / HyperOS 4 the launcher ships **no dex at all**. It is a
 Rust/Flutter program started by `/system_ext/bin/hyos_spawner`, so
 `java_init.list` class hooks never execute in that process. The module therefore
-declares `META-INF/xposed/native_init.list` and does all of its work from
-`libhha_native.so`.
+declares `META-INF/xposed/native_init.list` and handles launcher work in
+`libhha_native.so`. The separate Java entry hooks Settings lifecycle methods and
+loads `libhha_content.so` for the real content-layer mesh.
 
 ## Where the hook goes
 
@@ -96,13 +104,17 @@ app UID and cannot create files under `/data/local/tmp`, so create it as root.
 app/src/main/
 ├── AndroidManifest.xml            # label/description come from resources
 ├── kotlin/ng/lst/hha/
-│   └── HookEntry.kt               # XposedModule entry (no-op on Android 17)
+│   ├── HookEntry.kt               # launcher/Settings libxposed entry
+│   ├── SettingsHooks.kt           # VRI + Activity lifecycle
+│   └── ContentAnimator.kt         # Settings native renderer JNI
 ├── cpp/
 │   ├── CMakeLists.txt             # arm64-v8a only
-│   ├── exports.map                # exports native_init only
-│   └── hha_native.cpp             # the actual implementation
+│   ├── exports.map                # launcher exports native_init only
+│   ├── hha_native.cpp             # launcher perspective integration
+│   ├── hha_content.cpp            # live content SELF renderer + native vsync
+│   └── hha_genie.h/.cpp           # 19-state spring/geometry model
 ├── resources/META-INF/xposed/
-│   ├── java_init.list             # entry class (Android 16 and below)
+│   ├── java_init.list             # entry class for dex-based Apps
 │   ├── native_init.list           # libhha_native.so (Android 17)
 │   ├── module.prop                # API versions, staticScope, exceptionMode
 │   └── scope.list                 # target packages
@@ -132,9 +144,11 @@ runtime and must never be bundled.
 adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Enable the module for `com.miui.home` in the LSPosed manager. This AVD does not
-ship the manager app, so on a headless emulator write the enable state directly
-and reboot:
+Enable the module for `com.miui.home` in the LSPosed manager, and add
+`com.android.settings` for the content integration. Settings also requires its
+opt-in configuration described in the [Settings guide](docs/settings-content-animation.md).
+This AVD does not ship the manager app, so on a headless emulator write the enable
+state directly and reboot:
 
 ```sh
 # modules_config.db lives in /data/adb/lspd/config; set modules_state.enabled=1
