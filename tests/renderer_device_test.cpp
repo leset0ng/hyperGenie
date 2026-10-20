@@ -9,7 +9,7 @@
 
 namespace {
 using namespace std::chrono_literals;
-struct Event { int layer; bool clear; };
+struct Event { int layer; bool clear; void* transaction; };
 struct CallbackCall { void* context; ASurfaceTransaction_OnComplete callback; };
 std::mutex test_mutex;
 std::condition_variable test_cv;
@@ -17,6 +17,8 @@ std::vector<Event> events;
 std::vector<CallbackCall> commits;
 std::vector<CallbackCall> completions;
 std::map<std::pair<const void*, const void*>, int> references;
+std::map<int, float> border_widths;
+std::map<int, std::array<float,44>> layer_uniforms;
 bool pause_post=false, post_paused=false, release_post=false, producer_ready=false;
 int producer_parent=-1;
 int checks=0;
@@ -40,18 +42,33 @@ int32_t Layer(const void* pointer) {
     if(Id(pointer)==producer_parent) {producer_ready=true;test_cv.notify_all();}
     return Id(pointer);
 }
-void* Post(void* transaction,const void* surface,const void* token,const void*,int32_t) {
+void* Post(void* transaction,const void* surface,const void* token,const void* payload,int32_t) {
     std::unique_lock<std::mutex> lock(test_mutex);
     const bool clear=*static_cast<void* const*>(token)==nullptr;
-    events.push_back({Id(*static_cast<void* const*>(surface)),clear});
+    const int layer=Id(*static_cast<void* const*>(surface));
+    if(!clear) {
+        const auto& bytes=*static_cast<const std::shared_ptr<std::vector<unsigned char>>*>(payload);
+        Check(bytes && bytes->size()==sizeof(std::array<float,44>),"shader payload is complete");
+        std::memcpy(layer_uniforms[layer].data(),bytes->data(),bytes->size());
+    }
+    events.push_back({layer,clear,transaction});
     if(pause_post && !clear) {
         pause_post=false;post_paused=true;test_cv.notify_all();
         Wait(lock,release_post,"paused Frame released within timeout");
     }
     return transaction; // Neither fake capability reaches an Android SDK function.
 }
-void* Rotate(void* transaction,const void*,float,float,float,float,float,
-             float,float,float,float,float) {return transaction;}
+void* Border(void* transaction,const void* surface,const BorderSettingsAbi* settings) {
+    std::lock_guard<std::mutex> lock(test_mutex);
+    const int layer=Id(*static_cast<void* const*>(surface));
+    Check(!events.empty() && events.back().layer==layer && events.back().transaction==transaction,
+          "CLIENT guard and SELF attach/detach share the same surface transaction");
+    Check(settings->width==(events.back().clear?0.0f:kClientBorderWidth),
+          "every SELF attach has positive CLIENT guard and every detach clears it");
+    Check(settings->color==0,"CLIENT guard always has zero RGBA, including retirement");
+    border_widths[layer]=settings->width;
+    return transaction;
+}
 void OnCommit(ASurfaceTransaction*,void* context,ASurfaceTransaction_OnCommit callback) {
     std::lock_guard<std::mutex> lock(test_mutex);
     commits.push_back({context,callback});test_cv.notify_all();
@@ -87,6 +104,8 @@ Controller& Fresh() {
     std::lock_guard<std::mutex> lock(test_mutex);
     for(const auto& commit:commits) Check(!commit.callback,"previous fixture consumed every fake commit");
     for(const auto& completion:completions) Check(!completion.callback,"previous fixture drained every completion");
+    for(const auto& entry:border_widths) Check(entry.second==0.0f,"previous fixture cleared every CLIENT guard");
+    border_widths.clear();
     events.clear();commits.clear();completions.clear();
     pause_post=post_paused=release_post=producer_ready=false;producer_parent=-1;
     return *controller;
@@ -160,6 +179,8 @@ void ReplacementPreservesSharedLayers() {
     Pump(controller);
     Check(controller.active && controller.active->width==1080,"replacement extent adopted");
     Check(Cleared()==std::vector<int>{203},"only lost layer cleared, shared primary and companion kept");
+    Check(border_widths[201]>0 && border_widths[202]>0 && border_widths[203]==0 && border_widths[204]>0,
+          "replacement preserves shared CLIENT guards and retires only the lost companion");
     Stop(controller);std::puts("PASS extent replacement retains shared layers");
 }
 void ScopedCancellation() {
@@ -238,15 +259,175 @@ void IndependentDetachCompletions() {
     Stop(retained);DrainCompletions();Check(!Running(),"retained successor eventually becomes idle");
     std::puts("PASS independent detach completions protect snapshot guard");
 }
+void OpeningPreviewLifetime() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    const int64_t request=NowNs();
+    Check(QueueSession(801,8001,1120,2436,opening,false,request,{802,803},true),
+          "queue opening starting buffer with verified OEM previews");
+    Pump(controller);ResetEvents();
+    Check(QueueSession(801,8001,1120,2436,opening,false,request,{803},true),
+          "OEM registry drops a preview while its SF buffer can still be visible");
+    Pump(controller);
+    Check(Cleared().empty() && controller.active->companions.size()==2,
+          "registry disappearance cannot strip a still-visible preview's shader");
+    Check(border_widths[802]>0,"retained preview keeps CLIENT alongside SELF");
+    ResetEvents();
+    Check(QueueSession(804,8001,1120,2436,opening,false,request,{},false),
+          "real App replaces starting content after preview registries empty");
+    Pump(controller);
+    Check(controller.active->layer==804 && controller.active->companions.size()==3,
+          "handoff retains previous starting buffer and all verified previews");
+    Check(Cleared().empty(),"handoff exposes no old preview rectangle");
+    Check(layer_uniforms.count(804)==1 && border_widths[804]>0,
+          "new App receives inherited contour immediately during adoption");
+    ResetEvents();
+    Stop(controller);
+    auto cleared=Cleared();std::sort(cleared.begin(),cleared.end());
+    Check(cleared==std::vector<int>({801,802,803,804}),
+          "final retirement clears real App and every retained preview");
+
+    auto& isolated=Fresh();
+    Check(QueueSession(811,8101,1120,2436,opening,false,request,{812},false),
+          "seed separate opening request");
+    Pump(isolated);ResetEvents();
+    Check(QueueSession(811,8101,1120,2436,opening,false,request+1,{},false),
+          "new immutable request reuses the App surface");
+    Pump(isolated);
+    Check(Cleared()==std::vector<int>{812} && isolated.active->companions.empty(),
+          "preview retention does not leak across request identity");
+    Stop(isolated);
+    std::puts("PASS opening preview lifetime and immediate content handoff");
+}
+void CornerEndpointRadii() {
+    for(bool closing:{false,true}) {
+        auto& controller=Fresh();
+        auto geometry=Geometry(1120,2436);
+        geometry[10]=180;geometry[11]=45.6085f;
+        if(!closing) {
+            for(size_t i=0;i<4;++i) std::swap(geometry[i],geometry[i+4]);
+            std::swap(geometry[10],geometry[11]);
+        }
+        const int layer=closing?701:702;
+        Check(QueueSession(layer,7001,1120,2436,geometry,closing,NowNs(),{},false),
+              "queue actual icon/device corner endpoints");
+        auto& pending=*controller.pending;
+        const double start=static_cast<double>(geometry[10])/geometry[2];
+        const double end=static_cast<double>(geometry[11])/geometry[6];
+        Check(std::abs(pending.corner.value-start)<1e-12,
+              "corner seeds supplied physical start radius in visible-width units");
+        Check(std::abs(pending.corner.target-end)<1e-12,
+              "corner targets supplied physical end radius in visible-width units");
+        Check(pending.corner.response==pending.parameters.response,
+              "corner response follows opening or closing dynamics");
+        Check(Submit(controller,pending,false),"submit exact start corner before time advance");
+        Check(std::abs(layer_uniforms[layer][38]-start)<1e-6,
+              "first shader corner matches actual start instead of fixed .225");
+        Pump(controller);
+        auto& current=*controller.active;
+        current.animation.Advance(5);
+        hha::genie::AdvanceScalar(&current.corner,5,1.0);
+        Check(Submit(controller,current,false),"submit converged endpoint corner");
+        Check(std::abs(layer_uniforms[layer][38]*geometry[6]-geometry[11])<1e-4,
+              "final shader corner reconstructs physical icon/device endpoint");
+        Stop(controller);
+    }
+    std::puts("PASS physical icon/device corner endpoints in both directions");
+}
+void CornerRetargetAndHandoff() {
+    auto& controller=Fresh();
+    auto closing=Geometry(1120,2436);
+    closing[10]=180;closing[11]=45.6085f;
+    Check(QueueSession(711,7101,1120,2436,closing,true,NowNs(),{},true),
+          "seed starting layer corner state");
+    Pump(controller);
+    auto& current=*controller.active;
+    current.animation.Advance(.12);
+    hha::genie::AdvanceScalar(&current.corner,.12,1.0);
+    current.last_ns=NowNs()+10000000LL;
+    const auto corner=current.corner;
+    auto opening=closing;
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    Check(QueueSession(711,7101,1120,2436,opening,false,NowNs(),{},true),
+          "queue unprimed corner reversal");
+    Pump(controller);
+    Check(controller.active->corner.value==corner.value &&
+          controller.active->corner.velocity==corner.velocity,
+          "unprimed reversal preserves corner position and velocity");
+    Check(std::abs(controller.active->corner.target-180.0/1120)<1e-12,
+          "unprimed reversal targets the supplied device corner");
+    Check(controller.active->corner.response==hha::genie::kOpeningResponse,
+          "unprimed reversal updates corner response");
+    Check(QueueSession(712,7101,1120,2436,opening,false,NowNs(),{},false),
+          "queue real-content handoff");
+    Pump(controller);
+    Check(controller.active->layer==712 && controller.active->corner.value==corner.value &&
+          controller.active->corner.velocity==corner.velocity,
+          "starting-to-content handoff preserves the live corner and velocity");
+    Check(std::abs(controller.active->corner.target-180.0/1120)<1e-12,
+          "handoff retains the nonzero device corner target");
+    Stop(controller);
+    std::puts("PASS corner reversal and starting/content handoff continuity");
+}
+void PrimedReversalContinuity() {
+    auto& controller=Fresh();Check(Queue(601,6001),"seed closing icon state");Pump(controller);
+    auto& current=*controller.active;
+    current.animation.Advance(.18);
+    hha::genie::AdvanceScalar(&current.corner,.18,1.0);
+    // Model a vsync timestamp slightly ahead of the submission clock, so a
+    // retarget must preserve the already-published state without extra advance.
+    current.last_ns=NowNs()+10000000LL;
+    const auto mesh=hha::genie::ContourMesh(current.animation,current.parameters);
+    const double corner=current.corner.value;
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create reversal transaction");
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    Check(QueueSession(601,6001,1120,2436,opening,false,NowNs(),{},false,
+                       171,171,transaction),"prime reversal on same buffer");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    Check(controller.pending && controller.pending->primed_continuation,"prime inherits active continuation");
+    for(size_t i=0;i<mesh.size();++i) {
+        Check(std::abs(layer_uniforms[601][i*4]-mesh[i].x)<1e-6 &&
+              std::abs(layer_uniforms[601][i*4+1]-mesh[i].y)<1e-6,
+              "first reversal transaction keeps live contour instead of a fresh endpoint");
+    }
+    Check(std::abs(layer_uniforms[601][38]-corner)<1e-6,"first reversal keeps current corner");
+    Check(controller.pending->corner.velocity==current.corner.velocity,
+          "primed reversal preserves corner velocity");
+    Check(std::abs(controller.pending->corner.target-100.0/1120)<1e-12,
+          "primed reversal targets supplied device radius");
+    const auto primed_corner=controller.pending->corner;
+    const auto primed=controller.pending->animation.Scalars();
+    Commit(0);Pump(controller);
+    Check(!controller.active->closing,"committed reversal changes direction");
+    Check(controller.active->corner.value==primed_corner.value &&
+          controller.active->corner.velocity==primed_corner.velocity &&
+          controller.active->corner.target==primed_corner.target,
+          "commit adopts exact primed corner state and endpoint");
+    for(size_t i=0;i<primed.size();++i) {
+        Check(controller.active->animation.Scalars()[i].value==primed[i].value &&
+              controller.active->animation.Scalars()[i].velocity==primed[i].velocity,
+              "commit adopts exact primed value and velocity");
+    }
+    Stop(controller);std::puts("PASS primed reversal preserves the published contour");
+}
 } // namespace
 
 int main() {
     alarm(25); // Bound failures in the real mutex/callback paths as well as fake barriers.
-    g_post=Post;g_rotate=Rotate;g_layer_id=Layer;g_inc_strong=Inc;g_dec_strong=Dec;g_on_commit=OnCommit;
+    g_post=Post;g_border=Border;g_layer_id=Layer;g_inc_strong=Inc;g_dec_strong=Dec;g_on_commit=OnCommit;
     g_on_complete=OnComplete;
+    Check(std::isfinite(kClientBorderWidth) && kClientBorderWidth>0 && kClientBorderWidth<0.001f,
+          "CLIENT guard stays finite, strictly positive, and below one thousandth of a pixel");
     FramePrimeOrdering();ReplacementPreservesSharedLayers();ScopedCancellation();PendingRetirement();
-    IndependentDetachCompletions();DrainCompletions();
+    IndependentDetachCompletions();PrimedReversalContinuity();CornerEndpointRadii();
+    CornerRetargetAndHandoff();OpeningPreviewLifetime();DrainCompletions();
     {std::lock_guard<std::mutex> lock(test_mutex);
+     for(const auto& entry:border_widths) Check(entry.second==0.0f,"all CLIENT guards cleared after retirement");
      for(const auto& entry:references) Check(entry.second==0,"all fake capabilities released");
      for(const auto& commit:commits) Check(!commit.callback,"all fake commit callbacks consumed");
      for(const auto& completion:completions) Check(!completion.callback,"all fake completions consumed");}

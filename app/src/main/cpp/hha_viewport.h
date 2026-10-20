@@ -2,9 +2,19 @@
 #pragma once
 
 #include "hha_genie.h"
+#include <algorithm>
 #include <cmath>
 
 namespace hha::genie {
+
+// The shader's round-rect metric measures both axes in visible-width units.
+// Convert each physical endpoint independently: icon and window widths differ,
+// and a gesture release can begin from a partially scaled presentation.
+inline double CornerRatio(double radius,const Rect& rect) {
+    if(!std::isfinite(radius) || !std::isfinite(rect.width) || !std::isfinite(rect.height) ||
+       rect.width<=0 || rect.height<=0) return 0.0;
+    return std::clamp(radius,0.0,0.5*std::min(rect.width,rect.height))/rect.width;
+}
 
 // Android's SF parent exposes one uniform scale. Adapt the document's changing
 // local B aspect into that host, preserving raw row differences and centre lag.

@@ -29,6 +29,8 @@ struct AnimationSource {
     Transition transition;
     int32_t animation_id = -1;
     genie::Rect window{0,0,0,0};
+    genie::Rect presentation_start{0,0,0,0};
+    bool adjusting = false;
     bool valid = false;
 };
 

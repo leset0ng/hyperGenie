@@ -509,6 +509,24 @@ void IconPairingAfterRepeatedLaunches() {
     Check(!hha::FindIconSource(sources,7,500000000LL),"future source cannot pair with icon");
 }
 
+void CornerEndpointMetrics() {
+    const Rect icon{349,2122,160,160},window{0,0,1120,2436};
+    const double icon_ratio=hha::genie::CornerRatio(42.64,icon);
+    const double device_ratio=hha::genie::CornerRatio(180,window);
+    Near(icon_ratio*icon.width,42.64,1e-12,"icon round-rect metric preserves physical radius");
+    Near(device_ratio*window.width,180,1e-12,"device round-rect metric preserves physical radius");
+    Check(icon_ratio>0.225,"real icon radius is not clipped to historical fixed ratio");
+    Check(device_ratio>0,"full-device endpoint keeps nonzero device corners");
+    Near(hha::genie::CornerRatio(90,{0,0,560,1218}),device_ratio,1e-15,
+         "gesture release inherits the same radius ratio after uniform scaling");
+    Near(hha::genie::CornerRatio(1000,icon),.5,1e-15,"radius clamps to half shortest side");
+    Near(hha::genie::CornerRatio(1000,{0,0,400,100}),.125,1e-15,
+         "landscape round-rect clamp respects height");
+    Near(hha::genie::CornerRatio(0,window),0,0,"square device corner remains square");
+    Near(hha::genie::CornerRatio(-1,icon),0,0,"negative radius cannot invert corner coverage");
+    Near(hha::genie::CornerRatio(20,{0,0,0,100}),0,0,"invalid metric cannot divide by zero");
+}
+
 void RenderRetirementAndCancellation() {
     // A size-changing replacement can keep the same primary; a handoff can
     // also promote an old companion to primary or demote the old primary.
@@ -572,6 +590,7 @@ int main() {
     ParentScalarAndGestureSettings();
     TransitionQueueOrdering();
     IconPairingAfterRepeatedLaunches();
+    CornerEndpointMetrics();
     RenderRetirementAndCancellation();
     HostContourEndpoints();
     std::printf("Genie kernel: %d checks passed\n", checks);

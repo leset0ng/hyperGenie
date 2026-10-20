@@ -279,11 +279,18 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
         "corner layer=%d radius=%.2f->%.2f corner=%.2f->%.2f ratio=%.3f->%.3f",
         id,radius.start,radius.end,corner.start,corner.end,radius_ratio.start,radius_ratio.end);
+    const hha::genie::Rect presentation_start{request.geometry[0],request.geometry[1],
+        request.geometry[2],request.geometry[3]};
     if (adjust && cached.valid) {
-        // Direction uses the stable full domain. The supplied start is the live
-        // gesture presentation and must survive both close and open retargets.
+        // A live host is already expanded to the window aspect. Keep the true
+        // icon endpoint separate from that current presentation on a reversal.
         const double full_area=cached.window.width*cached.window.height;
         if(full_area>0) request.closing=end_area<0.5*full_area;
+        if(!request.closing) {
+            const size_t icon=cached.transition.closing?4:0;
+            std::copy_n(cached.transition.geometry.begin()+icon,4,request.geometry.begin());
+            request.geometry[10]=cached.transition.geometry[cached.transition.closing?11:10];
+        }
     }
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -293,6 +300,8 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         if (!previous) previous=&g_last[g_next++%g_last.size()];
         if(!request.closing) g_window={request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
         previous->window=g_window;
+        previous->presentation_start=presentation_start;
+        previous->adjusting=adjust && cached.valid;
         previous->transition=request;
         previous->animation_id=animation_id;
         previous->valid=true;
@@ -399,7 +408,8 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             if(!rendering) return;
         }
         const hha::genie::Rect original_start{geometry[0],geometry[1],geometry[2],geometry[3]};
-        const auto start=snapshot.transition.closing?original_start:minimized;
+        const auto start=snapshot.adjusting?snapshot.presentation_start:
+            (snapshot.transition.closing?original_start:minimized);
         const auto end=snapshot.transition.closing?minimized:window;
         SetSpring(parameters,"centerX",start.left+start.width/2,end.left+end.width/2);
         SetSpring(parameters,"centerY",start.top+start.height/2,end.top+end.height/2);

@@ -30,7 +30,16 @@ full-buffer viewport: stock aspect cropping and stock corner channels are
 removed, and the content shader draws the visible mesh contour and its source
 corner mask. The floating icon's real BBQ child uses the same mesh and source
 clock. Its first shader state and parent viewport are submitted atomically;
-subsequent updates wait for transaction commit. The destination's tall virtual
+subsequent updates wait for transaction commit. SELF attachment also sets a
+fully transparent border (`width=1e-6`, packed color zero) on actual buffer
+children. Both ordinary and SF-animation snapshot updates retain CLIENT for
+positive border width. Standard shadow radius remains zero after the earlier
+shadow guard produced a dark exterior. Detachment clears the effect and border
+together. Initial publication, frame
+writes and retirement share one controller lock. Replacements keep shared
+primary/companion layers, and icon stops match both parent and request epoch.
+Superseded primed transactions remain owned until commit and cleanup; snapshot
+capture waits for every detach completion. The destination's tall virtual
 crop remains separate from the square icon's sampled source footprint, so the
 padded canvas is not compressed into the final icon. Platform alpha handoff and
 completion callbacks remain active.
@@ -79,6 +88,14 @@ entries in its LSPosed configuration. Reboot after changing scope or installing
 an updated native module; automatic hot reload is disabled because persistent
 native workers pin their library until process exit.
 
+On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
+controller in an isolated executable with fake surface capabilities and empty
+SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
+commit order, independent detach completions, and atomic CLIENT-guard lifetime.
+The current suite passes 677 checks; `ADB_SERIAL` selects a device. It does not
+install the module or touch
+real App layers.
+
 The module app has no Activity. Its metadata is shown by the framework.
 
 ## Runtime switches
@@ -123,28 +140,39 @@ app/src/main/
 
 ## Validation status
 
-The current build passes Android assembly/lint and 758 native checks. On the
-AVD, Settings and Calculator enter forced CLIENT composition during the sampled
-open/close transitions and return to normal composition afterward. The recorded
-matrix also checks cleanup after rapid reversal, runtime disable and zero
-animation scale, verifies that neither target loads the module, and keeps
-system_server, SurfaceFlinger and launcher PIDs stable. No new crash-buffer
-entries appeared during that matrix; radio/camera failures already present at
-its start are retained in the evidence. Rotation samples contained no target
-output layers and do not establish successful mid-animation rotation rendering.
+The current build passes Android assembly/lint, 781 native geometry checks and
+677 isolated checks of the actual renderer. Sampled Settings/Calculator
+transitions verify content access, composition and cleanup; these checks do not
+establish complete visual fidelity. The earlier positive-shadow CLIENT guard
+caused a visible dark exterior and has been replaced by a fully transparent
+positive-width border, with standard shadow radius left zero.
 
-Frame-by-frame captures still show occasional unmasked rectangular content or
-a tall icon during some transitions. Correct square icon proportions have been
-captured near closing completion, but this is not a complete visual pass. Static
-ROM analysis confirms that a linear/LUT color-processing branch can return
-before wrapping the SELF shader, even under CLIENT composition. That branch's
-presence is proven; its execution during the remaining flashes has not been
-measured. A subsequent per-layer dimming experiment produced no reliable visual
-improvement and was discarded. Its anomalous-frame samples did not verify the
-intended dimming state, so it cannot exclude brightness scaling as a cause. The
-ROM's native MSKP capture was also blocked from writing its output; diagnostic
-properties and the experimental APK were restored. The module therefore remains
-an experimental integration, not a finished iOS animation replacement.
+Browser/gallery opening captures exposed a separate problem: OEM preview
+buffers could remain visible after their registry entries disappeared, while
+the renderer had already cleared their shader. Already-verified opening previews
+now keep the shared mesh until final retirement of that same request, and a
+starting-to-App handoff primes its inherited state immediately. Actual icon and
+device corner radii replace the former hard-coded .225-to-zero mask; the AVD's
+configured device radius is 180px. Position and velocity survive reversal.
+
+OEM preview selection also uses the verified type mapping: `1=Snapshot`,
+`2=Splash`. Snapshot requires its observed identity draw domain; Splash uses its
+fixed full-size Canvas domain. The latest installed capture found no shader
+loss after attachment across 14 sampled preview layers and no shadow draw
+scopes; core processes and the crash buffer remained unchanged. The user
+reports ordinary opening now looks correct.
+
+**Cold launches and rapid switching between Apps still have visible issues.**
+Some preview layers are drawn for one to three samples before central takeover;
+current validation does not establish an atomic cold-launch or cross-App first
+frame. These paths remain follow-up work. See
+[the composition fix and evidence](docs/client-composition-fix.md).
+
+The emulator has a separate verified host-capture buffer-selection problem
+when its secondary display is enabled; recordings temporarily disable it and
+restore it afterward. HDR/color-processing bypasses, other display
+configurations, full gesture fidelity and production performance remain outside
+current validation. The module remains an experimental integration.
 
 Ignored local evidence is under `temp/ios-module-integration/validation/` and
 `temp/ios-module-integration/resumed-validation/`, including physical recordings,

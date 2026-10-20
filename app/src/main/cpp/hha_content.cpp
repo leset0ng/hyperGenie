@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -37,18 +38,31 @@ constexpr char kRegister[] =
     "_ZN7android21SurfaceComposerClient14registerShaderERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_";
 constexpr char kPost[] =
     "_ZN7android21SurfaceComposerClient11Transaction14setPostProcessERKNS_2spINS_14SurfaceControlEEERKNS2_INS_7IBinderEEERKNSt3__110shared_ptrINSB_6vectorIhNSB_9allocatorIhEEEEEENS_13layer_state_t12SampleTargetE";
-constexpr char kRotate[] =
-    "_ZN7android21SurfaceComposerClient11Transaction18setSurfaceRotationERKNS_2spINS_14SurfaceControlEEEffffffffff";
+constexpr char kBorder[] =
+    "_ZN7android21SurfaceComposerClient11Transaction17setBorderSettingsERKNS_2spINS_14SurfaceControlEEENS_3gui14BorderSettingsE";
+// Both snapshot paths preserve CLIENT for a positive border width, even with
+// fully transparent color. Keep standard shadows at their original zero: a
+// positive shadow radius draws the unwarped host and darkens the mesh exterior.
+constexpr float kClientBorderWidth = 1e-6f;
+// The verified nontrivial by-value setter receives an indirect argument and
+// only copies width/color at +8. It never reads the vptr or destroys this view.
+struct BorderSettingsAbi {
+    void* vptr = nullptr;
+    float width = 0;
+    uint32_t color = 0;
+};
+static_assert(sizeof(BorderSettingsAbi) == 16);
+static_assert(offsetof(BorderSettingsAbi, width) == 8);
+static_assert(offsetof(BorderSettingsAbi, color) == 12);
 
 using StrongFn = void (*)(const void*, const void*);
 using PostFn = void* (*)(void*, const void*, const void*, const void*, int32_t);
-using RotateFn = void* (*)(void*, const void*, float, float, float, float, float,
-                           float, float, float, float, float);
+using BorderFn = void* (*)(void*, const void*, const BorderSettingsAbi*);
 using LayerIdFn = int32_t (*)(const void*);
 StrongFn g_inc_strong = nullptr;
 StrongFn g_dec_strong = nullptr;
 PostFn g_post = nullptr;
-RotateFn g_rotate = nullptr;
+BorderFn g_border = nullptr;
 LayerIdFn g_layer_id = nullptr;
 using CommitFn = void (*)(ASurfaceTransaction*,void*,ASurfaceTransaction_OnCommit);
 CommitFn g_on_commit = nullptr;
@@ -148,6 +162,7 @@ struct Session {
     uint64_t frames = 0;
     uint64_t generation = 1;
     bool attached = false;
+    bool primed_continuation = false;
     bool closing = false;
     bool starting = false;
     hha::genie::Parameters parameters;
@@ -187,7 +202,8 @@ void ClearSurface(ASurfaceTransaction* transaction, void* surface) {
     void* empty=nullptr;
     std::shared_ptr<std::vector<unsigned char>> uniforms;
     g_post(transaction,&surface,&empty,&uniforms,0);
-    g_rotate(transaction,&surface,0,0,0,0,0,0,0,0,45,1600);
+    const BorderSettingsAbi border{};
+    g_border(transaction,&surface,&border);
 }
 
 bool Submit(Controller& controller, Session& session, bool detach,
@@ -243,13 +259,14 @@ bool Submit(Controller& controller, Session& session, bool detach,
         // final square silhouette compresses the glyph into its upper half.
         values[40]=static_cast<float>(session.texture_width?session.texture_width:session.width);
         values[41]=static_cast<float>(session.texture_height?session.texture_height:session.height);
-        // The corner channel retains its own value/velocity and inherits the
-        // physical corner at gesture release. This is an Android adaptation,
-        // not a recovered complete iOS radius(t).
-        values[38]=static_cast<float>(std::clamp(session.corner.value,0.0,0.225));
         const double visible_width=std::max(1e-6,(vertices[2].x-vertices[0].x)*session.width);
         const double visible_height=std::max(1e-6,(vertices[6].y-vertices[0].y)*session.height);
         values[39]=static_cast<float>(visible_height/visible_width);
+        // Both round-rect metric axes use the current visible width as one
+        // unit. Endpoint ratios come from the actual icon/device radii, while
+        // the independent spring preserves its value and velocity on reversal.
+        values[38]=static_cast<float>(std::clamp(session.corner.value,0.0,
+            0.5*std::min(1.0,visible_height/visible_width)));
         auto uniforms = std::make_shared<std::vector<unsigned char>>(sizeof(values));
         std::memcpy(uniforms->data(), values.data(), sizeof(values));
         std::vector<void*> surfaces{session.surface};
@@ -257,7 +274,8 @@ bool Submit(Controller& controller, Session& session, bool detach,
         for(void* surface:surfaces) {
             if(!surface) continue;
             g_post(transaction,&surface,&controller.shader,&uniforms,0);
-            g_rotate(transaction,&surface,0,0,1e-6f,0,0,0,0,0,45,1600);
+            const BorderSettingsAbi border{nullptr,kClientBorderWidth,0};
+            g_border(transaction,&surface,&border);
         }
         session.attached = true;
         controller.submitted_serial.fetch_add(1,std::memory_order_acq_rel);
@@ -332,6 +350,27 @@ void RetireCommitted(Controller& controller) {
     }
 }
 
+// Removing an OEM preview from its registry does not remove its visible SF
+// layer. Keep each verified opening capability under the same mesh until this
+// request finishes; otherwise a still-opaque preview becomes a full rectangle
+// behind the animated App. The immutable request, parent and extent bound reuse.
+void PreserveOpeningPreviews(Session& next, const Session& previous) {
+    if(next.closing || previous.closing || next.request_ns!=previous.request_ns ||
+       next.parent_layer!=previous.parent_layer || next.width!=previous.width ||
+       next.height!=previous.height) return;
+    auto retain=[&](void* surface,int32_t layer) {
+        if(!surface || layer<0 || layer==next.layer ||
+           std::any_of(next.companions.begin(),next.companions.end(),
+               [&](const Companion& item) {return item.layer==layer;})) return;
+        next.companions.push_back({surface,layer});
+        g_inc_strong(surface,&next);
+    };
+    for(const auto& item:previous.companions) retain(item.surface,item.layer);
+    if(previous.starting) retain(previous.surface,previous.layer);
+    std::sort(next.companions.begin(),next.companions.end(),
+        [](const Companion& a,const Companion& b) {return a.layer<b.layer;});
+}
+
 // Caller holds controller.mutex throughout command adoption and all SF writes.
 void ConsumeCommand(Controller& controller) {
     if (!controller.command) return;
@@ -348,11 +387,25 @@ void ConsumeCommand(Controller& controller) {
     // delivery was late. Adopt it so the normal frame/deadline path detaches it.
     if(next && !controller.active && !next->attached &&
        NowNs()-next->started_ns>500000000LL) return;
+    if(next && controller.active) PreserveOpeningPreviews(*next,*controller.active);
     if (next && controller.active && next->layer==controller.active->layer &&
         next->width==controller.active->width && next->height==controller.active->height) {
         auto& current=*controller.active;
         if (next->request_ns<current.request_ns) return;
         current.request_ns=next->request_ns;
+        if(next->primed_continuation) {
+            // Adopt the exact state already published with the parent viewport.
+            // Replaying a fresh endpoint for one transaction causes a flash
+            // before this normal same-layer continuation can retarget it.
+            current.animation=next->animation;
+            current.parameters=next->parameters;
+            current.corner=next->corner;
+            current.closing=next->closing;
+            current.started_ns=next->started_ns;
+            current.last_ns=next->last_ns;
+            current.elapsed=next->elapsed;
+            current.generation=next->generation;
+        }
         const bool companions_changed=current.companions.size()!=next->companions.size() ||
             !std::equal(current.companions.begin(),current.companions.end(),next->companions.begin(),
                 [](const Companion& a,const Companion& b) {return a.layer==b.layer;});
@@ -361,6 +414,9 @@ void ConsumeCommand(Controller& controller) {
             for(const auto& companion:current.companions) g_dec_strong(companion.surface,&current);
             current.companions=next->companions;
             for(const auto& companion:current.companions) g_inc_strong(companion.surface,&current);
+            // Cover newly discovered buffers immediately, before another SF
+            // frame can draw them without the shared contour.
+            Submit(controller,current,false);
         }
         if (next->parent_layer!=current.parent_layer) {
             if (current.parent) g_dec_strong(current.parent,&current);
@@ -383,7 +439,8 @@ void ConsumeCommand(Controller& controller) {
             current.animation.Retarget(parameters,next->closing);
             current.parameters=parameters;
             current.closing=next->closing;
-            current.corner.target=next->closing?0.225:0.0;
+            current.corner.target=next->corner.target;
+            current.corner.response=next->corner.response;
             current.started_ns=next->started_ns;
             current.elapsed=0;
             ++current.generation;
@@ -400,8 +457,10 @@ void ConsumeCommand(Controller& controller) {
         const auto& previous=*controller.active;
         const auto requested=next->parameters;
         next->animation=previous.animation;
+        const auto requested_corner=next->corner;
         next->corner=previous.corner;
-        next->corner.target=next->closing?0.225:0.0;
+        next->corner.target=requested_corner.target;
+        next->corner.response=requested_corner.response;
         next->parameters=previous.parameters;
         next->last_ns=previous.last_ns;
         next->started_ns=previous.started_ns;
@@ -420,6 +479,9 @@ void ConsumeCommand(Controller& controller) {
             previous.layer,next->layer,next->companions.size(),next->starting,
             static_cast<unsigned long long>(next->generation));
         controller.active=std::move(next);
+        // The live App may already have a queued buffer. Publish its inherited
+        // state during adoption rather than waiting for the next vsync callback.
+        Submit(controller,*controller.active,false);
         return;
     }
     Finish(controller, next ? "replaced" : "cancelled", next.get());
@@ -540,12 +602,12 @@ bool Initialize() {
     }
     auto reg = reinterpret_cast<RegisterFn>(dlsym(gui, kRegister));
     g_post = reinterpret_cast<PostFn>(dlsym(gui, kPost));
-    g_rotate = reinterpret_cast<RotateFn>(dlsym(gui, kRotate));
+    g_border = reinterpret_cast<BorderFn>(dlsym(gui, kBorder));
     g_layer_id = reinterpret_cast<LayerIdFn>(dlsym(gui, "_ZNK7android14SurfaceControl10getLayerIdEv"));
     g_inc_strong = reinterpret_cast<StrongFn>(dlsym(utils, "_ZNK7android7RefBase9incStrongEPKv"));
     g_dec_strong = reinterpret_cast<StrongFn>(dlsym(utils, "_ZNK7android7RefBase9decStrongEPKv"));
     g_on_commit = reinterpret_cast<CommitFn>(dlsym(platform, "ASurfaceTransaction_setOnCommit"));
-    if (!reg || !g_post || !g_rotate || !g_layer_id || !g_inc_strong || !g_dec_strong || !g_on_commit) {
+    if (!reg || !g_post || !g_border || !g_layer_id || !g_inc_strong || !g_dec_strong || !g_on_commit) {
         __android_log_print(ANDROID_LOG_WARN, kTag, "required ROM symbols missing; content animation disabled");
         return false;
     }
@@ -604,9 +666,10 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     next->parameters=parameters;
     next->closing=closing;
     next->starting=starting;
-    const double inherited_corner=closing?
-        std::clamp(static_cast<double>(values[10])/std::max(1.0f,values[2]),0.0,0.225):0.225;
-    next->corner={inherited_corner,0.0,closing?0.225:0.0,0.336};
+    const hha::genie::Rect start_rect{values[0],values[1],values[2],values[3]};
+    const hha::genie::Rect end_rect{values[4],values[5],values[6],values[7]};
+    next->corner={hha::genie::CornerRatio(values[10],start_rect),0.0,
+        hha::genie::CornerRatio(values[11],end_rect),parameters.response};
     if(!next->animation.Reset(parameters,!closing)||!next->animation.Retarget(closing)) return JNI_FALSE;
     next->surface=reinterpret_cast<void*>(static_cast<uintptr_t>(surface));
     next->parent=reinterpret_cast<void*>(static_cast<uintptr_t>(parent));
@@ -630,10 +693,10 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     next->texture_height=texture_height;
     next->started_ns=next->last_ns=next->request_ns=event_ns;
     __android_log_print(ANDROID_LOG_INFO,kTag,
-        "transition content=%d parent=%d close=%d icon=(%.1f,%.1f %.1fx%.1f) I=(%.1f,%.1f) G=%.4f scale=%.4f lagMs=%.1f",
+        "transition content=%d parent=%d close=%d icon=(%.1f,%.1f %.1fx%.1f) I=(%.1f,%.1f) G=%.4f scale=%.4f lagMs=%.1f cornerPx=%.2f->%.2f cornerRatio=%.5f->%.5f",
         next->layer,next->parent_layer,closing,values[icon],values[icon+1],values[icon+2],values[icon+3],
         parameters.icon_x,parameters.icon_y,parameters.genie_amount_y,parameters.minimized_scale,
-        static_cast<double>(now-event_ns)/1e6);
+        static_cast<double>(now-event_ns)/1e6,values[10],values[11],next->corner.value,next->corner.target);
     // Initial transaction construction/publication and worker writes share one
     // lock. A frame cannot retire an old session after its successor is primed.
     std::lock_guard<std::mutex> lock(controller->mutex);
@@ -643,9 +706,34 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
         // Queue the first SELF state in the exact transaction that installs the
         // virtual icon host. No frame may expose the unwarped tall backing plate.
         const double delta=static_cast<double>(now-event_ns)/1e9;
-        next->animation.Advance(std::max(0.0,delta));
-        hha::genie::AdvanceScalar(&next->corner,std::max(0.0,delta),1.0);
+        if(controller->active && controller->active->layer==next->layer &&
+           controller->active->width==width && controller->active->height==height) {
+            const auto& current=*controller->active;
+            const auto requested_corner=next->corner;
+            next->animation=current.animation;
+            next->parameters=current.parameters;
+            next->corner=current.corner;
+            next->last_ns=current.last_ns;
+            next->started_ns=current.started_ns;
+            next->generation=current.generation;
+            const double advance=std::max(0.0,static_cast<double>(now-current.last_ns)/1e9);
+            next->animation.Advance(advance);
+            hha::genie::AdvanceScalar(&next->corner,advance,1.0);
+            next->corner.target=requested_corner.target;
+            next->corner.response=requested_corner.response;
+            if(current.closing!=next->closing) {
+                next->parameters.response=closing?hha::genie::kClosingResponse:hha::genie::kOpeningResponse;
+                next->animation.Retarget(next->parameters,next->closing);
+                next->started_ns=event_ns;
+                ++next->generation;
+            }
+            next->primed_continuation=true;
+        } else {
+            next->animation.Advance(std::max(0.0,delta));
+            hha::genie::AdvanceScalar(&next->corner,std::max(0.0,delta),1.0);
+        }
         next->last_ns=std::max(now,event_ns);
+        next->elapsed=std::max(0.0,static_cast<double>(now-next->started_ns)/1e9);
         auto* transaction=static_cast<ASurfaceTransaction*>(initial_transaction);
         if(!Submit(*controller,*next,false,transaction)) return false;
         next->committed=std::make_shared<std::atomic<bool>>(false);

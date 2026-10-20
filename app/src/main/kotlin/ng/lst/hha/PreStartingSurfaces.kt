@@ -144,7 +144,11 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
                             synchronized(drawDomains) { drawDomains[sourceLayer]?.let(::Rect) }
                         }.getOrNull()
                     }
-                    if (type == 1 || (type == 2 && observed == frame)) {
+                    // OEM type 1 posts a TaskSnapshot and may change the SC
+                    // scale/rotation, so require its observed identity domain.
+                    // Type 2 paints Splash pixels into a full-sized Canvas;
+                    // bitmap rotation does not change the SurfaceControl domain.
+                    if (type == PRESTART_SPLASH || (type == PRESTART_SNAPSHOT && observed == frame)) {
                         addCopy(surface, width, height, false, seen, owned)
                     }
                 }
@@ -238,6 +242,8 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
 
     private companion object {
         const val TAG = "HHA.PreStarting"
+        const val PRESTART_SNAPSHOT = 1
+        const val PRESTART_SPLASH = 2
         const val MAX_DRAW_DOMAINS = 64
     }
 }
