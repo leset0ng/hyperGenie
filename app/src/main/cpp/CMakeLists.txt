@@ -43,3 +43,23 @@ set_target_properties(${HHA_TARGET} PROPERTIES
     CXX_EXTENSIONS OFF
     OUTPUT_NAME "${HHA_TARGET}"
 )
+
+# Loaded by the Settings Java entry; independent of the launcher's native hooks.
+add_library(hha_content SHARED hha_content.cpp hha_genie.cpp)
+target_compile_features(hha_content PRIVATE cxx_std_17)
+target_compile_options(hha_content PRIVATE
+    -fno-exceptions
+    -fno-rtti
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+    -Wall
+    -Wextra
+    -Werror
+)
+target_link_options(hha_content PRIVATE
+    -Wl,--no-undefined
+    -Wl,-z,relro
+    -Wl,-z,now
+)
+target_link_libraries(hha_content PRIVATE android log dl)
+set_target_properties(hha_content PROPERTIES CXX_EXTENSIONS OFF)
