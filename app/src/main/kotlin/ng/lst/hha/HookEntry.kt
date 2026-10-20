@@ -1,5 +1,7 @@
 package ng.lst.hha
 
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.HookHandle
@@ -20,8 +22,11 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam
 class HookEntry : XposedModule() {
 
     private var installed = false
+    private var settingsProcess = false
+    private var settingsHooks: SettingsHooks? = null
 
     override fun onModuleLoaded(param: ModuleLoadedParam) {
+        settingsProcess = param.processName == SETTINGS_PACKAGE
         log(Log.INFO, TAG, "loaded in ${param.processName} (systemServer=${param.isSystemServer})")
     }
 
@@ -30,6 +35,10 @@ class HookEntry : XposedModule() {
     }
 
     override fun onPackageReady(param: PackageReadyParam) {
+        if (param.packageName == SETTINGS_PACKAGE && settingsProcess) {
+            installSettingsHooks()
+            return
+        }
         // A process may load several packages; only patch the launcher once.
         if (installed) return
         if (param.packageName != TARGET_PACKAGE) return
@@ -64,6 +73,17 @@ class HookEntry : XposedModule() {
         }
     }
 
+    private fun installSettingsHooks() {
+        if (settingsHooks != null) return
+        runCatching {
+            SettingsHooks(this).also { it.install() }
+        }.onSuccess {
+            settingsHooks = it
+        }.onFailure {
+            log(Log.ERROR, TAG, "Settings content hooks unavailable: ${it.message}", it)
+        }
+    }
+
     /**
      * Runs in the *new* generation after a hot reload (API 102+).
      * The default implementation drops every hook installed by the old generation;
@@ -71,15 +91,25 @@ class HookEntry : XposedModule() {
      */
     override fun onHotReloaded(param: HotReloadedParam) {
         installed = false
+        settingsHooks = null
+        settingsProcess = param.processName == SETTINGS_PACKAGE
         super.onHotReloaded(param)
+        if (settingsProcess) {
+            Handler(Looper.getMainLooper()).post { installSettingsHooks() }
+        }
         log(Log.INFO, TAG, "hot reloaded, old hooks=${param.oldHookHandles.size}")
     }
 
-    /** Runs in the *old* generation. Return true to allow the reload. */
-    override fun onHotReloading(param: HotReloadingParam): Boolean = true
+    /** Runs in the *old* generation. Release VRI state before replacing hooks. */
+    override fun onHotReloading(param: HotReloadingParam): Boolean {
+        settingsHooks?.close()
+        settingsHooks = null
+        return true
+    }
 
     private companion object {
         const val TAG = "HyperHomeAnimation"
         const val TARGET_PACKAGE = "com.miui.home"
+        const val SETTINGS_PACKAGE = "com.android.settings"
     }
 }

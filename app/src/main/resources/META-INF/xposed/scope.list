@@ -1,3 +1,4 @@
 # Packages the framework will inject the module into.
 # One package name per line. `system` is a virtual package meaning system_server.
 com.miui.home
+com.android.settings

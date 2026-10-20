@@ -2,7 +2,7 @@
 # Read by the framework when the module app is installed / updated.
 
 # Minimum Xposed API version this module can run on.
-minApiVersion=101
+minApiVersion=102
 # API version this module was written against.
 targetApiVersion=102
 
