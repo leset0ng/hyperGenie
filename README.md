@@ -139,8 +139,12 @@ captured near closing completion, but this is not a complete visual pass. Static
 ROM analysis confirms that a linear/LUT color-processing branch can return
 before wrapping the SELF shader, even under CLIENT composition. That branch's
 presence is proven; its execution during the remaining flashes has not been
-measured. The module therefore remains an experimental integration, not a
-finished iOS animation replacement.
+measured. A subsequent per-layer dimming experiment produced no reliable visual
+improvement and was discarded. Its anomalous-frame samples did not verify the
+intended dimming state, so it cannot exclude brightness scaling as a cause. The
+ROM's native MSKP capture was also blocked from writing its output; diagnostic
+properties and the experimental APK were restored. The module therefore remains
+an experimental integration, not a finished iOS animation replacement.
 
 Ignored local evidence is under `temp/ios-module-integration/validation/` and
 `temp/ios-module-integration/resumed-validation/`, including physical recordings,
