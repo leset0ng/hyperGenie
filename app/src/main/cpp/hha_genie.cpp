@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "hha_genie.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace hha::genie {
@@ -109,6 +110,84 @@ bool Step(Scalar* scalar, double seconds, double damping_ratio) {
 }
 }  // namespace
 
+bool ParametersForIcon(const Rect& icon, const Rect& window, Parameters* result,
+                       Point velocity, double pixel_scale) {
+    if (result == nullptr) return false;
+    const double values[] = {icon.left, icon.top, icon.width, icon.height,
+        window.left, window.top, window.width, window.height, velocity.x,
+        velocity.y, pixel_scale};
+    for (double value : values) {
+        if (!std::isfinite(value)) return false;
+    }
+    if (!Positive(icon.width) || !Positive(icon.height) ||
+        !Positive(window.width) || !Positive(window.height) ||
+        !Positive(pixel_scale)) return false;
+
+    Parameters candidate;
+    candidate.width = window.width;
+    candidate.height = window.height;
+    // _homeScreenFrameForZoomingIndex:ignoringGenie: compares icon aspect with
+    // max(Dw/Dh,Dh/Dw), then scales the icon by selected/max(iw,ih). The floating
+    // comparison uses the ordinary finite case, not BSFloatGreaterThanFloat's
+    // unverified near-equality tolerance.
+    const double window_aspect = std::max(window.width / window.height,
+                                          window.height / window.width);
+    const double reference = icon.width / icon.height > window_aspect
+        ? window.width : std::min(window.width, window.height);
+    const double minimized_factor = reference / std::max(icon.width, icon.height);
+    candidate.minimized_width = icon.width * minimized_factor;
+    candidate.minimized_height = icon.height * minimized_factor;
+    const double ratio = std::max(icon.width / window.width, icon.height / window.height);
+    candidate.minimized_scale = ratio * 2.5;
+    candidate.genie_scale = 0.4;
+    candidate.window_x = window.width / 2.0;
+    candidate.window_y = window.height / 2.0;
+    // Subtract the screen window origin once; W-D/2 is zero in this local basis.
+    const double icon_center_x = icon.left - window.left + icon.width / 2.0;
+    const double icon_center_y = icon.top - window.top + icon.height / 2.0;
+    candidate.icon_x = std::round((icon_center_x -
+        ratio * candidate.minimized_width / 2.0) * pixel_scale) / pixel_scale;
+    candidate.icon_y = std::round(icon_center_y * pixel_scale) / pixel_scale;
+    const double predicted_y = candidate.window_y + 0.15 * velocity.y;
+    if (!std::isfinite(predicted_y)) return false;
+    const double n = std::clamp(2.0 * ((candidate.icon_y - predicted_y) / window.height),
+                                -1.0, 1.0);
+    candidate.genie_amount_x = 0.0;
+    candidate.genie_amount_y = -(n < 0.0 ? 0.75 * n : n);
+    // Validate both endpoint response fields, not only the scalar dimensions.
+    Animation validation;
+    if (!validation.Reset(candidate)) return false;
+    *result = candidate;
+    return true;
+}
+
+bool SettingsForGesture(double weight, Point velocity, GestureSettings* result) {
+    if (result == nullptr || !std::isfinite(weight) ||
+        !std::isfinite(velocity.x) || !std::isfinite(velocity.y)) return false;
+    const double y_weight = std::clamp((-velocity.y - 3000.0) / 2000.0, 0.0, 1.0);
+    const double x_weight = std::clamp((std::abs(velocity.x) - 1000.0) / 3000.0, 0.0, 1.0);
+    const GestureSettings candidate{
+        {(0.425 + (0.375 - 0.425) * weight) * 0.8 * (1.0 - 0.3 * y_weight), 1.1},
+        {(0.45 + (0.55 - 0.45) * weight) * 0.8 * (1.0 + 0.2 * x_weight),
+         0.8 + (0.86 - 0.8) * weight},
+        {0.55 * 0.8, 0.84},
+    };
+    for (const auto& settings : {candidate.layout, candidate.position, candidate.scale}) {
+        if (!Positive(settings.response) || !Positive(settings.damping_ratio) ||
+            !Positive(2.0 * kPi / settings.response)) return false;
+    }
+    *result = candidate;
+    return true;
+}
+
+bool AdvanceScalar(Scalar* scalar, double seconds, double damping_ratio) {
+    if (scalar == nullptr || !Positive(seconds) || !Positive(damping_ratio) ||
+        !Positive(scalar->response) || !Positive(2.0 * kPi / scalar->response) ||
+        !std::isfinite(scalar->value) || !std::isfinite(scalar->target) ||
+        !std::isfinite(scalar->velocity)) return false;
+    return Step(scalar, seconds, damping_ratio);
+}
+
 bool Animation::ConfigureEndpoint(bool minimized, std::array<Scalar, 19>* result) const {
     const auto& p = parameters_;
     const double size_x = minimized ? p.minimized_width : p.width;
@@ -164,10 +243,17 @@ bool Animation::Reset(const Parameters& parameters, bool minimized) {
 }
 
 bool Animation::Retarget(bool minimized) {
-    if (!initialized_) return false;
-    auto candidate = scalars_;
-    if (!ConfigureEndpoint(minimized, &candidate)) return false;
-    scalars_ = candidate;
+    return Retarget(parameters_, minimized);
+}
+
+bool Animation::Retarget(const Parameters& parameters, bool minimized) {
+    if (!initialized_ || !Validate(parameters)) return false;
+    Animation candidate = *this;
+    candidate.parameters_ = parameters;
+    auto opposite = candidate.scalars_;
+    if (!candidate.ConfigureEndpoint(!minimized, &opposite) ||
+        !candidate.ConfigureEndpoint(minimized, &candidate.scalars_)) return false;
+    *this = candidate;
     return true;
 }
 
