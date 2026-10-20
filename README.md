@@ -2,13 +2,18 @@
 
 A libxposed (LSPosed, API 102) module for HyperOS app-open animations.
 
-The current implementation includes a **real Settings content-layer Genie mesh**:
-19 independent animated scalars, a native Choreographer loop, and lifecycle
-cleanup through the formal LSPosed entry. It is narrowly verified on the
-Android 17 / HyperOS 4 AVD. The stock launcher still controls overall motion,
-startup snapshots and floating icons; this is the first content integration,
-not yet the complete iOS launch trajectory. See
-[Settings setup, validation and remaining work](docs/settings-content-animation.md).
+The current direction uses **central content acquisition in system_server**, so
+App targets need no module hooks. The actual content capability is held by
+`WindowState.mWinAnimator.mSurfaceControl`; a temporary central bridge verified
+external SELF mesh rendering and detachment on both Settings and Calculator.
+See the [general content route and evidence](docs/general-content-route.md).
+
+The earlier Settings-specific integration is disabled in the entry and scope.
+Its 19-state mathematical kernel and native rendering prototype remain available
+for the central implementation. The stock launcher still controls overall motion,
+startup snapshots and floating icons; a complete iOS launch replacement is still
+in progress. The [Settings prototype notes](docs/settings-content-animation.md)
+are historical validation, not the current setup path.
 
 The legacy launcher integration adds a **real 3D perspective tilt** to the app window
 while the launcher's stock open animation runs. The stock animation is kept;
@@ -23,8 +28,8 @@ On Android 17 / HyperOS 4 the launcher ships **no dex at all**. It is a
 Rust/Flutter program started by `/system_ext/bin/hyos_spawner`, so
 `java_init.list` class hooks never execute in that process. The module therefore
 declares `META-INF/xposed/native_init.list` and handles launcher work in
-`libhha_native.so`. The separate Java entry hooks Settings lifecycle methods and
-loads `libhha_content.so` for the real content-layer mesh.
+`libhha_native.so`. Target-App Java hooks are disabled; content acquisition is
+being integrated centrally through system_server.
 
 ## Where the hook goes
 
@@ -104,9 +109,9 @@ app UID and cannot create files under `/data/local/tmp`, so create it as root.
 app/src/main/
 ├── AndroidManifest.xml            # label/description come from resources
 ├── kotlin/ng/lst/hha/
-│   ├── HookEntry.kt               # launcher/Settings libxposed entry
-│   ├── SettingsHooks.kt           # VRI + Activity lifecycle
-│   └── ContentAnimator.kt         # Settings native renderer JNI
+│   ├── HookEntry.kt               # launcher libxposed entry
+│   ├── SettingsHooks.kt           # disabled historical VRI prototype
+│   └── ContentAnimator.kt         # historical prototype JNI
 ├── cpp/
 │   ├── CMakeLists.txt             # arm64-v8a only
 │   ├── exports.map                # launcher exports native_init only
@@ -144,9 +149,9 @@ runtime and must never be bundled.
 adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Enable the module for `com.miui.home` in the LSPosed manager, and add
-`com.android.settings` for the content integration. Settings also requires its
-opt-in configuration described in the [Settings guide](docs/settings-content-animation.md).
+Enable the module for `com.miui.home` in the LSPosed manager. No target-App scope
+is needed; the earlier Settings entry is disabled. The central bridge is verified
+as a diagnostic and has not yet been added to the production module's scope.
 This AVD does not ship the manager app, so on a headless emulator write the enable
 state directly and reboot:
 
