@@ -246,6 +246,38 @@ void PendingRetirement() {
     std::puts("PASS superseded and canceled pending-prime retirement");
 }
 bool Running() {return Java_ng_lst_hha_ContentAnimator_nativeRunning(nullptr,nullptr)==JNI_TRUE;}
+void JniStopRequestValidation() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    Check(QueueSession(311,3101,1120,2436,opening,false,NowNs(),{},false),
+          "seed opening request for JNI stop validation");
+    Pump(controller);
+    const auto request=controller.active->request_ns;
+    // The last value would alias the live parent if JNI truncated before checking.
+    const jlong invalid_parents[]={0,-1,static_cast<jlong>(INT32_MAX)+1,(jlong{1}<<32)+3101};
+    for(jlong parent:invalid_parents) {
+        Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,parent,request);
+        Check(controller.active->cancel_ns==0,"JNI rejects invalid or overflowing parent without canceling the live request");
+    }
+    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3101,request-1);
+    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3102,request);
+    Check(controller.active->cancel_ns==0,"JNI stop requires both current parent and immutable request epoch");
+    const auto before=NowNs();
+    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3101,request);
+    const auto after=NowNs();
+    Check(controller.active->cancel_ns>=before+48000000LL &&
+          controller.active->cancel_ns<=after+48000000LL,
+          "JNI stop uses the same 48ms scoped grace as the native API");
+    // Advance cancellation deterministically without depending on wall-clock scheduling.
+    controller.active->cancel_ns=NowNs()-1;
+    ResetEvents();Frame(NowNs(),&controller);
+    Check(!controller.active && Cleared()==std::vector<int>{311} && Running(),
+          "expired opening stop clears its effect but remains busy until detach completion");
+    DrainCompletions();Check(!Running(),"scoped opening stop becomes idle after its own detach completes");
+    std::puts("PASS JNI stop range, identity, and opening retirement");
+}
 void IndependentDetachCompletions() {
     for(size_t first:{size_t{0},size_t{1}}) {
         auto& controller=Fresh();auto a=Prime(501,5001);auto b=Prime(502,5002);
@@ -256,8 +288,8 @@ void IndependentDetachCompletions() {
               controller.detaches_pending.load()==2,"two primes submit independent detach transactions");
         Check(Running(),"renderer busy before either detach completes");
         Invoke(completions,first);
-        Check(controller.cleared_serial.load()==controller.submitted_serial.load(),
-              "first callback advances serial watermark over both retirements");
+        Check(!completions[first].callback && completions[1-first].callback,
+              "completing one detach leaves the other transaction's completion pending");
         Check(controller.detaches_pending.load()==1 && Running(),
               "first detach completion cannot release snapshot guard while second remains");
         Invoke(completions,1-first);
@@ -709,8 +741,8 @@ void OneShotOpeningPublication() {
     Check(!controller.active && !controller.pending && controller.queued.empty() &&
           controller.overlapping.empty() && commits.empty() && completions.empty(),
           "one-shot publication creates no launcher frame writer or retirement callbacks");
-    Check(controller.submitted_serial.load()==0 && !Java_ng_lst_hha_ContentAnimator_nativeRunning(nullptr,nullptr),
-          "server-owned one-shot does not poison launcher retirement bookkeeping");
+    Check(controller.detaches_pending.load()==0 && !Running(),
+          "server-owned one-shot leaves no launcher detach outstanding and remains idle");
     Check(layer_uniforms[995][8]-layer_uniforms[995][0]<.99f && layer_uniforms[995][36]==1120,
           "first publication uses elapsed opening deformation and full buffer domain");
     ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
@@ -830,7 +862,7 @@ void GestureClosingHostPublication() {
           "gesture host first corner ratio uses the scaled release width");
     Check(!controller.active && !controller.pending && controller.queued.empty() &&
           controller.overlapping.empty() && commits.empty() && completions.empty() &&
-          renderer_applies.load()==applies && controller.submitted_serial.load()==0 && !Running(),
+          renderer_applies.load()==applies && controller.detaches_pending.load()==0 && !Running(),
           "gesture host one-shot creates no extra renderer session, callbacks, or independent apply");
     ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
     // An elapsed frame distinguishes the content's (0,0) origin from the
@@ -892,7 +924,7 @@ void GesturePublicationRejectsIncompatibleGeometry() {
         Check(!hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1831),
             reinterpret_cast<void*>(1830),1120,2436,request),item.second);
         Check(events.empty() && border_widths.empty() && commits.empty() && completions.empty() &&
-              !controller.active && !controller.pending && !Running() && controller.submitted_serial.load()==0,
+              !controller.active && !controller.pending && !Running() && controller.detaches_pending.load()==0,
               "rejected gesture geometry publishes no shader, CLIENT guard, session, or callbacks");
         Check(renderer_applies.load()==applies && references==retained,
               "rejected gesture geometry applies no transaction and retains no capabilities");
@@ -944,7 +976,7 @@ int main() {
     Check(std::isfinite(kClientBorderWidth) && kClientBorderWidth>0 && kClientBorderWidth<0.001f,
           "CLIENT guard stays finite, strictly positive, and below one thousandth of a pixel");
     FramePrimeOrdering();ReplacementPreservesSharedLayers();ScopedCancellation();PendingRetirement();
-    IndependentDetachCompletions();PrimedReversalContinuity();CornerEndpointRadii();
+    IndependentDetachCompletions();JniStopRequestValidation();PrimedReversalContinuity();CornerEndpointRadii();
     CornerRetargetAndHandoff();OpeningPreviewLifetime();
     OverlappingRequests();IndependentCommitGates();CrossParentPreviewHandoff();
     AtomicCompanionAttachment();StopDuringCompanionPublication();RepeatedPrimeCommitGates();

@@ -138,6 +138,10 @@ Property Spring(const void* parameters, const char* key) {
     return result;
 }
 
+std::array<float, 2> FitSize(float width, float height, float ratio) {
+    return {std::min(width, height / ratio), std::min(height, width * ratio)};
+}
+
 using Last = hha::AnimationSource;
 std::array<Last,32> g_last{};
 size_t g_next = 0;
@@ -230,10 +234,8 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     if (!x.valid || !y.valid || !w.valid || !h.valid ||
         !ratio.valid || ratio.start<=0 || ratio.end<=0 ||
         w.start<=0 || w.end<=0 || h.start<=0 || h.end<=0) return;
-    const float start_width=std::min(w.start,h.start/ratio.start);
-    const float start_height=std::min(h.start,w.start*ratio.start);
-    const float end_width=std::min(w.end,h.end/ratio.end);
-    const float end_height=std::min(h.end,w.end*ratio.end);
+    const auto [start_width,start_height]=FitSize(w.start,h.start,ratio.start);
+    const auto [end_width,end_height]=FitSize(w.end,h.end,ratio.end);
     const float start_area=start_width*start_height, end_area=end_width*end_height;
     const float small_width=start_area<end_area?start_width:end_width;
     const float small_height=start_area<end_area?start_height:end_height;
@@ -359,10 +361,8 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
     const auto ratio=Spring(parameters,"ratio");
     if (!w.valid || !h.valid || !ratio.valid || ratio.start<=0 || ratio.end<=0 ||
         w.start<=0 || h.start<=0 || w.end<=0 || h.end<=0) return;
-    const float start_width=std::min(w.start,h.start/ratio.start);
-    const float start_height=std::min(h.start,w.start*ratio.start);
-    const float end_width=std::min(w.end,h.end/ratio.end);
-    const float end_height=std::min(h.end,w.end*ratio.end);
+    const auto [start_width,start_height]=FitSize(w.start,h.start,ratio.start);
+    const auto [end_width,end_height]=FitSize(w.end,h.end,ratio.end);
     const bool closing=end_width*end_height<start_width*start_height;
     const float small_aspect=closing?end_width/end_height:start_width/start_height;
     if(type!=-1 && (small_aspect<0.8f || small_aspect>1.25f)) return;

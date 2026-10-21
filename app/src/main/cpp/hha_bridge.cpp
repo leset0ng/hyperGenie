@@ -35,6 +35,38 @@ AIBinder_Class* BridgeClass() {
     return value;
 }
 
+// Prepare operations read additional reply payloads, so the caller owns output.
+binder_status_t Send(AIBinder* binder, const Transition& transition, int32_t operation,
+                     AParcel** output, int32_t* accepted) {
+    AParcel* input = nullptr;
+    *accepted = 0;
+    binder_status_t status = AIBinder_prepareTransaction(binder, &input);
+    auto integer = [&](int32_t value) {
+        if (status == STATUS_OK) status = AParcel_writeInt32(input, value);
+    };
+    integer(kBridgeMagic);
+    integer(kBridgeVersion);
+    integer(operation);
+    integer(transition.leash_layer);
+    integer(transition.container_layer);
+    integer(transition.task_id);
+    integer(transition.closing ? 1 : 0);
+    if (status == STATUS_OK) status = AParcel_writeInt64(input, transition.event_ns);
+    for (float value : transition.geometry) {
+        if (status == STATUS_OK) status = AParcel_writeFloat(input, value);
+    }
+    if (status == STATUS_OK) status = AIBinder_transact(binder, kBridgeCode, &input, output, 0);
+    if (status == STATUS_OK) {
+        AStatus* result = nullptr;
+        status = AParcel_readStatusHeader(*output, &result);
+        if (status == STATUS_OK && result && AStatus_isOk(result))
+            status = AParcel_readInt32(*output, accepted);
+        if (result) AStatus_delete(result);
+    }
+    if (input) AParcel_delete(input);
+    return status;
+}
+
 void Run(Dispatcher* dispatcher) {
     // The service-manager NDK API is a platform export on the verified ROM. It
     // is resolved at runtime so an unavailable bridge keeps stock animation.
@@ -85,36 +117,10 @@ void Run(Dispatcher* dispatcher) {
             }
         }
         if (!binder) continue;
-        AParcel* input = nullptr;
         AParcel* output = nullptr;
-        binder_status_t status = AIBinder_prepareTransaction(binder, &input);
-        auto integer = [&](int32_t value) {
-            if (status == STATUS_OK) status = AParcel_writeInt32(input, value);
-        };
-        integer(kBridgeMagic);
-        integer(kBridgeVersion);
-        integer(command.cancel ? 2 : 1);
-        integer(command.transition.leash_layer);
-        integer(command.transition.container_layer);
-        integer(command.transition.task_id);
-        integer(command.transition.closing ? 1 : 0);
-        if (status == STATUS_OK) status = AParcel_writeInt64(input, command.transition.event_ns);
-        for (float value : command.transition.geometry) {
-            if (status == STATUS_OK) status = AParcel_writeFloat(input, value);
-        }
         int32_t accepted = 0;
-        if (status == STATUS_OK) {
-            status = AIBinder_transact(binder, kBridgeCode, &input, &output, 0);
-            if (status == STATUS_OK) {
-                AStatus* result = nullptr;
-                status = AParcel_readStatusHeader(output, &result);
-                if (status == STATUS_OK && result && AStatus_isOk(result)) {
-                    status = AParcel_readInt32(output, &accepted);
-                }
-                if (result) AStatus_delete(result);
-            }
-        }
-        if (input) AParcel_delete(input);
+        const binder_status_t status = Send(binder, command.transition, command.cancel ? 2 : 1,
+                                             &output, &accepted);
         if (output) AParcel_delete(output);
         if (status == STATUS_DEAD_OBJECT) {
             AIBinder_decStrong(binder);
@@ -166,23 +172,9 @@ bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,cons
     AIBinder* binder=check("window");
     if(!binder) return false;
     if(!AIBinder_associateClass(binder,BridgeClass())) {AIBinder_decStrong(binder);return false;}
-    AParcel* input=nullptr;
     AParcel* output=nullptr;
-    binder_status_t status=AIBinder_prepareTransaction(binder,&input);
-    auto integer=[&](int32_t value) {if(status==STATUS_OK) status=AParcel_writeInt32(input,value);};
-    integer(kBridgeMagic);integer(kBridgeVersion);integer(4);
-    integer(transition.leash_layer);integer(transition.container_layer);integer(transition.task_id);
-    integer(transition.closing?1:0);
-    if(status==STATUS_OK) status=AParcel_writeInt64(input,transition.event_ns);
-    for(float value:transition.geometry) if(status==STATUS_OK) status=AParcel_writeFloat(input,value);
     int32_t accepted=0;
-    if(status==STATUS_OK) status=AIBinder_transact(binder,kBridgeCode,&input,&output,0);
-    if(status==STATUS_OK) {
-        AStatus* result=nullptr;
-        status=AParcel_readStatusHeader(output,&result);
-        if(status==STATUS_OK && result && AStatus_isOk(result)) status=AParcel_readInt32(output,&accepted);
-        if(result) AStatus_delete(result);
-    }
+    binder_status_t status=Send(binder,transition,4,&output,&accepted);
     int32_t width=0,height=0;
     if(status==STATUS_OK && accepted==1) {
         status=AParcel_readInt32(output,&width);
@@ -206,7 +198,6 @@ bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,cons
     }
     if(output_surface) release(output_surface,&output_surface);
     if(visibility) ASurfaceTransaction_delete(visibility);
-    if(input) AParcel_delete(input);
     if(output) AParcel_delete(output);
     AIBinder_decStrong(binder);
     __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_DEBUG,"HHA.Bridge",
@@ -242,22 +233,9 @@ bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
     AIBinder* binder=check("window");
     if(!binder) return false;
     if(!AIBinder_associateClass(binder,BridgeClass())) {AIBinder_decStrong(binder);return false;}
-    AParcel* input=nullptr;
     AParcel* output=nullptr;
-    binder_status_t status=AIBinder_prepareTransaction(binder,&input);
-    auto integer=[&](int32_t value) {if(status==STATUS_OK) status=AParcel_writeInt32(input,value);};
-    integer(kBridgeMagic);integer(kBridgeVersion);integer(3);
-    integer(transition.leash_layer);integer(transition.container_layer);integer(transition.task_id);integer(0);
-    if(status==STATUS_OK) status=AParcel_writeInt64(input,transition.event_ns);
-    for(float value:transition.geometry) if(status==STATUS_OK) status=AParcel_writeFloat(input,value);
     int32_t accepted=0;
-    if(status==STATUS_OK) status=AIBinder_transact(binder,kBridgeCode,&input,&output,0);
-    if(status==STATUS_OK) {
-        AStatus* result=nullptr;
-        status=AParcel_readStatusHeader(output,&result);
-        if(status==STATUS_OK && result && AStatus_isOk(result)) status=AParcel_readInt32(output,&accepted);
-        if(result) AStatus_delete(result);
-    }
+    const binder_status_t status=Send(binder,transition,3,&output,&accepted);
     void* surface=nullptr; // ABI mirror of the output sp<SurfaceControl>.
     bool primed=false;
     if(status==STATUS_OK && accepted==1) {
@@ -266,7 +244,6 @@ bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
             primed=PrimeOpeningPreview(transaction,surface,parent,width,height,transition);
     }
     if(surface) release(surface,&surface);
-    if(input) AParcel_delete(input);
     if(output) AParcel_delete(output);
     AIBinder_decStrong(binder);
     if(accepted && !primed) {

@@ -49,7 +49,9 @@ completion callbacks remain active.
 The host viewport and source mask are Android adaptations around the recovered
 mesh. They do not establish a pixel-for-pixel iOS screen trajectory. The source
 document leaves the full parent trajectory, complete radius(t), and some UIKit
-retarget/gesture behavior unverified.
+retarget/gesture behavior unverified. Recovered gesture-response formulas remain
+in `tests/genie_gesture_reference.h` for numerical reference and are not used by
+the production renderer.
 
 ## Integration
 
@@ -96,7 +98,7 @@ On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
 controller in an isolated executable with fake surface capabilities and empty
 SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
 commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 1,401 checks; `ADB_SERIAL` selects a device. It does not
+The current suite passes 1,422 checks; `ADB_SERIAL` selects a device. It does not
 install the module or touch
 real App layers.
 
@@ -129,6 +131,7 @@ app/src/main/
 │   ├── PreStartingSurfaces.kt # owned OEM preview copies and domain checks
 │   ├── SurfaceEvents.kt      # first-show transactions and lifecycle wakeups
 │   ├── SnapshotGuard.kt      # prevent snapshots of deformed Task content
+│   ├── OptionalMembers.kt    # shared per-component reflection caches
 │   └── ContentAnimator.kt    # central JNI boundary
 ├── cpp/
 │   ├── hha_native.cpp        # launcher event/geometry correlation
@@ -145,8 +148,10 @@ app/src/main/
 
 ## Validation status
 
-The current build passes Android assembly/lint, 784 native geometry checks and
-1,401 isolated checks of the actual renderer. Sampled Settings/Calculator
+The current build passes Android assembly/lint, 771 native geometry/reference
+checks and 1,422 isolated checks of the actual renderer. Retired helper-only
+tests have been removed; actual detach completion and JNI cancellation checks
+cover the production paths. Sampled Settings/Calculator
 transitions verify content access, composition and cleanup; these checks do not
 establish complete visual fidelity. The earlier positive-shadow CLIENT guard
 caused a visible dark exterior and has been replaced by a fully transparent

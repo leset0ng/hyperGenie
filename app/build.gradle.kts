@@ -1,7 +1,5 @@
 plugins {
     alias(libs.plugins.android.application)
-    // AGP 9+ compiles Kotlin itself (built-in Kotlin), so the standalone
-    // org.jetbrains.kotlin.android plugin must not be applied here.
 }
 
 android {
@@ -61,12 +59,6 @@ android {
 }
 
 dependencies {
-    implementation(libs.androidx.core.ktx)
-
     // Provided by the framework at runtime: never bundle these into the APK.
     compileOnly(libs.libxposed.api)
-
-    // Only needed when the module app talks to the framework service
-    // (scope management, hot reload, remote preferences).
-    // compileOnly(libs.libxposed.service)
 }

@@ -2,7 +2,7 @@
 #include "hha_genie.h"
 #include "hha_bridge.h"
 #include "hha_viewport.h"
-#include "hha_renderer.h"
+#include "genie_gesture_reference.h"
 
 #include <cmath>
 #include <cstdio>
@@ -431,28 +431,28 @@ void ParentScalarAndGestureSettings() {
     Check(!hha::genie::AdvanceScalar(nullptr, .01, 1.0), "null parent scalar rejected");
     Check(!hha::genie::AdvanceScalar(&scalar, .01, 0.0), "invalid parent damping rejected");
 
-    hha::genie::GestureSettings settings{};
-    Check(hha::genie::SettingsForGesture(0.5, {0.0, 0.0}, &settings), "ordinary gesture settings");
+    hha::genie::reference::GestureSettings settings{};
+    Check(hha::genie::reference::SettingsForGesture(0.5, {0.0, 0.0}, &settings), "ordinary gesture settings");
     Near(settings.layout.response, 0.32, 1e-15, "published gesture layout response");
     Near(settings.layout.damping_ratio, 1.1, 0.0, "gesture mesh is overdamped");
     Near(settings.position.response, 0.4, 1e-15, "position has its own response");
     Near(settings.position.damping_ratio, 0.83, 1e-15, "position has its own damping");
     Near(settings.scale.response, 0.44, 1e-15, "scale response independent of layout");
     Near(settings.scale.damping_ratio, 0.84, 0.0, "scale has its own damping");
-    Check(hha::genie::SettingsForGesture(0.5, {-4000.0, -5000.0}, &settings), "fast flick settings");
+    Check(hha::genie::reference::SettingsForGesture(0.5, {-4000.0, -5000.0}, &settings), "fast flick settings");
     Near(settings.layout.response, 0.224, 1e-15, "upward speed shortens layout response");
     Near(settings.position.response, 0.48, 1e-15, "horizontal speed lengthens position response");
-    Check(hha::genie::SettingsForGesture(0.5, {40000.0, -50000.0}, &settings), "speed modifiers clamp");
+    Check(hha::genie::reference::SettingsForGesture(0.5, {40000.0, -50000.0}, &settings), "speed modifiers clamp");
     Near(settings.layout.response, 0.224, 1e-15, "layout speed weight capped");
     Near(settings.position.response, 0.48, 1e-15, "position speed weight capped");
-    Check(hha::genie::SettingsForGesture(1.5, {0.0, 0.0}, &settings), "frame weight not clamped");
+    Check(hha::genie::reference::SettingsForGesture(1.5, {0.0, 0.0}, &settings), "frame weight not clamped");
     Near(settings.layout.response, 0.28, 1e-15, "frame weight extrapolates source formula");
     const auto old = settings;
-    Check(!hha::genie::SettingsForGesture(100.0, {0.0, 0.0}, &settings), "nonphysical extrapolation rejected");
+    Check(!hha::genie::reference::SettingsForGesture(100.0, {0.0, 0.0}, &settings), "nonphysical extrapolation rejected");
     Near(settings.layout.response, old.layout.response, 0.0, "invalid gesture preserves settings");
-    Check(!hha::genie::SettingsForGesture(0.5,
+    Check(!hha::genie::reference::SettingsForGesture(0.5,
         {std::numeric_limits<double>::quiet_NaN(), 0.0}, &settings), "nonfinite gesture rejected");
-    Check(!hha::genie::SettingsForGesture(0.5, {0.0, 0.0}, nullptr), "null gesture result rejected");
+    Check(!hha::genie::reference::SettingsForGesture(0.5, {0.0, 0.0}, nullptr), "null gesture result rejected");
 }
 void HostContourEndpoints() {
     for(const auto& icon:std::array<hha::genie::Rect,3>{{{869,1657,171,171},{83,806,165,165},{606,1372,171,171}}}) {
@@ -529,31 +529,6 @@ void CornerEndpointMetrics() {
     Near(hha::genie::CornerRatio(20,{0,0,0,100}),0,0,"invalid metric cannot divide by zero");
 }
 
-void RenderRetirementAndCancellation() {
-    // A size-changing replacement can keep the same primary; a handoff can
-    // also promote an old companion to primary or demote the old primary.
-    const std::vector<int32_t> companions{20,30};
-    Check(hha::RetainsLayer(10,10,companions),"extent replacement retains existing primary");
-    Check(hha::RetainsLayer(20,10,companions),"replacement retains shared companion");
-    Check(hha::RetainsLayer(10,20,{10,30}),"starting primary survives as a companion");
-    Check(hha::RetainsLayer(20,20,{30}),"starting companion survives promotion to primary");
-    Check(!hha::RetainsLayer(40,10,companions),"removed surface is eligible for detachment");
-    Check(!hha::RetainsLayer(-1,-1,{-1}),"invalid identity cannot retain an unrelated surface");
-
-    const hha::RenderIdentity a{100,1000},b{200,2000},b_retarget{200,3000};
-    hha::RenderCancellation cancel;
-    Check(!cancel.Due(a,100),"new renderer has no cancellation");
-    cancel.Request(a,48);
-    Check(!cancel.Due(a,47),"matching icon retains its cancellation grace");
-    Check(cancel.Due(a,48),"matching icon retires after grace");
-    Check(!cancel.Due(b,100),"late stop for old icon cannot retire a new icon");
-    cancel.Request(b,148);
-    Check(!cancel.Due(b_retarget,200),"reused parent with new request survives old stop");
-    Check(cancel.Due(b,200),"original parent and request still match");
-    cancel.Clear();
-    Check(!cancel.Due(b,300),"new submission clears the old cancellation");
-}
-
 void TransitionQueueOrdering() {
     hha::PendingTransitions pending;
     Check(!pending.Ready() && !pending.Take(),"empty dispatcher has no command");
@@ -598,7 +573,6 @@ int main() {
     TransitionQueueOrdering();
     IconPairingAfterRepeatedLaunches();
     CornerEndpointMetrics();
-    RenderRetirementAndCancellation();
     HostContourEndpoints();
     std::printf("Genie kernel: %d checks passed\n", checks);
     return 0;

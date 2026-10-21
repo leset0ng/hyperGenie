@@ -81,22 +81,19 @@ internal class LiveSubtrees(
     /** A short-lived lease consisting of independent Java/native SC copies. Always use/close. */
     inner class Entry internal constructor(internal val record: Record) : AutoCloseable {
         val sourceLayer = record.sourceLayer
-        val generation = record.generation
         val width = record.width
         val height = record.height
         val task = record.task
-        private val held = ArrayList<Any>(4)
+        private val held = ArrayList<Any>(3)
         private val released = AtomicBoolean()
         val source: Any
         val output: Any
-        val hideTarget: Any
         val parent: Any
 
         init {
             try {
                 source = retain(record.source, "HHA.subtree.lease.source").also(held::add)
                 output = retain(checkNotNull(record.output), "HHA.subtree.lease.output").also(held::add)
-                hideTarget = retain(record.hideTarget, "HHA.subtree.lease.window").also(held::add)
                 parent = retain(record.parent, "HHA.subtree.lease.parent").also(held::add)
             } catch (error: Throwable) {
                 held.forEach(::release)
@@ -219,10 +216,6 @@ internal class LiveSubtrees(
         val record = records[sourceLayer] ?: return@synchronized false
         if (closed || record.retired) return@synchronized false
         publication(record, transaction, active = false, guarded = false)
-    }
-
-    fun invalidate(entry: Entry) = synchronized(lock) {
-        if (records[entry.sourceLayer] === entry.record) retireLocked(entry.record)
     }
 
     /** For actual source removal, rather than cancellation of a particular animation generation. */

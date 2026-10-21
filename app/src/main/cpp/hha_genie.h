@@ -52,23 +52,6 @@ struct Parameters {
 bool ParametersForIcon(const Rect& icon, const Rect& window, Parameters* result,
                        Point velocity = {0.0, 0.0}, double pixel_scale = 1.0);
 
-struct SpringSettings {
-    double response;
-    double damping_ratio;
-};
-
-struct GestureSettings {
-    SpringSettings layout;
-    SpringSettings position;
-    SpringSettings scale;
-};
-
-// Recovered section-11 close configuration; weight is the caller's frame-derived
-// t, not clamped progress. Velocity must already use the source modifier's units
-// (thresholds 3000/5000 and 1000/4000); this API does not infer Android unit mapping
-// or inject that velocity into any scalar. Invalid results leave *result intact.
-bool SettingsForGesture(double weight, Point velocity, GestureSettings* result);
-
 struct Scalar {
     double value = 0.0;
     double velocity = 0.0;

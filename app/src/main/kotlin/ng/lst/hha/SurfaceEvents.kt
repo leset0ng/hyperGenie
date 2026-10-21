@@ -7,8 +7,6 @@ import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.HookHandle
 import io.github.libxposed.api.XposedModule
-import java.lang.reflect.Field
-import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 
@@ -32,7 +30,7 @@ internal class SurfaceEvents(
         val verifiedManager: Boolean = false,
     )
 
-    private val members = Members()
+    private val members = OptionalMembers()
     private val hooks = ArrayList<HookHandle>()
     private data class Producer(val show: Show, val frame: Rect, val registeredNs: Long)
     private val localProducers = ConcurrentHashMap<Int, Producer>()
@@ -402,28 +400,6 @@ internal class SurfaceEvents(
         hooks.asReversed().forEach { runCatching { it.unhook() } }
         hooks.clear()
         localProducers.clear()
-    }
-
-    private class Members {
-        private data class Key(val type: Class<*>, val name: String)
-        private data class Optional<T>(val value: T?)
-        private val fields = ConcurrentHashMap<Key, Optional<Field>>()
-        private val methods = ConcurrentHashMap<Key, Optional<Method>>()
-        fun field(target: Any, name: String): Any? = fields.getOrPut(Key(target.javaClass, name)) {
-            Optional(find(target.javaClass) { it.getDeclaredField(name).apply { isAccessible = true } })
-        }.value?.get(target)
-        fun call(target: Any, name: String): Any? = methods.getOrPut(Key(target.javaClass, name)) {
-            Optional(find(target.javaClass) { it.getDeclaredMethod(name).apply { isAccessible = true } })
-        }.value?.invoke(target)
-        private fun <T> find(type: Class<*>, lookup: (Class<*>) -> T): T? {
-            var current: Class<*>? = type
-            while (current != null) {
-                try { return lookup(current) }
-                catch (_: NoSuchFieldException) { current = current.superclass }
-                catch (_: NoSuchMethodException) { current = current.superclass }
-            }
-            return null
-        }
     }
 
     private companion object { const val TAG = "HHA.SurfaceEvents" }

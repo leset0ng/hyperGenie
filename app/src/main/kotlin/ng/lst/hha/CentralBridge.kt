@@ -13,15 +13,13 @@ import android.view.WindowManager
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.HookHandle
 import io.github.libxposed.api.XposedModule
-import java.lang.reflect.Field
-import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** System-server-only content ownership bridge. No hooks are installed in target Apps. */
 @SuppressLint("PrivateApi", "BlockedPrivateApi", "SoonBlockedPrivateApi")
 internal class CentralBridge(private val module: XposedModule, loader: ClassLoader) : AutoCloseable {
-    private val access = Access()
+    private val access = OptionalMembers()
     private val snapshots = SnapshotGuard(module, loader)
     private val preStarting = PreStartingSurfaces(module, loader, ::surfacesChanged)
     private val subtrees = LiveSubtrees(module, loader, ::surfacesChanged)
@@ -59,7 +57,6 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val worker = HandlerThread("HHA.Bridge").apply { start() }
     private val handler = Handler(worker.looper)
     private var hook: HookHandle? = null
-    private var generation = 0L
     @Volatile private var closed = false
     @Volatile private var rendererReady = false
     @Volatile private var contentEnabled = true
@@ -218,7 +215,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             handler.post {
                 // This synchronous publication can outlive its window before
                 // the ordinary worker lookup registers the Task for cleanup.
-                val cleanup = Active(++generation, service, context, transition)
+                val cleanup = Active(service, context, transition)
                 cleanup.taskId = request.taskId
                 cleanup.snapshotBlocked = true
                 releaseSnapshotAfterDetach(cleanup)
@@ -375,7 +372,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             checkCurrent(previous)
             return
         }
-        val next = Active(++generation, service, context, resolved)
+        val next = Active(service, context, resolved)
         if (previous != null) {
             next.activityToken = previous.activityToken
             next.taskId = previous.taskId
@@ -384,11 +381,10 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             next.nativeParent = previous.nativeParent
             next.contentLayer = previous.contentLayer
             next.companionLayers = previous.companionLayers
-            next.starting = previous.starting
             next.width = previous.width
             next.height = previous.height
             next.snapshotBlocked = previous.snapshotBlocked
-            next.groupSources += previous.groupSources
+            if (previous.request.eventNs != resolved.eventNs) owners.remove(previous.request.eventNs)
         }
         sessions[request.leash] = next
         checkCurrent(next)
@@ -472,6 +468,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 sessions.values.filter { old -> old !== current && old.task === it.task &&
                     old.request.eventNs < current.request.eventNs }.toList().forEach { old ->
                     sessions.remove(old.parentLayer)
+                    owners.remove(old.request.eventNs)
                     requests.computeIfPresent(old.parentLayer) { _, envelope ->
                         envelope.takeIf { entry -> entry.request.eventNs > old.request.eventNs }
                     }
@@ -497,7 +494,6 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     false, request.eventNs, starting = true)) {
                 current.contentLayer = surfaceLayer.invoke(preview.surface) as Int
                 current.nativeParent = surfaceLayer.invoke(preview.parent) as Int
-                current.starting = true
                 current.width = width
                 current.height = height
                 report(Log.INFO, "early preview parent=${request.leash} content=${current.contentLayer}")
@@ -516,11 +512,9 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         current.contentLayer = match.contentLayer
         current.nativeParent = match.parentLayer
         current.companionLayers = match.companionLayers
-        current.starting = match.starting
         current.snapshotBlocked = true
         current.width = match.width
         current.height = match.height
-        match.group?.let { current.groupSources += it.sourceLayer }
     }
 
     /** Surface.copyFrom has just materialized a local BBQ, before its first buffer. */
@@ -677,7 +671,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                         current.nativeParent = blockedParent
                         current.snapshotBlocked = true
                     } else {
-                        val cleanup = Active(++generation, envelope.service, envelope.context, request)
+                        val cleanup = Active(envelope.service, envelope.context, request)
                         cleanup.taskId = blockedTask
                         cleanup.snapshotBlocked = true
                         releaseSnapshotAfterDetach(cleanup)
@@ -1010,7 +1004,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private class Candidate(val window: Any, val parent: Any, val content: Any?,
         val activity: Any, val task: Any, val activityToken: Any, val taskId: Int, val uid: Int, val type: Int)
 
-    private class Active(val generation: Long, val service: Any, val context: Context,
+    private class Active(val service: Any, val context: Context,
         val request: Request) {
         val parentLayer = request.leash
         var nativeParent = -1
@@ -1021,9 +1015,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         var uid = -1
         var contentLayer = -1
         var companionLayers: List<Int> = emptyList()
-        var starting = false
         var snapshotBlocked = false
-        val groupSources = HashSet<Int>()
         var width = 0
         var height = 0
     }
@@ -1057,29 +1049,6 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 if (operation == CANCEL && leash < -1) return null
                 return Request(operation, leash, containerLayer, taskId, direction == 1, eventNs, geometry)
             }
-        }
-    }
-
-    /** Cache both found and absent optional members across Binder/worker calls. */
-    private class Access {
-        private data class Key(val type: Class<*>, val name: String)
-        private data class Member<T>(val value: T?)
-        private val fields = ConcurrentHashMap<Key, Member<Field>>()
-        private val methods = ConcurrentHashMap<Key, Member<Method>>()
-        fun field(target: Any, name: String): Any? = fields.getOrPut(Key(target.javaClass, name)) {
-            Member(find(target.javaClass) { it.getDeclaredField(name).apply { isAccessible = true } })
-        }.value?.get(target)
-        fun call(target: Any, name: String): Any? = methods.getOrPut(Key(target.javaClass, name)) {
-            Member(find(target.javaClass) { it.getDeclaredMethod(name).apply { isAccessible = true } })
-        }.value?.invoke(target)
-        private fun <T> find(type: Class<*>, member: (Class<*>) -> T): T? {
-            var current: Class<*>? = type
-            while (current != null) {
-                try { return member(current) }
-                catch (_: NoSuchFieldException) { current = current.superclass }
-                catch (_: NoSuchMethodException) { current = current.superclass }
-            }
-            return null
         }
     }
 

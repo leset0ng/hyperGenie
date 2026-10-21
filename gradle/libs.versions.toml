@@ -1,16 +1,9 @@
 [versions]
 agp = "9.4.1"
-# Kotlin is compiled by AGP's built-in Kotlin support (KGP bundled with AGP).
-# Bump this only if you deliberately opt out via android.builtInKotlin=false.
-kotlin = "2.2.10"
 libxposed = "102.0.0"
-coreKtx = "1.19.1"
 
 [libraries]
-androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 libxposed-api = { group = "io.github.libxposed", name = "api", version.ref = "libxposed" }
-libxposed-service = { group = "io.github.libxposed", name = "service", version.ref = "libxposed" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
-kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

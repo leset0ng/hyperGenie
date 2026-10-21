@@ -182,26 +182,6 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
         }.getOrDefault(false)
     }
 
-    /**
-     * Optional recovery for a snapshot produced by an earlier unguarded module.
-     * Drops this Task's in-memory cache only; no disk files or other tasks are
-     * deleted. A successful later refresh replaces its normal persisted image.
-     */
-    fun invalidateMemoryCache(service: Any, taskId: Int): Boolean {
-        if (closed || taskId < 0) return false
-        return runCatching {
-            val globalLock = members.value(service, "mGlobalLock") ?: return false
-            synchronized(globalLock) {
-                val controller = members.value(service, "mTaskSnapshotController") ?: return false
-                members.method(controller, "removeSnapshotCache", Int::class.javaPrimitiveType!!)
-                    .invoke(controller, taskId)
-            }
-            true
-        }.onFailure {
-            report(Log.WARN, "snapshot cache invalidation skipped task=$taskId", it)
-        }.getOrDefault(false)
-    }
-
     override fun close() {
         if (closed) return
         closed = true

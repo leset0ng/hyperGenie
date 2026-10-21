@@ -7,7 +7,6 @@ import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.HookHandle
 import io.github.libxposed.api.XposedModule
-import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -21,7 +20,7 @@ internal class PreStartingSurfaces(
     private val onChanged: () -> Unit = {},
 ) : AutoCloseable {
     /** Independently owned copies; neither object is borrowed from an OEM registry. */
-    data class Preview(val surface: Any, val parent: Any, val width: Int, val height: Int) : AutoCloseable {
+    data class Preview(val surface: Any, val parent: Any) : AutoCloseable {
         override fun close() {
             runCatching { surface.javaClass.getMethod("release").invoke(surface) }
             runCatching { parent.javaClass.getMethod("release").invoke(parent) }
@@ -30,7 +29,7 @@ internal class PreStartingSurfaces(
     /** The caller must retry without retiring its currently attached content. */
     class Busy : RuntimeException()
 
-    private val members = Members()
+    private val members = OptionalMembers()
     private val surfaceClass = Class.forName("android.view.SurfaceControl")
     private val copySurface = surfaceClass.getConstructor(surfaceClass, String::class.java)
     private val surfaceValid = surfaceClass.getMethod("isValid")
@@ -256,7 +255,7 @@ internal class PreStartingSurfaces(
                     return unavailable(leash, "parent-retired")
                 parentCopy = copySurface.newInstance(parent, "HHA.central.prestarting.parent")
             }
-            return Preview(surfaceCopy, checkNotNull(parentCopy), width, height).also {
+            return Preview(surfaceCopy, checkNotNull(parentCopy)).also {
                 openingExclusions.remove(leash)
                 copies.clear()
                 parentCopy = null
@@ -430,28 +429,6 @@ internal class PreStartingSurfaces(
     private fun factory(name: String): Method? = runCatching {
         Class.forName(name, false, loader).getDeclaredMethod("getInstance").apply { isAccessible = true }
     }.getOrNull()
-
-    private class Members {
-        private data class Key(val type: Class<*>, val name: String)
-        private data class Optional<T>(val value: T?)
-        private val fields = ConcurrentHashMap<Key, Optional<Field>>()
-        private val methods = ConcurrentHashMap<Key, Optional<Method>>()
-        fun field(target: Any, name: String): Any? = fields.getOrPut(Key(target.javaClass, name)) {
-            Optional(find(target.javaClass) { it.getDeclaredField(name).apply { isAccessible = true } })
-        }.value?.get(target)
-        fun call(target: Any, name: String): Any? = methods.getOrPut(Key(target.javaClass, name)) {
-            Optional(find(target.javaClass) { it.getDeclaredMethod(name).apply { isAccessible = true } })
-        }.value?.invoke(target)
-        private fun <T> find(type: Class<*>, lookup: (Class<*>) -> T): T? {
-            var current: Class<*>? = type
-            while (current != null) {
-                try { return lookup(current) }
-                catch (_: NoSuchFieldException) { current = current.superclass }
-                catch (_: NoSuchMethodException) { current = current.superclass }
-            }
-            return null
-        }
-    }
 
     companion object {
         private const val TAG = "HHA.PreStarting"
