@@ -51,6 +51,13 @@ internal object ContentAnimator {
         initialized && nativePrime(transaction, surface, parent, width, height, geometry,
             closing, eventTimeNanos, companions, starting, unwarpedSource)
 
+    /** The caller merges this server-owned publication into the icon host transaction. */
+    fun primeIcon(transaction: Long, surface: Long, parent: Long, textureWidth: Int, textureHeight: Int,
+                  windowWidth: Int, windowHeight: Int, geometry: FloatArray, closing: Boolean,
+                  eventTimeNanos: Long, sourceEventNanos: Long = 0L, sourceParentLayer: Int = -1): Boolean = initialized && geometry.size == 12 &&
+        nativePrimeIcon(transaction, surface, parent, textureWidth, textureHeight,
+            windowWidth, windowHeight, geometry, closing, eventTimeNanos, sourceEventNanos, sourceParentLayer)
+
     fun attach(transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
                eventTimeNanos: Long): Boolean = initialized &&
         nativeAttach(transaction, surface, parent, width, height, eventTimeNanos)
@@ -89,6 +96,11 @@ internal object ContentAnimator {
         transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
         geometry: FloatArray, closing: Boolean, eventNs: Long,
         companions: LongArray, starting: Boolean, unwarpedSource: Long,
+    ): Boolean
+    @JvmStatic external fun nativePrimeIcon(
+        transaction: Long, surface: Long, parent: Long, textureWidth: Int, textureHeight: Int,
+        windowWidth: Int, windowHeight: Int, geometry: FloatArray, closing: Boolean, eventNs: Long,
+        sourceEventNs: Long, sourceParentLayer: Int,
     ): Boolean
     @JvmStatic external fun nativeAttach(
         transaction: Long, surface: Long, parent: Long, width: Int, height: Int, eventNs: Long,

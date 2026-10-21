@@ -31,6 +31,11 @@ bool PrimeContentPublication(void* transaction,void* surface,void* parent,int wi
                              const Transition& transition);
 bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
                            const Transition& transition);
+// Register the actual floating icon with the central renderer. The returned
+// server transaction (including its commit listener) joins this host publication.
+bool PrepareIcon(void* host_transaction,void* icon_surface,void* icon_parent,
+                 int texture_width,int texture_height,int window_width,int window_height,
+                 const Transition& transition);
 bool RenderIcon(void* transaction,void* surface,void* parent,int texture_width,int texture_height,
                 int window_width,int window_height,const Transition& transition);
 void CancelIconRenderer();

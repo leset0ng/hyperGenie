@@ -7,6 +7,7 @@
 #include "hha_abi.h"
 
 #include <android/log.h>
+#include <android/surface_control.h>
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,6 +46,7 @@ using StopFn = void* (*)(void*, const void*, int32_t);
 using BlastUpdateFn = void* (*)(void*,const void*,uint32_t,uint32_t,int32_t);
 using LayerFn = int32_t (*)(const void*);
 using NameFn = const std::string& (*)(const void*);
+using TransactionIdFn = uint64_t (*)(void*);
 AnimationFn g_start = nullptr;
 AnimationFn g_adjust = nullptr;
 AnimationFn g_reparent = nullptr;
@@ -54,6 +56,7 @@ std::atomic<bool> g_icon_ready{false};
 std::atomic<bool> g_native_entered{false};
 LayerFn g_layer = nullptr;
 NameFn g_name = nullptr;
+TransactionIdFn g_transaction_id = nullptr; // Optional transaction diagnostics.
 const NativeAPIEntries* g_api = nullptr;
 std::atomic<bool> g_installed{false};
 std::mutex g_mutex;
@@ -124,6 +127,7 @@ struct Property {
     float start = 0;
     float end = 0;
     float velocity = 0;
+    float delay = 0;
     bool valid = false;
 };
 Property Spring(const void* parameters, const char* key) {
@@ -134,7 +138,9 @@ Property Spring(const void* parameters, const char* key) {
     std::memcpy(&result.start,property+0x10,4);
     std::memcpy(&result.end,property+0x14,4);
     std::memcpy(&result.velocity,property+0x1c,4);
-    result.valid=std::isfinite(result.start)&&std::isfinite(result.end)&&std::isfinite(result.velocity);
+    std::memcpy(&result.delay,property+0x18,4);
+    result.valid=std::isfinite(result.start)&&std::isfinite(result.end)&&
+        std::isfinite(result.velocity)&&std::isfinite(result.delay);
     return result;
 }
 
@@ -301,6 +307,9 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         previous->window=request.closing?cached.window:
             hha::genie::Rect{request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
         previous->presentation_start=presentation_start;
+        previous->host_velocity={x.velocity,y.velocity,w.velocity};
+        previous->host_delay={x.delay,y.delay,w.delay};
+        previous->host_transaction_id=0;
         previous->adjusting=adjust && cached.valid;
         previous->transition=request;
         previous->animation_id=animation_id;
@@ -333,9 +342,31 @@ void SetVelocity(const void* parameters,const char* key,float velocity) {
     auto* property=value?*reinterpret_cast<unsigned char* const*>(value):nullptr;
     if(property) std::memcpy(property+0x1c,&velocity,4);
 }
+void SetDelay(const void* parameters,const char* key,float delay) {
+    const auto* value=Find(parameters,0x18,key);
+    auto* property=value?*reinterpret_cast<unsigned char* const*>(value):nullptr;
+    if(property) std::memcpy(property+0x18,&delay,4);
+}
 void SetFixed(const void* parameters,const char* key,float number) {
     auto* value=const_cast<unsigned char*>(Find(parameters,0x30,key));
     if(value) std::memcpy(value,&number,4);
+}
+void SuppressFloatingIcon(void* transaction,const void* control,const void* parameters,
+                          int32_t layer,const Last& snapshot,const char* reason,uint64_t transaction_id) {
+    if(!control || !g_name || g_name(control).find("FloatingIcon_all")!=0) return;
+    // Suppress only the temporary clone. Zero both the initial alpha and its
+    // stock spring so a later SF animation update cannot reveal it again.
+    SetSpring(parameters,"alpha",0,0);
+    SetVelocity(parameters,"alpha",0);
+    SetDelay(parameters,"alpha",0);
+    if(transaction) ASurfaceTransaction_setBufferAlpha(
+        static_cast<ASurfaceTransaction*>(transaction),
+        reinterpret_cast<ASurfaceControl*>(const_cast<void*>(control)),0);
+    __android_log_print(ANDROID_LOG_WARN,kTag,
+        "icon suppressed parent=%d source=%d epoch=%lld reason=%s hostTxn=%llu sourceTxn=%llu",layer,
+        snapshot.transition.leash_layer,static_cast<long long>(snapshot.transition.event_ns),reason,
+        static_cast<unsigned long long>(transaction_id),
+        static_cast<unsigned long long>(snapshot.host_transaction_id));
 }
 void TuneParent(void* transaction,const void* surface,const void* parameters) {
     const Config config=ReadConfig();
@@ -422,23 +453,45 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             }
             hha::QueueTransition(snapshot.transition);
         }
+        const uint64_t transaction_id=transaction && g_transaction_id?g_transaction_id(transaction):0;
         hha::genie::Rect minimized;
         if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) return;
         if(is_icon) {
-            bool rendering=false;
-            std::lock_guard<std::mutex> lock(g_mutex);
-            for(auto& source:g_icons) if(source.surface && source.parent==layer) {
-                rendering=hha::RenderIcon(transaction,source.surface,const_cast<void*>(control),source.width,source.height,
-                    static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition);
-                if(rendering) {
-                    source.animation_id=animation_id;
-                    source.request_ns=snapshot.transition.event_ns;
+            // OEM can build App and icon in separate transactions and merge
+            // them before presentation. Construction IDs are diagnostic only;
+            // the server's exact request and capability proof authorize joining.
+            // Keep an independent capability lease while the server registers
+            // this buffer. Never hold the launcher registry lock across Binder.
+            IconBuffer lease;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(const auto& source:g_icons) if(source.surface && source.parent==layer) {
+                    lease=source;
+                    hha::RetainIconSurface(lease.surface,&lease);
+                    break;
                 }
-                break;
             }
-            // A stock icon must retain its stock host/corners if no real child
-            // accepted the mesh; otherwise it becomes a tall rectangular plate.
-            if(!rendering) return;
+            const bool rendering=lease.surface && hha::PrepareIcon(transaction,lease.surface,
+                const_cast<void*>(control),lease.width,lease.height,
+                static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition);
+            if(rendering) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(auto& source:g_icons) if(source.surface==lease.surface && source.parent==layer) {
+                    // A nested callback may have replaced or advanced this icon.
+                    // Do not let an older registration retag that newer epoch.
+                    if(source.request_ns<=snapshot.transition.event_ns) {
+                        source.animation_id=animation_id;
+                        source.request_ns=snapshot.transition.event_ns;
+                    }
+                    break;
+                }
+            }
+            hha::ReleaseIconSurface(lease.surface,&lease);
+            if(!rendering) {
+                SuppressFloatingIcon(transaction,control,parameters,layer,snapshot,
+                    lease.surface?"registration-rejected":"missing-child",transaction_id);
+                return;
+            }
         }
         const hha::genie::Rect original_start{geometry[0],geometry[1],geometry[2],geometry[3]};
         const auto start=snapshot.adjusting?snapshot.presentation_start:
@@ -449,18 +502,36 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         SetSpring(parameters,"width",start.width,end.width);
         SetSpring(parameters,"height",start.height,end.height);
         const float aspect=window.height/window.width;
-        SetVelocity(parameters,"height",w.velocity*aspect);
+        SetVelocity(parameters,"centerX",snapshot.host_velocity[0]);
+        SetVelocity(parameters,"centerY",snapshot.host_velocity[1]);
+        SetVelocity(parameters,"width",snapshot.host_velocity[2]);
+        SetVelocity(parameters,"height",snapshot.host_velocity[2]*aspect);
+        SetDelay(parameters,"centerX",snapshot.host_delay[0]);
+        SetDelay(parameters,"centerY",snapshot.host_delay[1]);
+        SetDelay(parameters,"width",snapshot.host_delay[2]);
+        SetDelay(parameters,"height",snapshot.host_delay[2]);
         SetSpring(parameters,"ratio",aspect,aspect);
         SetVelocity(parameters,"ratio",0);
+        SetDelay(parameters,"ratio",0);
         SetFixed(parameters,"needDrawWindowMask",0);
         for(const char* key:{"radius","radiusRatio","cornerTLX","cornerTLY","cornerTRX","cornerTRY",
                             "cornerBRX","cornerBRY","cornerBLX","cornerBLY"}) {
             SetSpring(parameters,key,0,0);
             SetVelocity(parameters,key,0);
+            SetDelay(parameters,key,0);
         }
-        __android_log_print(ANDROID_LOG_INFO,kTag,"mesh viewport layer=%d animation=%d source=%d epoch=%lld start=%.1fx%.1f end=%.1fx%.1f",layer,
+        if(!is_icon) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for(auto& source:g_last) if(source.valid && source.supported &&
+                source.transition.event_ns==snapshot.transition.event_ns &&
+                source.transition.leash_layer==snapshot.transition.leash_layer) {
+                source.host_transaction_id=transaction_id;
+                break;
+            }
+        }
+        __android_log_print(ANDROID_LOG_INFO,kTag,"mesh viewport layer=%d animation=%d source=%d epoch=%lld hostTxn=%llu start=%.1fx%.1f end=%.1fx%.1f",layer,
             animation_id,snapshot.transition.leash_layer,static_cast<long long>(snapshot.transition.event_ns),
-            start.width,start.height,end.width,end.height);
+            static_cast<unsigned long long>(transaction_id),start.width,start.height,end.width,end.height);
     }
     constexpr const char* keys[]={"centerX","centerY","width","height","ratio",
         "radius","radiusRatio","cornerTLX","cornerTLY","cornerTRX","cornerTRY",
@@ -522,14 +593,11 @@ void* Stop(void* transaction,const void* surface,int32_t animation_id) {
     if (surface && g_layer) {
         const void* control=*static_cast<const void* const*>(surface);
         const int32_t id=control?g_layer(control):-1;
-        bool cancel=false,icon_cancel=false;
-        hha::RenderIdentity icon_identity;
+        bool cancel=false;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
-            for(const auto& source:g_icons) if(source.parent==id && source.animation_id==animation_id) {
-                icon_identity={source.parent,source.request_ns};
-                icon_cancel=true;break;
-            }
+            // Icon buffers share the central App owner's lifetime. An icon's
+            // stock completion must not cancel or detach that shared mesh.
             for(auto& slot:g_last) {
                 if(slot.valid && slot.transition.leash_layer==id && slot.animation_id==animation_id) {
                     slot.valid=false;
@@ -539,7 +607,6 @@ void* Stop(void* transaction,const void* surface,int32_t animation_id) {
             }
         }
         if(cancel) hha::QueueCancel(id,Now());
-        if(icon_cancel) hha::CancelIconRenderer(icon_identity);
     }
     return g_stop(transaction,surface,animation_id);
 }
@@ -552,6 +619,8 @@ void Install(void* handle) {
     void* blast=dlsym(handle,kBlastUpdate);
     g_layer=reinterpret_cast<LayerFn>(dlsym(handle,"_ZNK7android14SurfaceControl10getLayerIdEv"));
     g_name=reinterpret_cast<NameFn>(dlsym(handle,"_ZNK7android14SurfaceControl7getNameEv"));
+    g_transaction_id=reinterpret_cast<TransactionIdFn>(dlsym(handle,
+        "_ZN7android21SurfaceComposerClient11Transaction5getIdEv"));
     if (!start || !adjust || !stop || !reparent || !blast || !g_layer || !g_name) {
         __android_log_print(ANDROID_LOG_WARN,kTag,"required launcher interfaces missing; keeping stock");
         return;

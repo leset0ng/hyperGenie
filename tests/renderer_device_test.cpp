@@ -18,7 +18,12 @@ static void ObserveRendererApply(ASurfaceTransaction* transaction) {
 
 namespace {
 using namespace std::chrono_literals;
-struct Event { int layer; bool clear; void* transaction; };
+struct Event {
+    int layer;
+    bool clear;
+    void* transaction;
+    std::array<float,44> uniforms{};
+};
 struct CallbackCall { void* context; ASurfaceTransaction_OnComplete callback; };
 std::mutex test_mutex;
 std::condition_variable test_cv;
@@ -30,6 +35,8 @@ std::map<int, float> border_widths;
 std::map<int, std::array<float,44>> layer_uniforms;
 bool pause_post=false, post_paused=false, release_post=false, producer_ready=false;
 int producer_parent=-1;
+bool pause_layer=false, layer_paused=false, release_layer=false;
+int paused_layer=-1;
 int checks=0;
 
 void Check(bool ok,const char* message) {
@@ -47,7 +54,11 @@ void Strong(const void* surface,const void* owner,int delta) {
 void Inc(const void* surface,const void* owner) {Strong(surface,owner,1);}
 void Dec(const void* surface,const void* owner) {Strong(surface,owner,-1);}
 int32_t Layer(const void* pointer) {
-    std::lock_guard<std::mutex> lock(test_mutex);
+    std::unique_lock<std::mutex> lock(test_mutex);
+    if(pause_layer && Id(pointer)==paused_layer) {
+        pause_layer=false;layer_paused=true;test_cv.notify_all();
+        Wait(lock,release_layer,"icon seed construction released within timeout");
+    }
     if(Id(pointer)==producer_parent) {producer_ready=true;test_cv.notify_all();}
     return Id(pointer);
 }
@@ -60,7 +71,8 @@ void* Post(void* transaction,const void* surface,const void* token,const void* p
         Check(bytes && bytes->size()==sizeof(std::array<float,44>),"shader payload is complete");
         std::memcpy(layer_uniforms[layer].data(),bytes->data(),bytes->size());
     }
-    events.push_back({layer,clear,transaction});
+    events.push_back({layer,clear,transaction,{}});
+    if(!clear) events.back().uniforms=layer_uniforms[layer];
     if(pause_post && !clear) {
         pause_post=false;post_paused=true;test_cv.notify_all();
         Wait(lock,release_post,"paused Frame released within timeout");
@@ -117,6 +129,7 @@ Controller& Fresh() {
     border_widths.clear();
     events.clear();commits.clear();completions.clear();
     pause_post=post_paused=release_post=producer_ready=false;producer_parent=-1;
+    pause_layer=layer_paused=release_layer=false;paused_layer=-1;
     return *controller;
 }
 std::array<float,12> Geometry(int width,int height) {
@@ -967,6 +980,686 @@ void GroupedSourcePublication() {
     Stop(controller);
     std::puts("PASS grouped-source publication prevents double deformation");
 }
+
+std::array<float,12> LinkedGeometry(bool closing) {
+    auto geometry=Geometry(1120,2436);
+    if(!closing) {
+        for(size_t i=0;i<4;++i) std::swap(geometry[i],geometry[i+4]);
+        std::swap(geometry[10],geometry[11]);
+    }
+    return geometry;
+}
+size_t PrimeTestIcon(int layer,int parent,const std::array<float,12>& geometry,
+                     bool closing,int64_t request) {
+    size_t index;
+    {std::lock_guard<std::mutex> lock(test_mutex);index=commits.size();}
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create linked icon host transaction");
+    const auto applies=renderer_applies.load();
+    Check(PrimeLinkedIcon(transaction,layer,parent,171,171,1120,2436,geometry,closing,request),
+          "prime real floating icon on its shared server motion owner");
+    Check(renderer_applies.load()==applies,"linked icon first publication does not apply a separate transaction");
+    Check(commits.size()==index+1,"linked icon host publication has an independent commit barrier");
+    Check(std::any_of(events.begin(),events.end(),[&](const Event& event) {
+              return event.layer==layer && !event.clear && event.transaction==transaction;
+          }),"linked icon first shader uses the supplied host transaction alongside its owner");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    return index;
+}
+void CheckSharedIconFrame(int app,int icon) {
+    Check(events.size()==2 && !events[0].clear && !events[1].clear &&
+          events[0].layer==app && events[1].layer==icon,
+          "one frame writes the App and its linked icon exactly once");
+    Check(events[0].transaction==events[1].transaction,
+          "App and linked icon frame uniforms are submitted in the same transaction");
+    const auto& app_values=layer_uniforms.at(app);
+    const auto& icon_values=layer_uniforms.at(icon);
+    Check(std::equal(app_values.begin(),app_values.begin()+36,icon_values.begin()) &&
+          app_values[38]==icon_values[38] && app_values[39]==icon_values[39],
+          "App and icon use exactly the same mesh vertices and corner state");
+    Check(app_values[36]==1120 && app_values[37]==2436 &&
+          app_values[40]==1120 && app_values[41]==2436,
+          "App samples the full content buffer in the full-size viewport");
+    Check(icon_values[36]==171 && std::abs(icon_values[37]-171.0f*2436/1120)<1e-4f &&
+          icon_values[40]==171 && icon_values[41]==171,
+          "linked icon keeps its tall virtual viewport separate from its square source footprint");
+}
+void CheckLinkedRetirement(int app,int icon) {
+    auto cleared=Cleared();std::sort(cleared.begin(),cleared.end());
+    Check(cleared==std::vector<int>({app,icon}),"retirement clears both App and linked icon");
+    const auto app_clear=std::find_if(events.begin(),events.end(),
+        [&](const Event& event) {return event.layer==app && event.clear;});
+    const auto icon_clear=std::find_if(events.begin(),events.end(),
+        [&](const Event& event) {return event.layer==icon && event.clear;});
+    Check(app_clear->transaction==icon_clear->transaction,
+          "App and linked icon SELF and CLIENT guards retire in the same transaction");
+    Check(border_widths[app]==0 && border_widths[icon]==0,
+          "retirement leaves neither linked layer forced to CLIENT composition");
+    DrainCompletions();Check(!Running(),"linked stream becomes idle after its actual detach completion");
+    for(const auto& entry:references)
+        Check(entry.second==0,"retired linked stream releases every retained surface capability");
+}
+void LateLinkedIconSharesFrames() {
+    auto& controller=Fresh();
+    const auto geometry=LinkedGeometry(true);
+    const int64_t request=NowNs()-700000000LL;
+    Check(QueueSession(1901,1900,1120,2436,geometry,true,request,{},false),
+          "seed App animation before a floating icon stalls for more than 500ms");
+    Pump(controller);ResetEvents();
+    const auto frames=controller.active->frames;
+    const auto last_ns=controller.active->last_ns;
+    const auto scalars=controller.active->animation.Scalars();
+    const auto commit=PrimeTestIcon(1902,1903,geometry,true,request);
+    Check(controller.active->layer==1901 && Owns(*controller.active,1902) &&
+          !controller.pending && controller.overlapping.empty(),
+          "late icon joins the App owner without creating another animation clock");
+    const auto icon_first=layer_uniforms[1902];
+    ResetEvents();Frame(last_ns+48000000LL,&controller);
+    Check(events.empty() && controller.active->frames==frames && controller.active->last_ns==last_ns &&
+          layer_uniforms[1902]==icon_first,
+          "an uncommitted icon publication freezes both App and icon frame updates");
+    for(size_t i=0;i<scalars.size();++i)
+        Check(controller.active->animation.Scalars()[i].value==scalars[i].value &&
+              controller.active->animation.Scalars()[i].velocity==scalars[i].velocity,
+              "the shared motion does not advance behind the icon publication barrier");
+    Commit(commit);ResetEvents();
+    const auto applies=renderer_applies.load();
+    Frame(last_ns+64000000LL,&controller);
+    Check(controller.active->frames==frames+1 && controller.active->last_ns==last_ns+64000000LL &&
+          renderer_applies.load()==applies+1,
+          "one shared frame catches up after commit with a single renderer apply");
+    CheckSharedIconFrame(1901,1902);
+    ResetEvents();Stop(controller);CheckLinkedRetirement(1901,1902);
+    std::puts("PASS late linked icon shares App frames and publication barrier");
+}
+void LinkedIconBeforeAppHandoff() {
+    for(bool closing:{false,true}) {
+        auto& controller=Fresh();
+        const auto geometry=LinkedGeometry(closing);
+        const int app=closing?1921:1911,icon=app+1;
+        const int64_t request=NowNs()-30000000LL;
+        const auto commit=PrimeTestIcon(icon,app+2,geometry,closing,request);
+        Pump(controller);
+        Check(!controller.active && controller.pending,
+              "icon-first provisional owner waits for its first host transaction commit");
+        Commit(commit);Pump(controller);
+        Check(controller.active && controller.active->layer==icon && controller.active->starting &&
+              controller.active->texture_width==171 && controller.active->texture_height==171,
+              "icon-first publication seeds one provisional owner with its actual texture dimensions");
+        controller.active->animation.Advance(.11);
+        hha::genie::AdvanceScalar(&controller.active->corner,.11,1.0);
+        controller.active->last_ns=NowNs()+10000000LL;
+        const auto scalars=controller.active->animation.Scalars();
+        const auto corner=controller.active->corner;
+        const auto last_ns=controller.active->last_ns;
+        ResetEvents();
+        Check(QueueSession(app,app-1,1120,2436,geometry,closing,request,{},false),
+              "real App arrives after its icon on the same immutable request");
+        Pump(controller);
+        Check(controller.active && controller.active->layer==app && !controller.active->starting &&
+              controller.active->texture_width==0 && controller.overlapping.empty(),
+              "real App takes over the single motion owner rather than an independent session");
+        const auto linked=std::find_if(controller.active->companions.begin(),controller.active->companions.end(),
+            [&](const Companion& item) {return item.layer==icon;});
+        Check(linked!=controller.active->companions.end() && linked->texture_width==171 && linked->texture_height==171,
+              "App handoff retains the icon capability and its square texture metadata in either direction");
+        Check(Cleared().empty() && border_widths[app]>0 && border_widths[icon]>0,
+              "icon-to-App handoff exposes neither a planar icon nor unprotected App source");
+        Check(controller.active->last_ns==last_ns && controller.active->corner.value==corner.value &&
+              controller.active->corner.velocity==corner.velocity,
+              "App handoff preserves the exact motion timestamp and corner velocity");
+        for(size_t i=0;i<scalars.size();++i)
+            Check(controller.active->animation.Scalars()[i].value==scalars[i].value &&
+                  controller.active->animation.Scalars()[i].velocity==scalars[i].velocity,
+                  "App handoff preserves every live spring position and velocity");
+        CheckSharedIconFrame(app,icon);
+        ResetEvents();Frame(last_ns+16000000LL,&controller);CheckSharedIconFrame(app,icon);
+        ResetEvents();Stop(controller);CheckLinkedRetirement(app,icon);
+    }
+    std::puts("PASS icon-first opening and closing handoffs retain one live motion and source domains");
+}
+void LinkedIconPublicationCancellation() {
+    auto& controller=Fresh();const auto geometry=LinkedGeometry(true);
+    const auto request=NowNs();
+    Check(QueueSession(1931,1930,1120,2436,geometry,true,request,{},false),
+          "seed linked stream before a pending icon publication is cancelled");
+    Pump(controller);
+    const auto commit=PrimeTestIcon(1932,1933,geometry,true,request);
+    ResetEvents();Stop(controller);
+    Check(!controller.active && controller.retiring.size()==1 && Cleared().empty() && Running(),
+          "global cancellation retains App and icon until the icon host publication commits");
+    Commit(commit);Pump(controller);CheckLinkedRetirement(1931,1932);
+
+    auto& deadline=Fresh();const auto later=NowNs();
+    Check(QueueSession(1941,1940,1120,2436,geometry,true,later,{},false),
+          "seed shared closing stream for deadline retirement");
+    Pump(deadline);Commit(PrimeTestIcon(1942,1943,geometry,true,later));
+    deadline.active->started_ns=NowNs()-2000000000LL;
+    ResetEvents();Frame(NowNs(),&deadline);
+    Check(!deadline.active,"closing deadline retires the shared motion owner");
+    CheckLinkedRetirement(1941,1942);
+    std::puts("PASS cancellation and deadline retire both linked layers after publication completion");
+}
+void LinkedIconSeedLosesToAppPublication() {
+    auto& controller=Fresh();const auto geometry=LinkedGeometry(true);
+    const auto request=NowNs();
+    auto* icon_transaction=ASurfaceTransaction_create();
+    auto* app_transaction=ASurfaceTransaction_create();
+    Check(icon_transaction && app_transaction,"create racing App and icon publication transactions");
+    {
+        std::lock_guard<std::mutex> lock(test_mutex);
+        pause_layer=true;paused_layer=1962;
+    }
+    std::atomic<bool> accepted{false};
+    std::thread icon([&] {
+        accepted=PrimeLinkedIcon(icon_transaction,1962,1963,171,171,1120,2436,
+                                 geometry,true,request);
+    });
+    {
+        std::unique_lock<std::mutex> lock(test_mutex);
+        Wait(lock,layer_paused,"icon seed is constructed before it acquires controller publication lock");
+    }
+    Check(QueueSession(1961,1960,1120,2436,geometry,true,request,{},false,0,0,app_transaction),
+          "App first publication wins while the provisional icon seed is being constructed");
+    Check(controller.pending && controller.pending->layer==1961 && commits.size()==1,
+          "App pending publication is established before the icon can enqueue its seed");
+    {
+        std::lock_guard<std::mutex> lock(test_mutex);
+        release_layer=true;test_cv.notify_all();
+    }
+    icon.join();Check(accepted,"racing icon joins the App publication that won the construction race");
+    Check(controller.pending && controller.pending->layer==1961 && Owns(*controller.pending,1962) &&
+          controller.retiring.empty() && controller.queued.empty() && commits.size()==2,
+          "late seed construction retains App primary and adds only a linked icon plus its commit barrier");
+    ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+    ASurfaceTransaction_apply(icon_transaction);ASurfaceTransaction_delete(icon_transaction);
+    ResetEvents();Commit(1);Frame(NowNs(),&controller);
+    Check(!controller.active && controller.pending && events.empty(),
+          "icon commit cannot start the stream ahead of the winning App publication");
+    Commit(0);Pump(controller);
+    Check(controller.active && controller.active->layer==1961 && Owns(*controller.active,1962) &&
+          controller.overlapping.empty() && Cleared().empty(),
+          "both committed racing publications adopt one App owner without clearing the App source");
+    ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);
+    CheckSharedIconFrame(1961,1962);
+    ResetEvents();Stop(controller);CheckLinkedRetirement(1961,1962);
+    std::puts("PASS icon seed construction joins an App publication that wins the race");
+}
+
+void LinkedIconCannotCrossAppOwnership() {
+    auto& controller=Fresh();const auto geometry=LinkedGeometry(true);
+    const auto a_request=NowNs()-100000000LL;
+    Check(QueueSession(1971,1970,1120,2436,geometry,true,a_request,{},false),
+          "seed App A with its linked icon before an independent App starts");
+    Pump(controller);Commit(PrimeTestIcon(1972,1973,geometry,true,a_request));
+    const auto b_request=NowNs();
+    Check(QueueSession(1974,1975,1120,2436,geometry,true,b_request,{},false),
+          "start independent App B while closing A and its icon remain visible");
+    Pump(controller);
+    Check(controller.active->layer==1974 && controller.overlapping.size()==1 &&
+          Owns(*controller.overlapping[0],1972),"independent App overlap retains A's icon ownership");
+    auto* stolen=ASurfaceTransaction_create();Check(stolen,"create conflicting icon publication");
+    ResetEvents();const auto callbacks=commits.size();
+    Check(!PrimeLinkedIcon(stolen,1972,1973,171,171,1120,2436,geometry,true,b_request),
+          "App B cannot bind an icon capability still owned by App A's live epoch");
+    Check(events.empty() && commits.size()==callbacks && !Owns(*controller.active,1972) &&
+          Owns(*controller.overlapping[0],1972),
+          "rejected cross-App icon binding writes nothing and leaves both motion owners intact");
+    ASurfaceTransaction_delete(stolen);
+    ResetEvents();Frame(NowNs()+16000000LL,&controller);
+    Check(events.size()==3,"both independent Apps and A's linked icon continue after rejection");
+    const auto app=std::find_if(events.begin(),events.end(),[](const Event& event) {return event.layer==1971;});
+    const auto icon=std::find_if(events.begin(),events.end(),[](const Event& event) {return event.layer==1972;});
+    Check(app!=events.end() && icon!=events.end() && app->transaction==icon->transaction &&
+          std::equal(layer_uniforms[1971].begin(),layer_uniforms[1971].begin()+36,layer_uniforms[1972].begin()),
+          "App A retains its own shared icon mesh and transaction throughout independent App B motion");
+    ResetEvents();Stop(controller);
+    auto cleared=Cleared();std::sort(cleared.begin(),cleared.end());
+    Check(cleared==std::vector<int>({1971,1972,1974}),"global stop retires both Apps and the correctly owned icon");
+    DrainCompletions();Check(!Running(),"cross-App overlap releases every stream and detach completion");
+    for(const auto& entry:references) Check(entry.second==0,"cross-App rejection retains no leaked capabilities");
+    std::puts("PASS a linked icon cannot migrate to another live App request");
+}
+
+void LinkedIconPendingReversalPublication() {
+    auto& controller=Fresh();const auto closing=LinkedGeometry(true);
+    const auto old_request=NowNs()-100000000LL;
+    Check(QueueSession(1981,1980,1120,2436,closing,true,old_request,{},false),
+          "seed closing App and linked icon before an uncommitted reversal");
+    Pump(controller);Commit(PrimeTestIcon(1982,1983,closing,true,old_request));
+    controller.active->animation.Advance(.09);
+    hha::genie::AdvanceScalar(&controller.active->corner,.09,1.0);
+    controller.active->last_ns=NowNs()+10000000LL;
+    const auto old_frames=controller.active->frames;
+    const auto opening=LinkedGeometry(false);
+    const auto new_request=NowNs();
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create pending reversal App publication");
+    Check(QueueSession(1981,1980,1120,2436,opening,false,new_request,{},false,0,0,transaction),
+          "prime new opening epoch without committing its App host transaction");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    Check(controller.active->request_ns==old_request && controller.pending &&
+          controller.pending->request_ns==new_request && Owns(*controller.active,1982) &&
+          Owns(*controller.pending,1982),
+          "old active and new pending reversal retain the same live icon capability");
+    const auto pending_app=layer_uniforms[1981];
+    ResetEvents();
+    const auto icon_commit=PrimeTestIcon(1982,1983,opening,false,new_request);
+    Check(layer_uniforms[1981]==pending_app,"icon publication leaves the pending App state unchanged");
+    Check(std::equal(layer_uniforms[1981].begin(),layer_uniforms[1981].begin()+36,
+                     layer_uniforms[1982].begin()) &&
+          layer_uniforms[1981][38]==layer_uniforms[1982][38],
+          "new icon publication uses the pending reversal mesh and corner rather than old active state");
+    ResetEvents();Commit(icon_commit);Frame(NowNs(),&controller);
+    Check(controller.active->request_ns==old_request && controller.active->frames==old_frames && events.empty(),
+          "icon commit cannot overtake the pending reversal App publication");
+    Commit(icon_commit-1);Pump(controller);
+    Check(controller.active->request_ns==new_request && !controller.active->closing && !controller.pending &&
+          Owns(*controller.active,1982),"both commits adopt the reversed App and icon as a single owner");
+    ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);CheckSharedIconFrame(1981,1982);
+    ResetEvents();Stop(controller);CheckLinkedRetirement(1981,1982);
+    std::puts("PASS new icon publication joins an uncommitted reversal while old active retains its capability");
+}
+
+std::vector<Event> TransactionWrites(void* transaction) {
+    std::lock_guard<std::mutex> lock(test_mutex);
+    std::vector<Event> writes;
+    for(const auto& event:events) if(event.transaction==transaction) writes.push_back(event);
+    return writes;
+}
+using VisibleUniforms=std::map<int,std::array<float,44>>;
+void PresentWrites(VisibleUniforms& visible,const std::vector<Event>& writes) {
+    for(const auto& write:writes) {
+        if(write.clear) visible.erase(write.layer);
+        else visible[write.layer]=write.uniforms;
+    }
+}
+void CheckVisibleContour(const VisibleUniforms& visible,int app,int icon) {
+    if(!visible.count(app) || !visible.count(icon)) return;
+    const auto& a=visible.at(app);const auto& i=visible.at(icon);
+    Check(std::equal(a.begin(),a.begin()+36,i.begin()) && a[38]==i[38] && a[39]==i[39],
+          "each visible transaction commit keeps App and icon mesh and corner in the same presentation state");
+}
+void LinkedIconWholeOwnerPublication() {
+    auto& controller=Fresh();const auto geometry=LinkedGeometry(true);const auto request=NowNs();
+    Check(QueueSession(2011,2010,1120,2436,geometry,true,request,{},false),
+          "seed visible App before attaching a newly visible icon");
+    Pump(controller);
+    VisibleUniforms visible;
+    for(const auto& write:events) if(!write.clear) visible[write.layer]=write.uniforms;
+    controller.active->animation.Advance(.08);
+    hha::genie::AdvanceScalar(&controller.active->corner,.08,1.0);
+    controller.active->last_ns=NowNs()+10000000LL;
+    const auto old_app=visible.at(2011);
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create whole-owner icon publication");
+    ResetEvents();
+    Check(PrimeLinkedIcon(transaction,2012,2013,171,171,1120,2436,geometry,true,request),
+          "new icon publication accepts the current shared App state");
+    const auto writes=TransactionWrites(transaction);
+    Check(writes.size()==2 && writes[0].layer==2011 && writes[1].layer==2012,
+          "first icon transaction republishes the App together with its icon at one snapshot");
+    Check(!std::equal(old_app.begin(),old_app.begin()+36,writes[0].uniforms.begin()),
+          "whole-owner publication regression distinguishes old visible App from its current unpublished state");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    Commit(0);PresentWrites(visible,writes);CheckVisibleContour(visible,2011,2012);
+    ResetEvents();Stop(controller);CheckLinkedRetirement(2011,2012);
+    std::puts("PASS first linked icon transaction publishes the whole owner at one visible snapshot");
+}
+void LinkedIconAppCommitOrders() {
+    for(bool app_first:{false,true}) {
+        auto& controller=Fresh();const auto geometry=LinkedGeometry(true);
+        const auto request=NowNs()-100000000LL;
+        auto* icon_transaction=ASurfaceTransaction_create();
+        auto* app_transaction=ASurfaceTransaction_create();
+        Check(icon_transaction && app_transaction,"create separate icon-first and App-handoff publications");
+        Check(PrimeLinkedIcon(icon_transaction,2022,2023,171,171,1120,2436,geometry,true,request),
+              "prime icon-first owner before either host transaction commits");
+        const auto icon_writes=TransactionWrites(icon_transaction);
+        Check(icon_writes.size()==1 && icon_writes[0].layer==2022,
+              "icon-first transaction contains the original provisional icon state");
+        Check(controller.pending && !Committed(*controller.pending),"provisional icon publication is still gated");
+        // Simulate waiting on an outstanding host transaction without sleeping.
+        // The visible state remains its published mesh at this earlier clock.
+        controller.pending->last_ns=NowNs()-50000000LL;
+        controller.pending->elapsed=static_cast<double>(controller.pending->last_ns-controller.pending->started_ns)/1e9;
+        const auto held_last=controller.pending->last_ns;
+        const auto held_elapsed=controller.pending->elapsed;
+        const auto held=controller.pending->animation.Scalars();
+        ResetEvents();
+        Check(QueueSession(2021,2020,1120,2436,geometry,true,request,{},false,0,0,app_transaction),
+              "prime real App while the original icon host publication is uncommitted");
+        const auto app_writes=TransactionWrites(app_transaction);
+        Check(app_writes.size()==2 && app_writes[0].layer==2021 && app_writes[1].layer==2022,
+              "App handoff transaction contains both the new App and retained icon");
+        Check(controller.pending->last_ns==held_last && controller.pending->elapsed==held_elapsed,
+              "inherited prime preserves the frozen source clock instead of advancing across an uncommitted publication");
+        for(size_t i=0;i<held.size();++i)
+            Check(controller.pending->animation.Scalars()[i].value==held[i].value &&
+                  controller.pending->animation.Scalars()[i].velocity==held[i].velocity,
+                  "inherited App prime preserves every spring behind the original icon commit barrier");
+        ASurfaceTransaction_apply(icon_transaction);ASurfaceTransaction_delete(icon_transaction);
+        ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+        VisibleUniforms visible;
+        const size_t first=app_first?1:0,second=app_first?0:1;
+        Commit(first);PresentWrites(visible,app_first?app_writes:icon_writes);
+        CheckVisibleContour(visible,2021,2022);
+        ResetEvents();Pump(controller);Frame(NowNs(),&controller);
+        Check(!controller.active && controller.pending && events.empty(),
+              "first commit in either order cannot advance the shared stream before the other publication");
+        Commit(second);PresentWrites(visible,app_first?icon_writes:app_writes);
+        CheckVisibleContour(visible,2021,2022);
+        ResetEvents();Pump(controller);
+        for(const auto& write:events) PresentWrites(visible,{write});
+        CheckVisibleContour(visible,2021,2022);
+        Check(controller.active && controller.active->layer==2021 && !controller.pending,
+              "both commit orders eventually adopt one App owner with the original icon");
+        ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);CheckSharedIconFrame(2021,2022);
+        ResetEvents();Stop(controller);CheckLinkedRetirement(2021,2022);
+    }
+    std::puts("PASS icon/App transactions preserve visible contour through either commit order");
+}
+
+void RejectedLateIcon(int icon,int parent,const std::array<float,12>& geometry,int64_t request) {
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create late retired icon publication");
+    ResetEvents();const auto callbacks=commits.size();const auto applies=renderer_applies.load();
+    Check(!PrimeLinkedIcon(transaction,icon,parent,171,171,1120,2436,geometry,true,request),
+          "stopped or retired request rejects a late icon capability before any shader publication");
+    Check(events.empty() && commits.size()==callbacks && renderer_applies.load()==applies,
+          "rejected late icon adds no shader writes, commit barrier, or independent apply");
+    ASurfaceTransaction_delete(transaction);
+}
+void LinkedIconCannotReviveCancelledRequest() {
+    const auto geometry=LinkedGeometry(true);
+    for(bool published:{false,true}) {
+        auto& controller=Fresh();const auto request=NowNs();
+        Check(QueueSession(1991,1990,1120,2436,geometry,true,request,{},false),
+              "seed App before cancelling a linked icon stream");
+        Pump(controller);
+        const auto commit=PrimeTestIcon(1992,1993,geometry,true,request);
+        if(published) Commit(commit);
+        hha::CancelIconRenderer();
+        Check(controller.stop_requested,"global cancellation is pending before its worker consumes it");
+        RejectedLateIcon(1994,1995,geometry,request);
+        Pump(controller);
+        Check(!controller.active && !controller.pending,"cancelled stream has no live motion owner");
+        if(!published) {
+            Check(controller.retiring.size()==1,"cancelled uncommitted icon remains owned until its host commit");
+            RejectedLateIcon(1994,1995,geometry,request);
+            Commit(commit);Pump(controller);
+        }
+        DrainCompletions();
+        Check(controller.retiring.empty() && !Running(),"cancelled icon stream completes its retirement");
+        RejectedLateIcon(1994,1995,geometry,request);
+        Check(!controller.active && !controller.pending && controller.queued.empty() && controller.overlapping.empty(),
+              "a late icon cannot seed a fresh provisional owner for a retired epoch");
+        for(const auto& entry:references) Check(entry.second==0,"cancelled and rejected icon paths release every capability");
+    }
+    std::puts("PASS late icon cannot revive cancellation before or after host commit and retirement");
+}
+void LinkedIconSelectsPendingPublication() {
+    auto& controller=Fresh();const auto geometry=LinkedGeometry(true);const auto request=NowNs();
+    Check(QueueSession(2001,2000,1120,2436,geometry,true,request,{},false),
+          "seed App before repeating a same-request first-show publication");
+    Pump(controller);Commit(PrimeTestIcon(2002,2003,geometry,true,request));
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create newer pending same-request App publication");
+    Check(QueueSession(2001,2000,1120,2436,geometry,true,request,{},false,0,0,transaction),
+          "prime pending same-request owner while the previous App owner remains active");
+    Check(controller.pending && controller.active,"same epoch has both active and pending publication states");
+    // Deliberately make the pending publication distinguishable while the old
+    // owner carries a newer callback timestamp. Selection must follow the
+    // uncommitted publication, rather than choosing the largest last_ns.
+    controller.pending->animation.Advance(.04);
+    hha::genie::AdvanceScalar(&controller.pending->corner,.04,1.0);
+    controller.active->last_ns=controller.pending->last_ns+10000000LL;
+    Check(Submit(controller,*controller.pending,false,transaction),"publish a distinct pending contour in its borrowed transaction");
+    const auto pending=layer_uniforms[2001];
+    const auto old_mesh=hha::genie::ContourMesh(controller.active->animation,controller.active->parameters);
+    Check(std::abs(pending[0]-old_mesh[0].x)>1e-6 || std::abs(pending[1]-old_mesh[0].y)>1e-6,
+          "pending and active contours differ so owner-selection regression is observable");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    const auto icon_commit=PrimeTestIcon(2002,2003,geometry,true,request);
+    Check(std::equal(pending.begin(),pending.begin()+36,layer_uniforms[2002].begin()) &&
+          pending[38]==layer_uniforms[2002][38],
+          "icon joins the pending publication even when old active has a newer frame timestamp");
+    const auto frames=controller.active->frames;
+    Commit(icon_commit);ResetEvents();Frame(NowNs(),&controller);
+    Check(controller.active->frames==frames && events.empty(),"same-request icon still waits for the pending App transaction");
+    Commit(icon_commit-1);Pump(controller);
+    ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);CheckSharedIconFrame(2001,2002);
+    ResetEvents();Stop(controller);CheckLinkedRetirement(2001,2002);
+    std::puts("PASS linked icon prioritizes the pending publication over a newer old-owner timestamp");
+}
+
+void LinkedIconAdjustPrecedesAppDispatch() {
+    for(bool pending_source:{false,true}) for(bool was_closing:{false,true})
+    for(int source_form:{0,1,2}) {
+        auto& controller=Fresh();
+        const auto old_geometry=LinkedGeometry(was_closing);
+        const auto next_geometry=LinkedGeometry(!was_closing);
+        const auto source_request=NowNs()-80000000LL;
+        auto* source_transaction=pending_source?ASurfaceTransaction_create():nullptr;
+        if(pending_source) Check(source_transaction,"create uncommitted predecessor App transaction");
+        Check(QueueSession(2031,2030,1120,2436,old_geometry,was_closing,source_request,{},false,
+                           0,0,source_transaction),"seed exact predecessor before App adjust dispatch reaches the worker");
+        if(!pending_source) Pump(controller);
+        Session* source=pending_source?controller.pending.get():controller.active.get();
+        Check(source && source->request_ns==source_request,"predecessor is in the requested pending or committed state");
+        source->animation.Advance(.07);hha::genie::AdvanceScalar(&source->corner,.07,1.0);
+        source->last_ns=NowNs()+10000000LL;
+        if(pending_source) Check(Submit(controller,*source,false,source_transaction),
+                                "predecessor App transaction records its current model state before icon attachment");
+        const auto source_icon_commit=PrimeTestIcon(2032,2033,old_geometry,was_closing,source_request);
+        if(pending_source) {
+            ASurfaceTransaction_apply(source_transaction);ASurfaceTransaction_delete(source_transaction);
+            Check(!controller.active && !Committed(*source),"pending predecessor retains both outstanding first publications");
+        } else Commit(source_icon_commit);
+        const auto scalars=source->animation.Scalars();
+        const auto corner=source->corner;
+        const auto last_ns=source->last_ns;
+        const auto frames=source->frames;
+        const auto generation=source->generation;
+        Check(std::any_of(scalars.begin(),scalars.end(),[](const hha::genie::Scalar& scalar) {
+                  return std::abs(scalar.velocity)>1e-6;
+              }) && std::abs(corner.velocity)>1e-6,
+              "adjust continuity seed has observable coordinate and corner velocities");
+        const auto next_request=NowNs();
+        source->cancel_ns=NowNs()+48000000LL;
+        auto* adjust_transaction=ASurfaceTransaction_create();Check(adjust_transaction,"create icon adjust preceding App dispatch");
+        const auto adjust_commit=commits.size();
+        ResetEvents();
+        const auto bridge_source=source_form==0?source_request:
+            source_form==1?next_request:source_request+1;
+        const int32_t bridge_parent=source_form==0?-1:2030;
+        Check(PrimeLinkedIcon(adjust_transaction,2032,2033,171,171,1120,2436,next_geometry,
+                              !was_closing,next_request,bridge_source,bridge_parent),
+              "icon adjust joins its exact predecessor or same-parent native owner before the App worker sees the new epoch");
+        const auto adjust_writes=TransactionWrites(adjust_transaction);
+        Check(adjust_writes.size()==2 && adjust_writes[0].layer==2031 && adjust_writes[1].layer==2032,
+              "source-based icon adjust republishes App and icon in one borrowed transaction");
+        CheckSharedIconFrame(2031,2032);
+        Check((pending_source?controller.pending.get():controller.active.get())==source &&
+              source->request_ns==next_request && source->closing!=was_closing && source->cancel_ns==0 &&
+              source->started_ns==next_request && source->generation==generation+1,
+              "source-based reversal retargets its existing owner and advances only request identity and target");
+        Check(source->last_ns==last_ns && source->frames==frames && source->corner.value==corner.value &&
+              source->corner.velocity==corner.velocity,
+              "source-based reversal preserves presentation timestamp, frame count, and corner velocity");
+        for(size_t i=0;i<scalars.size();++i)
+            Check(source->animation.Scalars()[i].value==scalars[i].value &&
+                  source->animation.Scalars()[i].velocity==scalars[i].velocity,
+                  "source-based reversal preserves every spring position and velocity before asynchronous App dispatch");
+        Check(source->parameters.response==(!was_closing?hha::genie::kClosingResponse:hha::genie::kOpeningResponse) &&
+              source->corner.response==source->parameters.response,
+              "source-based reversal applies the new opening or closing response to shared motion and corner");
+        ASurfaceTransaction_apply(adjust_transaction);ASurfaceTransaction_delete(adjust_transaction);
+        auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create later App adjust worker publication");
+        const auto app_commit=commits.size();
+        ResetEvents();
+        Check(QueueSession(2031,2030,1120,2436,next_geometry,!was_closing,next_request,{},false,
+                           0,0,app_transaction),"asynchronous App worker subsequently joins the icon-retargeted epoch");
+        Check(controller.pending && controller.pending->request_ns==next_request && Owns(*controller.pending,2032),
+              "later App publication retains the icon on the already-retargeted shared owner");
+        const auto app_writes=TransactionWrites(app_transaction);
+        Check(app_writes.size()==2 && app_writes[0].uniforms==adjust_writes[0].uniforms &&
+              app_writes[1].uniforms==adjust_writes[1].uniforms,
+              "later App publication copies the exact frozen App and icon snapshot without restarting either");
+        for(size_t i=0;i<scalars.size();++i)
+            Check(controller.pending->animation.Scalars()[i].value==scalars[i].value &&
+                  controller.pending->animation.Scalars()[i].velocity==scalars[i].velocity,
+                  "new App epoch adoption retains original predecessor spring motion through the adjust barrier");
+        Check(controller.pending->corner.value==corner.value && controller.pending->corner.velocity==corner.velocity &&
+              controller.pending->generation==generation+1,"later App worker does not retarget or reset corner motion a second time");
+        ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+        Commit(app_commit);ResetEvents();Frame(NowNs(),&controller);
+        Check(events.empty(),"later App commit cannot overtake the earlier icon adjust publication");
+        Commit(adjust_commit);
+        if(pending_source) {
+            ResetEvents();Frame(NowNs(),&controller);
+            Check(events.empty() && !controller.active,"new epoch still waits for pending predecessor publications");
+            Commit(source_icon_commit);Commit(source_icon_commit-1);
+        }
+        Pump(controller);
+        Check(controller.active && controller.active->request_ns==next_request && controller.active->closing!=was_closing &&
+              controller.active->generation==generation+1 && !controller.pending,
+              "all predecessor and adjust commits adopt a single continuously retargeted App owner");
+        ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);CheckSharedIconFrame(2031,2032);
+        ResetEvents();Stop(controller);CheckLinkedRetirement(2031,2032);
+    }
+    std::puts("PASS exact and production parent-proved icon reversal precede App dispatch for pending and committed owners");
+}
+
+void LinkedIconProductionSourceParentProof() {
+    auto& controller=Fresh();const auto closing=LinkedGeometry(true);const auto opening=LinkedGeometry(false);
+    const auto old_request=NowNs()-80000000LL;
+    Check(QueueSession(2051,2050,1120,2436,closing,true,old_request,{},false),
+          "seed old native App owner while the bridge is about to publish a new request");
+    Pump(controller);Commit(PrimeTestIcon(2052,2053,closing,true,old_request));
+    const auto next_request=NowNs();const auto old_state=controller.active->animation.Scalars();
+    auto* wrong=ASurfaceTransaction_create();Check(wrong,"create wrong-parent production icon adjust");
+    ResetEvents();const auto callbacks=commits.size();
+    Check(!PrimeLinkedIcon(wrong,2052,2053,171,171,1120,2436,opening,false,
+                           next_request,next_request,2059),
+          "production source event equal to the new request cannot borrow an old icon from a different App parent");
+    Check(events.empty() && commits.size()==callbacks && !controller.pending && controller.active->request_ns==old_request &&
+          controller.active->closing,"wrong parent cannot replace, write, or retarget the existing App and icon owner");
+    for(size_t i=0;i<old_state.size();++i)
+        Check(controller.active->animation.Scalars()[i].value==old_state[i].value &&
+              controller.active->animation.Scalars()[i].velocity==old_state[i].velocity,
+              "wrong-parent production proof preserves all old native spring state");
+    ASurfaceTransaction_delete(wrong);
+    auto* valid=ASurfaceTransaction_create();Check(valid,"create correct-parent production icon adjust");
+    Check(PrimeLinkedIcon(valid,2052,2053,171,171,1120,2436,opening,false,
+                          next_request,next_request,2050),
+          "the same missed-worker request succeeds with the actual App parent after wrong-parent rejection");
+    Check(controller.active->request_ns==next_request && !controller.active->closing,
+          "correct production parent proof advances the old native owner instead of suppressing its icon");
+    ASurfaceTransaction_apply(valid);ASurfaceTransaction_delete(valid);Commit(callbacks);
+    ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);CheckSharedIconFrame(2051,2052);
+    ResetEvents();Stop(controller);CheckLinkedRetirement(2051,2052);
+
+    auto& first=Fresh();const auto initial_request=NowNs();
+    auto* initial=ASurfaceTransaction_create();Check(initial,"create production icon-first transaction without a native predecessor");
+    Check(PrimeLinkedIcon(initial,2062,2063,171,171,1120,2436,closing,true,
+                          initial_request,initial_request,2060),
+          "production source event equal to the request still allows a legitimate icon-first seed when no App owner exists");
+    Check(first.pending && first.pending->layer==2062 && first.pending->request_ns==initial_request &&
+          first.pending->starting && !first.active,"production icon-first request creates one provisional pending owner");
+    ASurfaceTransaction_apply(initial);ASurfaceTransaction_delete(initial);
+    auto* app=ASurfaceTransaction_create();Check(app,"create first real App publication after production icon-first seed");
+    Check(QueueSession(2061,2060,1120,2436,closing,true,initial_request,{},false,0,0,app),
+          "first real App joins the production icon-first source while its original publication is uncommitted");
+    ASurfaceTransaction_apply(app);ASurfaceTransaction_delete(app);
+    Commit(1);Pump(first);
+    Check(!first.active && first.pending,"App publication still waits for the production icon-first transaction");
+    Commit(0);Pump(first);
+    Check(first.active && first.active->layer==2061 && Owns(*first.active,2062),
+          "production icon-first source hands off to its actual App without losing the icon");
+    ResetEvents();Frame(first.active->last_ns+16000000LL,&first);CheckSharedIconFrame(2061,2062);
+    ResetEvents();Stop(first);CheckLinkedRetirement(2061,2062);
+    std::puts("PASS production parent proof rejects another App and preserves legitimate icon-first publication");
+}
+
+void LinkedIconRejectsStaleAdjustSource() {
+    auto& controller=Fresh();const auto closing=LinkedGeometry(true);const auto opening=LinkedGeometry(false);
+    const auto source_request=NowNs()-80000000LL;
+    Check(QueueSession(2041,2040,1120,2436,closing,true,source_request,{},false),
+          "seed App with its exact source epoch before testing rejected icon adjusts");
+    Pump(controller);Commit(PrimeTestIcon(2042,2043,closing,true,source_request));
+    const auto next_request=NowNs();
+    auto reject=[&](int icon,int64_t source_epoch,const char* reason) {
+        auto* transaction=ASurfaceTransaction_create();Check(transaction,"create rejected source-based adjust transaction");
+        ResetEvents();const auto callbacks=commits.size();
+        Check(!PrimeLinkedIcon(transaction,icon,2043,171,171,1120,2436,opening,false,next_request,source_epoch),reason);
+        Check(events.empty() && commits.size()==callbacks && !controller.pending,
+              "invalid source adjust writes no shader, creates no publication gate, and seeds no provisional icon owner");
+        ASurfaceTransaction_delete(transaction);
+    };
+    reject(2042,source_request-1,"stale unmatched source timestamp cannot borrow another App epoch");
+    reject(2044,source_request,"exact source timestamp cannot authorize an icon capability it does not already own");
+    Check(controller.active->request_ns==source_request && controller.active->closing,
+          "invalid predecessor proofs leave live App direction and identity unchanged");
+    hha::CancelIconRenderer();
+    reject(2042,source_request,"a queued global cancellation rejects source-based adjust before worker processing");
+    Pump(controller);DrainCompletions();
+    reject(2042,source_request,"a retired source cannot be revived by presenting a newer adjust epoch");
+    Check(!controller.active && !Running(),"rejected cancelled source leaves the controller idle");
+    for(const auto& entry:references) Check(entry.second==0,"rejected source-based adjusts retain no surface references");
+
+    auto& pending=Fresh();const auto pending_request=NowNs()-30000000LL;
+    Check(QueueSession(2045,2040,1120,2436,closing,true,pending_request,{},false),
+          "seed App before cancelling an outstanding icon publication");
+    Pump(pending);const auto icon_commit=PrimeTestIcon(2046,2043,closing,true,pending_request);
+    Stop(pending);Check(pending.retiring.size()==1,"cancelled uncommitted source remains in retirement only");
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create adjust against cancelled uncommitted source");
+    ResetEvents();const auto callbacks=commits.size();
+    Check(!PrimeLinkedIcon(transaction,2046,2043,171,171,1120,2436,opening,false,NowNs(),pending_request),
+          "a cancelled source waiting for commit cannot act as a live predecessor");
+    Check(events.empty() && commits.size()==callbacks && !pending.pending,
+          "cancelled pending source creates neither a new shader write nor a provisional owner");
+    ASurfaceTransaction_delete(transaction);Commit(icon_commit);Pump(pending);DrainCompletions();
+    Check(!Running(),"cancelled pending source finishes normal cleanup after rejected adjust");
+    for(const auto& entry:references) Check(entry.second==0,"cancelled pending source cleanup releases every capability");
+    std::puts("PASS stale, unowned, cancelled and retired icon adjust sources are rejected");
+}
+
+void LinkedIconReversalEpochIsolation() {
+    auto& controller=Fresh();const auto closing=LinkedGeometry(true);
+    const auto old_request=NowNs()-100000000LL;
+    Check(QueueSession(1951,1950,1120,2436,closing,true,old_request,{},false),
+          "seed closing App for linked icon reversal");
+    Pump(controller);Commit(PrimeTestIcon(1952,1953,closing,true,old_request));
+    controller.active->animation.Advance(.09);
+    hha::genie::AdvanceScalar(&controller.active->corner,.09,1.0);
+    controller.active->last_ns=NowNs()+10000000LL;
+    const auto scalars=controller.active->animation.Scalars();
+    const auto corner=controller.active->corner;
+    const auto opening=LinkedGeometry(false);
+    const auto new_request=NowNs();
+    ResetEvents();
+    Check(QueueSession(1951,1950,1120,2436,opening,false,new_request,{},false),
+          "rapid reversal publishes a new immutable App epoch");
+    Pump(controller);
+    Check(Owns(*controller.active,1952) && Cleared().empty(),
+          "rapid reversal keeps the still-visible icon under the shared contour before its new callback");
+    Check(!controller.active->closing && controller.active->request_ns==new_request &&
+          controller.active->corner.value==corner.value && controller.active->corner.velocity==corner.velocity,
+          "reversal changes direction and ownership while preserving live corner motion");
+    for(size_t i=0;i<scalars.size();++i)
+        Check(controller.active->animation.Scalars()[i].value==scalars[i].value &&
+              controller.active->animation.Scalars()[i].velocity==scalars[i].velocity,
+              "rapid reversal retains every shared spring position and velocity");
+    Commit(PrimeTestIcon(1952,1953,opening,false,new_request));
+    auto* late=ASurfaceTransaction_create();Check(late,"create stale icon callback transaction");
+    ResetEvents();const auto callbacks=commits.size();
+    Check(!PrimeLinkedIcon(late,1952,1953,171,171,1120,2436,closing,true,old_request),
+          "late old epoch cannot bind the icon capability now owned by the reversed App");
+    Check(events.empty() && commits.size()==callbacks && !controller.pending &&
+          controller.active->request_ns==new_request && !controller.active->closing,
+          "rejected old icon callback cannot write a shader, create a session, or block new motion");
+    ASurfaceTransaction_delete(late);
+    ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);CheckSharedIconFrame(1951,1952);
+    ResetEvents();Stop(controller);CheckLinkedRetirement(1951,1952);
+    std::puts("PASS linked icon reversal continuity and stale epoch isolation");
+}
+
 } // namespace
 
 int main() {
@@ -983,7 +1676,14 @@ int main() {
     PrimedCrossParentHandoff();DelayedPendingPreviewCoalescence();
     PublicationUnionAfterLateAttachment();OneShotOpeningPublication();ClosingGroupHostPublication();
     GestureClosingSessionPublication();GestureClosingHostPublication();GesturePublicationRejectsIncompatibleGeometry();
-    GroupedSourcePublication();DrainCompletions();
+    GroupedSourcePublication();
+    LateLinkedIconSharesFrames();LinkedIconBeforeAppHandoff();LinkedIconPublicationCancellation();
+    LinkedIconSeedLosesToAppPublication();LinkedIconCannotCrossAppOwnership();
+    LinkedIconPendingReversalPublication();LinkedIconSelectsPendingPublication();
+    LinkedIconWholeOwnerPublication();LinkedIconAppCommitOrders();
+    LinkedIconCannotReviveCancelledRequest();LinkedIconReversalEpochIsolation();
+    LinkedIconAdjustPrecedesAppDispatch();LinkedIconProductionSourceParentProof();
+    LinkedIconRejectsStaleAdjustSource();DrainCompletions();
     {std::lock_guard<std::mutex> lock(test_mutex);
      for(const auto& entry:border_widths) Check(entry.second==0.0f,"all CLIENT guards cleared after retirement");
      for(const auto& entry:references) Check(entry.second==0,"all fake capabilities released");

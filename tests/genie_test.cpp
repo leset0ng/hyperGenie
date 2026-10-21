@@ -507,8 +507,20 @@ void IconPairingAfterRepeatedLaunches() {
     sources[3].valid=false;
     Check(hha::FindIconSource(sources,7,3001000000LL)==&sources[2],"retired source cannot steal icon");
     Check(!hha::FindIconSource(sources,8,3001000000LL),"unmatched ID keeps stock icon");
-    Check(!hha::FindIconSource(sources,7,4000000000LL),"expired ID cannot restart an old mesh");
+    Check(hha::FindIconSource(sources,7,3700000000LL)==&sources[2],
+          "live source still pairs after a callback is stalled longer than 500ms");
+    Check(hha::FindIconSource(sources,7,8000000000LL)==&sources[2],
+          "source lifetime rather than elapsed wall time determines pairing");
     Check(!hha::FindIconSource(sources,7,500000000LL),"future source cannot pair with icon");
+    sources[2].valid=false;sources[1].valid=false;sources[0].valid=false;
+    Check(!hha::FindIconSource(sources,7,8000000000LL),
+          "stopping every matching source prevents a late icon from reviving retired animation");
+    sources[3].valid=true;sources[3].supported=true;
+    sources[3].transition.event_ns=9000000000LL;
+    Check(!hha::FindIconSource(sources,7,8999999999LL),
+          "a reused ID cannot select a new source before its own event time");
+    Check(hha::FindIconSource(sources,7,9000000000LL)==&sources[3],
+          "a reused ID pairs with its new live epoch after prior sources stop");
 }
 
 void CornerEndpointMetrics() {

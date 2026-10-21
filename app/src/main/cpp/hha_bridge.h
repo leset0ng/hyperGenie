@@ -16,7 +16,7 @@ namespace hha {
 // only an exactly owned OEM pre-start preview for same-transaction publication.
 constexpr int32_t kBridgeCode = 0x484841;
 constexpr int32_t kBridgeMagic = 0x48484131;
-constexpr int32_t kBridgeVersion = 3;
+constexpr int32_t kBridgeVersion = 4;
 
 struct Transition {
     int32_t leash_layer = -1;
@@ -33,6 +33,10 @@ struct AnimationSource {
     int32_t animation_id = -1;
     genie::Rect window{0,0,0,0};
     genie::Rect presentation_start{0,0,0,0};
+    // Source centerX/centerY/width dynamics, shared with the paired icon host.
+    std::array<float,3> host_velocity{};
+    std::array<float,3> host_delay{};
+    uint64_t host_transaction_id = 0;
     bool adjusting = false;
     bool valid = false;
     bool supported = true;
@@ -46,7 +50,9 @@ const AnimationSource* FindIconSource(const std::array<AnimationSource,N>& sourc
     const AnimationSource* result=nullptr;
     for(const auto& source:sources) {
         const int64_t age=now-source.transition.event_ns;
-        if(!source.valid || source.animation_id!=animation_id || age<0 || age>500000000LL) continue;
+        // The source stays eligible until its exact animation is stopped. A
+        // stalled callback must not put only the icon back onto stock geometry.
+        if(!source.valid || source.animation_id!=animation_id || age<0) continue;
         if(!result || source.transition.event_ns>result->transition.event_ns) result=&source;
     }
     return result && result->supported ? result : nullptr;

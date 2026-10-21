@@ -7,6 +7,7 @@ import android.os.Binder
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Parcel
+import android.os.Parcelable
 import android.provider.Settings
 import android.util.Log
 import android.view.WindowManager
@@ -32,6 +33,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val copySurface = scClass.getConstructor(scClass, String::class.java)
     private val validSurface = scClass.getMethod("isValid")
     private val surfaceLayer = scClass.getMethod("getLayerId")
+    private val surfaceName = scClass.getMethod("getName")
+    private val surfaceCreator = scClass.getField("CREATOR").get(null) as Parcelable.Creator<*>
     private val releaseSurface = scClass.getMethod("release")
     private val surfaceWidth = scClass.getMethod("getWidth")
     private val surfaceHeight = scClass.getMethod("getHeight")
@@ -111,6 +114,10 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     prepared = prepareGroup(service, context, request, reply)
                     return@runCatching prepared
                 }
+                if (request.operation == PREPARE_ICON) {
+                    prepared = prepareIcon(context, request, input, reply)
+                    return@runCatching prepared
+                }
                 if (request.operation == PREPARE_PREVIEW) {
                     prepared = preparePreview(service, context, request, reply)
                     return@runCatching prepared
@@ -152,7 +159,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         }
     }
 
-    /** Exact pre-start capability only; no WMS lock, native render or worker wait. */
+    /** Exact pre-start capability and first shader state; no WM lock or worker wait. */
     private fun preparePreview(service: Any, context: Context, request: Request, reply: Parcel): Boolean {
         val writer = nativeWriteSurface ?: return false
         if (!rendererReady || !animationsEnabled(context) || request.closing ||
@@ -162,10 +169,17 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         val height = request.geometry[7].toInt()
         preStarting.opening(request.leash, width, height)?.use { preview ->
             val encoded = Parcel.obtain()
+            val publication = newTransaction.newInstance()
             try {
-                synchronized(checkNotNull(surfaceLock.get(preview.surface))) {
-                    writer.invoke(null, nativeObject.getLong(preview.surface), encoded)
+                synchronized(checkNotNull(surfaceLock.get(preview.parent))) {
+                    synchronized(checkNotNull(surfaceLock.get(preview.surface))) {
+                        if (!ContentAnimator.prime(transactionObject.getLong(publication),
+                                nativeObject.getLong(preview.surface), nativeObject.getLong(preview.parent),
+                                width, height, request.geometry, false, request.eventNs, starting = true)) return false
+                        writer.invoke(null, nativeObject.getLong(preview.surface), encoded)
+                    }
                 }
+                writeTransaction.invoke(null, transactionObject.getLong(publication), encoded)
                 val transition = Request(TRANSITION, request.leash, request.containerLayer,
                     request.taskId, request.closing, request.eventNs, request.geometry)
                 publish(Envelope(service, context, transition))
@@ -174,7 +188,10 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 reply.writeInt(1)
                 reply.appendFrom(encoded, 0, encoded.dataSize())
                 return true
-            } finally { encoded.recycle() }
+            } finally {
+                closeTransaction.invoke(publication)
+                encoded.recycle()
+            }
         }
         return false
     }
@@ -232,19 +249,21 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     return false
                 }
                 groupOwners.merge(source, request.eventNs) { old, next -> maxOf(old, next) }
-                publish(Envelope(service, context, transition))
                 applyTransaction.invoke(publication)
-                handler.post { process(service, context, transition) }
                 val encoded = Parcel.obtain()
                 val hostPublication = newTransaction.newInstance()
                 try {
                     val writer = nativeWriteSurface ?: return false
                     writer.invoke(null, nativeObject.getLong(entry.output), encoded)
                     check(subtrees.activate(entry, hostPublication))
-                    // Serialize the actual tracked visibility transaction. Its
-                    // commit callback follows the merge into Launcher's host t
-                    // and repairs any publication arriving after cancellation.
+                    check(ContentAnimator.prime(transactionObject.getLong(hostPublication),
+                        nativeObject.getLong(entry.output), nativeObject.getLong(entry.parent), entry.width, entry.height,
+                        request.geometry, request.closing, request.eventNs, unwarpedSource = nativeObject.getLong(entry.source)))
+                    // Serialize the tracked visibility, inherited shader state
+                    // and native commit listener into Launcher's host t.
                     writeTransaction.invoke(null, transactionObject.getLong(hostPublication), encoded)
+                    publish(Envelope(service, context, transition))
+                    handler.post { process(service, context, transition) }
                     reply.writeNoException()
                     reply.writeInt(1)
                     reply.writeInt(entry.width)
@@ -260,6 +279,103 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             } finally { closeTransaction.invoke(publication) }
         }
         return false
+    }
+
+    /** Capability-only: no WMS lock, worker wait, or publication apply on this Binder thread. */
+    private fun prepareIcon(context: Context, request: Request, input: Parcel, reply: Parcel): Boolean {
+        if (!rendererReady || !animationsEnabled(context)) return false
+        val envelope = requests[request.leash] ?: return false
+        val current = envelope.request
+        val sameRequest = current.eventNs == request.eventNs && current.closing == request.closing &&
+            current.geometry.contentEquals(request.geometry)
+        // Adjust is dispatched asynchronously by Launcher. Its icon callback
+        // can reach this capability endpoint before the new geometry envelope.
+        // Permit only an ordered update of this exact established App stream.
+        val advancing = current.eventNs < request.eventNs && current.taskId == request.taskId &&
+            current.containerLayer == request.containerLayer
+        if (!sameRequest && !advancing) return false
+        val textureWidth = input.readInt()
+        val textureHeight = input.readInt()
+        val windowWidth = input.readInt()
+        val windowHeight = input.readInt()
+        if (textureWidth !in 1..1024 || textureHeight !in 1..1024 ||
+            windowWidth !in 1..MAX_EXTENT || windowHeight !in 1..MAX_EXTENT || windowHeight <= windowWidth) return false
+        val full = if (request.closing) 0 else 4
+        val width = request.geometry[full + 2]
+        val height = request.geometry[full + 3]
+        if (request.closing) {
+            if (width > windowWidth + 2f || height > windowHeight + 2f ||
+                kotlin.math.abs(height - width * windowHeight / windowWidth) >= 2f) return false
+        } else if (kotlin.math.abs(width - windowWidth) >= 2f ||
+            kotlin.math.abs(height - windowHeight) >= 2f) return false
+        owners[request.eventNs]?.let {
+            if (it.width != windowWidth || it.height != windowHeight) return false
+        }
+        var surface: Any? = null
+        var parent: Any? = null
+        try {
+            surface = surfaceCreator.createFromParcel(input) ?: return false
+            parent = surfaceCreator.createFromParcel(input) ?: return false
+            if (input.dataAvail() != 0 || !isValid(surface) || !isValid(parent)) return false
+            val layer = surfaceLayer.invoke(surface) as Int
+            val parentLayer = surfaceLayer.invoke(parent) as Int
+            // Native getName retains these exact names across a parcel copy.
+            // The producer's embedded parent ID must match the actual capability.
+            val importedName = surfaceName.invoke(surface)
+            val importedParentName = surfaceName.invoke(parent)
+            val importedWidth = surfaceWidth.invoke(surface)
+            val importedHeight = surfaceHeight.invoke(surface)
+            if (layer < 0 || parentLayer < 0 || layer == parentLayer ||
+                importedParentName != "FloatingIcon_all#$parentLayer" ||
+                importedName != "[BBQ] FloatingIcon_all#$parentLayer#$layer" ||
+                importedWidth != textureWidth || importedHeight != textureHeight) {
+                report(Log.WARN, "icon capability rejected leash=${request.leash} layer=$layer " +
+                    "parent=$parentLayer name=$importedName parentName=$importedParentName " +
+                    "size=${importedWidth}x$importedHeight expected=${textureWidth}x$textureHeight")
+                return false
+            }
+            val publication = newTransaction.newInstance()
+            val encoded = Parcel.obtain()
+            try {
+                val primed = synchronized(checkNotNull(surfaceLock.get(parent))) {
+                    synchronized(checkNotNull(surfaceLock.get(surface))) {
+                        val latest = requests[request.leash]?.request
+                        if (latest == null || latest.eventNs > request.eventNs ||
+                            (latest.eventNs == request.eventNs && (latest.closing != request.closing ||
+                                !latest.geometry.contentEquals(request.geometry)))) false
+                        else ContentAnimator.primeIcon(transactionObject.getLong(publication),
+                            nativeObject.getLong(surface), nativeObject.getLong(parent), textureWidth, textureHeight,
+                            windowWidth, windowHeight, request.geometry, request.closing, request.eventNs,
+                            request.eventNs, request.containerLayer)
+                    }
+                }
+                if (!primed) {
+                    report(Log.WARN, "icon motion rejected leash=${request.leash} layer=$layer epoch=${request.eventNs}")
+                    return false
+                }
+                if (advancing) {
+                    val transition = Request(TRANSITION, request.leash, request.containerLayer,
+                        request.taskId, request.closing, request.eventNs, request.geometry)
+                    publish(Envelope(envelope.service, context, transition))
+                    handler.post { process(envelope.service, context, transition) }
+                }
+                // This includes the native commit listener. The host's eventual
+                // commit, rather than this RPC returning, releases frame updates.
+                writeTransaction.invoke(null, transactionObject.getLong(publication), encoded)
+                reply.writeNoException()
+                reply.writeInt(1)
+                reply.appendFrom(encoded, 0, encoded.dataSize())
+                report(Log.INFO, "icon prepared leash=${request.leash} layer=$layer parent=$parentLayer " +
+                    "texture=${textureWidth}x$textureHeight domain=${windowWidth}x$windowHeight")
+                return true
+            } finally {
+                encoded.recycle()
+                closeTransaction.invoke(publication)
+            }
+        } finally {
+            release(parent)
+            release(surface)
+        }
     }
 
     /** Resolve package ownership outside the WMS lock; reject shared-UID callers. */
@@ -1037,7 +1153,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 val eventNs = parcel.readLong()
                 val geometry = FloatArray(12) { parcel.readFloat() }
                 val age = System.nanoTime() - eventNs
-                if (parcel.dataAvail() != 0 || operation !in TRANSITION..PREPARE_GROUP ||
+                if ((operation != PREPARE_ICON && parcel.dataAvail() != 0) || operation !in TRANSITION..PREPARE_ICON ||
                     direction !in 0..1 || eventNs <= 0 || age !in -FUTURE_NS..MAX_EVENT_AGE_NS ||
                     geometry.any { !it.isFinite() }) return null
                 if (operation != CANCEL && (leash < 0 || taskId < -1 ||
@@ -1058,11 +1174,12 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         const val DESCRIPTOR = "android.view.IWindowManager"
         const val TRANSACTION = 0x484841
         const val MAGIC = 0x48484131
-        const val VERSION = 3
+        const val VERSION = 4
         const val TRANSITION = 1
         const val CANCEL = 2
         const val PREPARE_PREVIEW = 3
         const val PREPARE_GROUP = 4
+        const val PREPARE_ICON = 5
         const val MAX_EXTENT = 16384
         const val CANCEL_GRACE_MS = 48L
         const val CHECK_MS = 50L // Detachment completion cleanup only.

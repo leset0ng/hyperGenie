@@ -28,9 +28,17 @@ SurfaceFlinger still schedules parent/icon motion and delivers the platform's
 completion callbacks. For supported App transitions, the parent now carries a
 full-buffer viewport: stock aspect cropping and stock corner channels are
 removed, and the content shader draws the visible mesh contour and its source
-corner mask. The floating icon's real BBQ child uses the same mesh and source
-clock. Its first shader state and parent viewport are submitted atomically;
-subsequent updates wait for transaction commit. SELF attachment also sets a
+corner mask. The floating icon's real BBQ child joins the system-server motion owner, with
+its square source footprint retained separately from the tall virtual viewport.
+App, preview and icon frames share one solver and one transaction. First shader
+states and commit listeners return in the actual Launcher host transaction;
+subsequent updates wait for every publication dependency. Live source pairing
+has no separate 500 ms cutoff. The server validates the exact live request and buffer capability before a
+floating icon joins; separate OEM construction transaction IDs do not disable
+normal icon animation. An unavailable floating buffer is suppressed rather than
+shown with stock geometry alongside an already-customized App.
+See [shared animation frames](docs/animation-frame-sync.md).
+SELF attachment also sets a
 fully transparent border (`width=1e-6`, packed color zero) on actual buffer
 children. Both ordinary and SF-animation snapshot updates retain CLIENT for
 positive border width. Standard shadow radius remains zero after the earlier
@@ -98,9 +106,11 @@ On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
 controller in an isolated executable with fake surface capabilities and empty
 SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
 commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 1,422 checks; `ADB_SERIAL` selects a device. It does not
-install the module or touch
-real App layers.
+The current suite passes 10,503 checks; `ADB_SERIAL` selects a device. It does not
+install the module or touch real App layers. `tests/run-launcher-device-tests.sh`
+adds 71 checks of the actual Launcher hooks with isolated parameter trees and
+fake capabilities, including separate OEM construction transactions and failure
+fallbacks.
 
 The module app has no Activity. Its metadata is shown by the framework.
 
@@ -148,8 +158,13 @@ app/src/main/
 
 ## Validation status
 
-The current build passes Android assembly/lint, 771 native geometry/reference
-checks and 1,422 isolated checks of the actual renderer. Retired helper-only
+The current build passes Android assembly/lint, 775 native geometry/reference
+checks, 10,503 isolated checks of the actual renderer and 71 Launcher-hook
+integration checks. Shared frame regression covers publication order, distinct
+texture domains and source-authenticated rapid reversal. Installed AVD captures
+confirm six ordinary App/icon registrations and a close-to-open adjust with
+`accepted=1 primed=1`, stable core processes and no new crash entries. See
+[shared animation frames](docs/animation-frame-sync.md). Retired helper-only
 tests have been removed; actual detach completion and JNI cancellation checks
 cover the production paths. Sampled Settings/Calculator
 transitions verify content access, composition and cleanup; these checks do not

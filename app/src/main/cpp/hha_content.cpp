@@ -145,6 +145,9 @@ int64_t NowNs() {
 struct Companion {
     void* surface=nullptr;
     int32_t layer=-1;
+    // Floating icons share the owner's mesh but sample a square source buffer.
+    int texture_width=0;
+    int texture_height=0;
 };
 
 struct Session {
@@ -188,6 +191,9 @@ struct Controller {
     std::vector<std::unique_ptr<Session>> queued;
     std::vector<std::unique_ptr<Session>> overlapping;
     std::vector<std::unique_ptr<Session>> retiring;
+    // Bounded tombstones prevent delayed imported publications from resurrecting
+    // a cancelled/finished owner after its retained surfaces have been released.
+    std::vector<int64_t> retired_requests;
     bool stop_requested = false;
     std::atomic<uint64_t> detaches_pending{0};
     ALooper* looper = nullptr;  // Owned by the persistent rendering thread.
@@ -307,12 +313,23 @@ bool Submit(Controller& controller, Session& session, bool detach,
         // the independent spring preserves its value and velocity on reversal.
         values[38]=static_cast<float>(std::clamp(session.corner.value,0.0,
             0.5*std::min(1.0,visible_height/visible_width)));
-        auto uniforms = std::make_shared<std::vector<unsigned char>>(sizeof(values));
-        std::memcpy(uniforms->data(), values.data(), sizeof(values));
-        std::vector<void*> surfaces{session.surface};
-        for(const auto& companion:session.companions) surfaces.push_back(companion.surface);
-        for(void* surface:surfaces) {
+        std::vector<Companion> surfaces{{session.surface,session.layer,session.texture_width,session.texture_height}};
+        surfaces.insert(surfaces.end(),session.companions.begin(),session.companions.end());
+        for(const auto& item:surfaces) {
+            void* surface=item.surface;
             if(!surface) continue;
+            auto surface_values=values;
+            if(item.texture_width>0) {
+                surface_values[36]=static_cast<float>(item.texture_width);
+                surface_values[37]=surface_values[36]*session.height/session.width;
+                surface_values[40]=static_cast<float>(item.texture_width);
+                surface_values[41]=static_cast<float>(item.texture_height);
+            } else {
+                surface_values[36]=surface_values[40]=static_cast<float>(session.width);
+                surface_values[37]=surface_values[41]=static_cast<float>(session.height);
+            }
+            auto uniforms=std::make_shared<std::vector<unsigned char>>(sizeof(surface_values));
+            std::memcpy(uniforms->data(),surface_values.data(),sizeof(surface_values));
             g_post(transaction,&surface,&controller.shader,&uniforms,0);
             const BorderSettingsAbi border{nullptr,kClientBorderWidth,0};
             g_border(transaction,&surface,&border);
@@ -332,9 +349,18 @@ bool Submit(Controller& controller, Session& session, bool detach,
     return true;
 }
 
+void RememberRetired(Controller& controller,int64_t request_ns) {
+    if(std::find(controller.retired_requests.begin(),controller.retired_requests.end(),request_ns)!=
+       controller.retired_requests.end()) return;
+    controller.retired_requests.push_back(request_ns);
+    if(controller.retired_requests.size()>128) controller.retired_requests.erase(controller.retired_requests.begin());
+}
+
 void Finish(Controller& controller, const char* reason, const Session* successor = nullptr) {
     if (!controller.active) return;
     auto& session = *controller.active;
+    if(!successor || successor->request_ns!=session.request_ns)
+        RememberRetired(controller,session.request_ns);
     const bool detached = !session.attached || Submit(controller, session, true, nullptr, successor);
     __android_log_print(ANDROID_LOG_INFO, kTag,
         "finish layer=%d request=%lld reason=%s callbacks=%llu elapsed=%.4f detachSubmitted=%d retained=%d",
@@ -391,23 +417,43 @@ void RetireCommitted(Controller& controller) {
     }
 }
 
+// Keep icon capabilities on the same motion owner through starting/App handoff,
+// including closing. They must never become a second independently clocked session.
+void PreserveLinkedIcons(Session& next,const Session& previous) {
+    if(next.width!=previous.width || next.height!=previous.height ||
+       (!SameRequestDomain(next,previous) && next.parent_layer!=previous.parent_layer &&
+        next.layer!=previous.layer)) return;
+    auto retain=[&](const Companion& item) {
+        if(!item.surface || item.texture_width<=0 || item.layer==next.layer ||
+           item.layer==next.unwarped_layer || Owns(next,item.layer)) return;
+        next.companions.push_back(item);
+        g_inc_strong(item.surface,&next);
+    };
+    retain({previous.surface,previous.layer,previous.texture_width,previous.texture_height});
+    for(const auto& item:previous.companions) retain(item);
+    std::sort(next.companions.begin(),next.companions.end(),
+        [](const Companion& a,const Companion& b) {return a.layer<b.layer;});
+}
+
 // Removing an OEM preview from its registry does not remove its visible SF
 // layer. Keep each verified opening capability under the same mesh until this
 // request finishes; otherwise a still-opaque preview becomes a full rectangle
 // behind the animated App. The immutable request, parent and extent bound reuse.
 void PreserveOpeningPreviews(Session& next, const Session& previous) {
+    PreserveLinkedIcons(next,previous);
     if(next.closing || previous.closing || next.request_ns!=previous.request_ns ||
        next.width!=previous.width ||
        next.height!=previous.height) return;
-    auto retain=[&](void* surface,int32_t layer) {
+    auto retain=[&](void* surface,int32_t layer,int texture_width,int texture_height) {
         if(!surface || layer<0 || layer==next.layer || layer==next.unwarped_layer ||
            std::any_of(next.companions.begin(),next.companions.end(),
                [&](const Companion& item) {return item.layer==layer;})) return;
-        next.companions.push_back({surface,layer});
+        next.companions.push_back({surface,layer,texture_width,texture_height});
         g_inc_strong(surface,&next);
     };
-    for(const auto& item:previous.companions) retain(item.surface,item.layer);
-    retain(previous.surface,previous.layer);
+    for(const auto& item:previous.companions)
+        retain(item.surface,item.layer,item.texture_width,item.texture_height);
+    retain(previous.surface,previous.layer,previous.texture_width,previous.texture_height);
     std::sort(next.companions.begin(),next.companions.end(),
         [](const Companion& a,const Companion& b) {return a.layer<b.layer;});
 }
@@ -441,7 +487,10 @@ void AdoptCommand(Controller& controller) {
         }
         const bool companions_changed=current.companions.size()!=next->companions.size() ||
             !std::equal(current.companions.begin(),current.companions.end(),next->companions.begin(),
-                [](const Companion& a,const Companion& b) {return a.layer==b.layer;});
+                [](const Companion& a,const Companion& b) {
+                    return a.layer==b.layer && a.texture_width==b.texture_width &&
+                        a.texture_height==b.texture_height;
+                });
         if(companions_changed) {
             DetachLostSurfaces(controller,current,*next);
             for(const auto& companion:current.companions) g_dec_strong(companion.surface,&current);
@@ -543,6 +592,12 @@ void AdoptCommand(Controller& controller) {
 void ConsumeCommand(Controller& controller) {
     if(controller.stop_requested) {
         controller.stop_requested=false;
+        auto remember=[&](const std::unique_ptr<Session>& session) {
+            if(session) RememberRetired(controller,session->request_ns);
+        };
+        remember(controller.active);remember(controller.pending);
+        for(const auto& session:controller.queued) remember(session);
+        for(const auto& session:controller.overlapping) remember(session);
         while(!controller.queued.empty()) {
             auto session=std::move(controller.queued.back());
             controller.queued.pop_back();
@@ -745,9 +800,15 @@ Java_ng_lst_hha_ContentAnimator_nativeInitialize(JNIEnv*, jclass) {
     return Initialize() ? JNI_TRUE : JNI_FALSE;
 }
 
+static bool PrimeLinkedIcon(void* transaction,jlong surface,jlong parent,int texture_width,
+                            int texture_height,int width,int height,
+                            const std::array<float,12>& geometry,bool closing,int64_t event_ns,
+                            int64_t source_request_ns=0,int32_t source_parent_layer=-1);
+
 static bool QueueSession(jlong surface,jlong parent,int width,int height,
     const std::array<float,12>& values,bool closing,int64_t event_ns,const std::vector<jlong>& companions,bool starting,
-    int texture_width=0,int texture_height=0,void* initial_transaction=nullptr,void* unwarped_source=nullptr) {
+    int texture_width=0,int texture_height=0,void* initial_transaction=nullptr,void* unwarped_source=nullptr,
+    bool linked_icon=false) {
     auto* controller=g_controller.load(std::memory_order_acquire);
     if (!controller || !surface || !parent || width<=0 || height<=0 || width>16384 || height>16384) return false;
     for(float value:values) if(!std::isfinite(value)) return JNI_FALSE;
@@ -806,7 +867,10 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
         static_cast<double>(now-event_ns)/1e6,values[10],values[11],next->corner.value,next->corner.target);
     // Initial transaction construction/publication and worker writes share one
     // lock. A frame cannot retire an old session after its successor is primed.
-    std::lock_guard<std::mutex> lock(controller->mutex);
+    std::unique_lock<std::mutex> lock(controller->mutex);
+    if(linked_icon && (controller->stop_requested ||
+       std::find(controller->retired_requests.begin(),controller->retired_requests.end(),event_ns)!=
+           controller->retired_requests.end())) return false;
     Session* previous=nullptr;
     auto inspect=[&](const std::unique_ptr<Session>& session) {
         if(session && Related(*session,*next) && (!previous ||
@@ -817,6 +881,14 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     inspect(controller->active);inspect(controller->pending);
     for(const auto& session:controller->overlapping) inspect(session);
     for(const auto& session:controller->queued) inspect(session);
+    if(linked_icon && previous) {
+        // A content publication may have won the race while this provisional
+        // icon was built. Join that owner instead of replacing its App buffer.
+        if(!SameRequestDomain(*previous,*next) || previous->closing!=closing) return false;
+        lock.unlock();
+        return PrimeLinkedIcon(initial_transaction,surface,parent,texture_width,texture_height,
+            width,height,values,closing,event_ns);
+    }
     // Ordering is local to the actual stream. A delayed App request cannot be
     // discarded merely because another App has a newer event timestamp.
     if(previous && event_ns<previous->request_ns) return false;
@@ -852,7 +924,8 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
             next->last_ns=current.last_ns;
             next->started_ns=current.started_ns;
             next->generation=current.generation;
-            const double advance=std::max(0.0,static_cast<double>(now-current.last_ns)/1e9);
+            const bool frozen=PublicationPending(*controller,current);
+            const double advance=frozen?0.0:std::max(0.0,static_cast<double>(now-current.last_ns)/1e9);
             next->animation.Advance(advance);
             hha::genie::AdvanceScalar(&next->corner,advance,1.0);
             next->corner.target=requested_corner.target;
@@ -868,8 +941,11 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
             next->animation.Advance(std::max(0.0,delta));
             hha::genie::AdvanceScalar(&next->corner,std::max(0.0,delta),1.0);
         }
-        next->last_ns=std::max(now,event_ns);
-        next->elapsed=std::max(0.0,static_cast<double>(now-next->started_ns)/1e9);
+        // An older borrowed publication can commit after this transaction.
+        // Keep their common snapshot frozen until every dependency is ready.
+        const bool frozen=previous && PublicationPending(*controller,*previous);
+        if(!frozen) next->last_ns=std::max(now,event_ns);
+        next->elapsed=std::max(0.0,static_cast<double>(next->last_ns-next->started_ns)/1e9);
         auto* transaction=static_cast<ASurfaceTransaction*>(initial_transaction);
         // Transfer away from direct SELF in the publication that reveals the
         // grouped buffer. Pending same-request adoption blocks further old writes.
@@ -933,6 +1009,135 @@ static bool AttachSession(void* transaction,jlong surface,jlong parent,int width
     GateCommit(*controller,*current,static_cast<ASurfaceTransaction*>(transaction));
     if(controller->looper) ALooper_wake(controller->looper);
     return true;
+}
+
+// The authenticated bridge imports only the launcher's real floating buffer.
+// Its first write travels back in the host transaction; every later write uses
+// the App owner's exact mesh and transaction, including publication barriers.
+static bool PrimeLinkedIcon(void* transaction,jlong surface,jlong parent,int texture_width,
+                            int texture_height,int width,int height,
+                            const std::array<float,12>& geometry,bool closing,int64_t event_ns,
+                            int64_t source_request_ns,int32_t source_parent_layer) {
+    auto* controller=g_controller.load(std::memory_order_acquire);
+    const int64_t now=NowNs();
+    if(!controller || !transaction || !surface || !parent || texture_width<=0 ||
+       texture_height<=0 || texture_width>1024 || texture_height>1024 || width<=0 ||
+       height<=width || width>16384 || height>16384 || event_ns<=0 ||
+       event_ns>now+100000000LL || now-event_ns>1500000000LL) return false;
+    for(float value:geometry) if(!std::isfinite(value)) return false;
+    {
+        std::lock_guard<std::mutex> lock(controller->mutex);
+        if(controller->stop_requested ||
+           std::find(controller->retired_requests.begin(),controller->retired_requests.end(),event_ns)!=
+               controller->retired_requests.end()) return false;
+        Session* current=nullptr;
+        auto find=[&](const std::unique_ptr<Session>& owner) {
+            if(owner && owner->request_ns==event_ns && owner->width==width &&
+               owner->height==height && owner->closing==closing) current=owner.get();
+        };
+        find(controller->active);
+        for(const auto& owner:controller->overlapping) find(owner);
+        for(const auto& owner:controller->queued) find(owner);
+        find(controller->pending);
+        bool advancing=false;
+        if(!current && source_request_ns>0 && source_request_ns<=event_ns) {
+            const int32_t icon_layer=g_layer_id(reinterpret_cast<void*>(static_cast<uintptr_t>(surface)));
+            auto predecessor=[&](const std::unique_ptr<Session>& owner) {
+                if(!owner) return;
+                const bool source=owner->request_ns==source_request_ns ||
+                    (source_parent_layer>=0 && owner->parent_layer==source_parent_layer &&
+                     owner->request_ns<source_request_ns);
+                if(source && owner->request_ns<event_ns && owner->width==width &&
+                   owner->height==height && Owns(*owner,icon_layer) &&
+                   (!current || owner->request_ns>=current->request_ns)) current=owner.get();
+            };
+            predecessor(controller->active);
+            for(const auto& owner:controller->overlapping) predecessor(owner);
+            for(const auto& owner:controller->queued) predecessor(owner);
+            predecessor(controller->pending);
+            advancing=current!=nullptr;
+            if(!current && source_request_ns<event_ns) return false;
+        }
+        if(current) {
+            void* control=reinterpret_cast<void*>(static_cast<uintptr_t>(surface));
+            const int32_t layer=g_layer_id(control);
+            if(layer<0 || layer==current->unwarped_layer) return false;
+            auto conflicting=[&](const std::unique_ptr<Session>& owner) {
+                if(!owner || owner.get()==current || !Owns(*owner,layer) ||
+                   SameRequestDomain(*owner,*current)) return false;
+                // Shared icon ownership alone cannot prove a predecessor: use
+                // the actual App primary/parent and strictly ordered epochs.
+                const bool predecessor=owner->request_ns<current->request_ns &&
+                    owner->width==width && owner->height==height &&
+                    (owner->layer==current->layer || owner->parent_layer==current->parent_layer);
+                return !predecessor;
+            };
+            if(conflicting(controller->active) || conflicting(controller->pending) ||
+               std::any_of(controller->overlapping.begin(),controller->overlapping.end(),conflicting) ||
+               std::any_of(controller->queued.begin(),controller->queued.end(),conflicting)) return false;
+            if(current->layer==layer) {
+                if(current->texture_width!=texture_width || current->texture_height!=texture_height)
+                    return false;
+            } else {
+                auto item=std::find_if(current->companions.begin(),current->companions.end(),
+                    [&](const Companion& companion) {return companion.layer==layer;});
+                if(item!=current->companions.end()) {
+                    if(item->texture_width!=texture_width || item->texture_height!=texture_height)
+                        return false;
+                } else {
+                    current->companions.push_back({control,layer,texture_width,texture_height});
+                    g_inc_strong(control,current);
+                    std::sort(current->companions.begin(),current->companions.end(),
+                        [](const Companion& a,const Companion& b) {return a.layer<b.layer;});
+                }
+            }
+            if(advancing) {
+                // The bridge proved an ordered adjust of the same App stream.
+                // Preserve presentation and velocity while moving its epoch;
+                // the asynchronous App lookup subsequently joins this state.
+                if(current->closing!=closing) {
+                    auto parameters=current->parameters;
+                    parameters.response=closing?hha::genie::kClosingResponse:hha::genie::kOpeningResponse;
+                    if(!current->animation.Retarget(parameters,closing)) return false;
+                    current->parameters=parameters;
+                    current->closing=closing;
+                    current->started_ns=event_ns;
+                    ++current->generation;
+                }
+                const size_t end=4;
+                const hha::genie::Rect target{geometry[end],geometry[end+1],geometry[end+2],geometry[end+3]};
+                current->corner.target=hha::genie::CornerRatio(geometry[11],target);
+                current->corner.response=current->parameters.response;
+                current->request_ns=event_ns;
+                current->cancel_ns=0;
+            }
+            // Publish the entire shared snapshot. A pending App transaction
+            // can arrive after this icon host transaction; writing only the
+            // new icon here would expose different snapshots in the meantime.
+            if(!Submit(*controller,*current,false,static_cast<ASurfaceTransaction*>(transaction)))
+                return false;
+            current->attached=true;
+            GateCommit(*controller,*current,static_cast<ASurfaceTransaction*>(transaction));
+            if(controller->looper) ALooper_wake(controller->looper);
+            return true;
+        }
+    }
+    // A published starting request can precede worker adoption of App content.
+    // Seed a provisional owner; the real App inherits it and retains this icon.
+    return QueueSession(surface,parent,width,height,geometry,closing,event_ns,{},true,
+        texture_width,texture_height,transaction,nullptr,true);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_ng_lst_hha_ContentAnimator_nativePrimeIcon(JNIEnv* env,jclass,jlong transaction,jlong surface,
+    jlong parent,jint texture_width,jint texture_height,jint width,jint height,
+    jfloatArray geometry,jboolean closing,jlong event_ns,jlong source_request_ns,jint source_parent_layer) {
+    if(!geometry || env->GetArrayLength(geometry)!=12) return JNI_FALSE;
+    std::array<float,12> values{};
+    env->GetFloatArrayRegion(geometry,0,values.size(),values.data());
+    if(env->ExceptionCheck()) return JNI_FALSE;
+    return PrimeLinkedIcon(reinterpret_cast<void*>(static_cast<uintptr_t>(transaction)),surface,parent,
+        texture_width,texture_height,width,height,values,closing,event_ns,source_request_ns,source_parent_layer)?JNI_TRUE:JNI_FALSE;
 }
 
 static jboolean TransitionJni(JNIEnv* env,jlong transaction,jlong surface,jlong parent,

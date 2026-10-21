@@ -35,9 +35,17 @@ AIBinder_Class* BridgeClass() {
     return value;
 }
 
+struct IconPayload {
+    void* surface;
+    void* parent;
+    int32_t texture_width,texture_height,window_width,window_height;
+    void* (*view)(AParcel*);
+    int32_t (*write_surface)(void*,void*);
+};
+
 // Prepare operations read additional reply payloads, so the caller owns output.
 binder_status_t Send(AIBinder* binder, const Transition& transition, int32_t operation,
-                     AParcel** output, int32_t* accepted) {
+                     AParcel** output, int32_t* accepted, const IconPayload* icon = nullptr) {
     AParcel* input = nullptr;
     *accepted = 0;
     binder_status_t status = AIBinder_prepareTransaction(binder, &input);
@@ -54,6 +62,22 @@ binder_status_t Send(AIBinder* binder, const Transition& transition, int32_t ope
     if (status == STATUS_OK) status = AParcel_writeInt64(input, transition.event_ns);
     for (float value : transition.geometry) {
         if (status == STATUS_OK) status = AParcel_writeFloat(input, value);
+    }
+    if (icon) {
+        integer(icon->texture_width);
+        integer(icon->texture_height);
+        integer(icon->window_width);
+        integer(icon->window_height);
+        // SurfaceControl.CREATOR reads Java width/height/presence before the
+        // native capability payload. Native writeToParcel alone omits these.
+        integer(icon->texture_width);
+        integer(icon->texture_height);
+        integer(1);
+        if (status == STATUS_OK) status = icon->write_surface(icon->surface, icon->view(input));
+        integer(0);
+        integer(0);
+        integer(1);
+        if (status == STATUS_OK) status = icon->write_surface(icon->parent, icon->view(input));
     }
     if (status == STATUS_OK) status = AIBinder_transact(binder, kBridgeCode, &input, output, 0);
     if (status == STATUS_OK) {
@@ -187,10 +211,9 @@ bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,cons
        width>0 && height>width && width<=16384 && height<=16384) {
         const void* parcel=view(output);
         if(parcel && read(parcel,&output_surface)==0 && output_surface &&
-           read_transaction(visibility,parcel)==0 &&
-           PrimeContentPublication(transaction,output_surface,parent,width,height,transition)) {
-            // Includes the server's commit listener, so a host publication
-            // arriving after cancellation restores the latest owner's state.
+           read_transaction(visibility,parcel)==0) {
+            // The server supplies the inherited shader state and both native
+            // and visibility commit listeners. Never overwrite it locally.
             merge_transaction(transaction,visibility);
             *window={0,0,static_cast<double>(width),static_cast<double>(height)};
             primed=true;
@@ -208,10 +231,10 @@ bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,cons
 
 bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
                            const Transition& transition) {
-    // This special request reads only the exact pre-start capability registry.
-    // The server never enters WMS.mGlobalLock, renders, or waits for its worker.
-    // Arbitrary App buffers are not returned across this boundary.
-    if(!transaction || !parent || transition.closing) return false;
+    // The server resolves only the exact pre-start capability and primes it
+    // without entering WMS.mGlobalLock or waiting for its worker/commit.
+    if(!transaction || !parent || transition.closing || width<=0 || height<=width ||
+       width>16384 || height>16384) return false;
     static void* binder_library=dlopen("libbinder_ndk.so",RTLD_NOW|RTLD_LOCAL);
     static void* platform=dlopen("libandroid.so",RTLD_NOW|RTLD_LOCAL);
     static void* gui=dlopen("libgui.so",RTLD_NOW|RTLD_LOCAL);
@@ -220,6 +243,8 @@ bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
     using ViewParcel=const void* (*)(const AParcel*);
     using ReadSurface=int32_t (*)(const void*,void**);
     using Release=void (*)(const void*,const void*);
+    using ReadTransaction=int32_t (*)(void*,const void*);
+    using MergeTransaction=void* (*)(void*,void*);
     auto symbol=[](void* library,void* fallback,const char* name) {
         void* value=library?dlsym(library,name):nullptr;
         return value?value:(fallback?dlsym(fallback,name):nullptr);
@@ -229,7 +254,9 @@ bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
     static auto read=reinterpret_cast<ReadSurface>(symbol(gui,platform,
         "_ZN7android14SurfaceControl14readFromParcelERKNS_6ParcelEPNS_2spIS0_EE"));
     static auto release=reinterpret_cast<Release>(symbol(utils,platform,"_ZNK7android7RefBase9decStrongEPKv"));
-    if(!check || !view || !read || !release) return false;
+    static auto read_transaction=reinterpret_cast<ReadTransaction>(symbol(gui,platform,"_ZN7android21SurfaceComposerClient11Transaction14readFromParcelEPKNS_6ParcelE"));
+    static auto merge_transaction=reinterpret_cast<MergeTransaction>(symbol(gui,platform,"_ZN7android21SurfaceComposerClient11Transaction5mergeEOS1_"));
+    if(!check || !view || !read || !release || !read_transaction || !merge_transaction) return false;
     AIBinder* binder=check("window");
     if(!binder) return false;
     if(!AIBinder_associateClass(binder,BridgeClass())) {AIBinder_decStrong(binder);return false;}
@@ -238,11 +265,17 @@ bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
     const binder_status_t status=Send(binder,transition,3,&output,&accepted);
     void* surface=nullptr; // ABI mirror of the output sp<SurfaceControl>.
     bool primed=false;
+    ASurfaceTransaction* publication=nullptr;
     if(status==STATUS_OK && accepted==1) {
         const void* parcel=view(output);
-        if(parcel && read(parcel,&surface)==0 && surface)
-            primed=PrimeOpeningPreview(transaction,surface,parent,width,height,transition);
+        publication=ASurfaceTransaction_create();
+        if(publication && parcel && read(parcel,&surface)==0 && surface &&
+           read_transaction(publication,parcel)==0) {
+            merge_transaction(transaction,publication);
+            primed=true;
+        }
     }
+    if(publication) ASurfaceTransaction_delete(publication);
     if(surface) release(surface,&surface);
     if(output) AParcel_delete(output);
     AIBinder_decStrong(binder);
@@ -252,6 +285,64 @@ bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
     }
     __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_WARN,"HHA.Bridge",
         "preview first transaction leash=%d accepted=%d primed=%d status=%d",transition.leash_layer,accepted,primed,status);
+    return primed;
+}
+
+bool PrepareIcon(void* host_transaction,void* icon_surface,void* icon_parent,
+                 int texture_width,int texture_height,int window_width,int window_height,
+                 const Transition& transition) {
+    static void* binder_library=dlopen("libbinder_ndk.so",RTLD_NOW|RTLD_LOCAL);
+    static void* platform=dlopen("libandroid.so",RTLD_NOW|RTLD_LOCAL);
+    static void* gui=dlopen("libgui.so",RTLD_NOW|RTLD_LOCAL);
+    using CheckService=AIBinder* (*)(const char*);
+    using MutableParcel=void* (*)(AParcel*);
+    using ConstParcel=const void* (*)(const AParcel*);
+    using WriteSurface=int32_t (*)(void*,void*);
+    using ReadTransaction=int32_t (*)(void*,const void*);
+    using MergeTransaction=void* (*)(void*,void*);
+    auto symbol=[](void* library,void* fallback,const char* name) {
+        void* value=library?dlsym(library,name):nullptr;
+        return value?value:(fallback?dlsym(fallback,name):nullptr);
+    };
+    static auto check=reinterpret_cast<CheckService>(symbol(binder_library,nullptr,"AServiceManager_checkService"));
+    // Both overloads are exported by the verified ROM's libbinder_ndk. The
+    // mutable overload preserves the parcel's current write position.
+    static auto mutable_view=reinterpret_cast<MutableParcel>(symbol(binder_library,nullptr,"_Z26AParcel_viewPlatformParcelP7AParcel"));
+    static auto const_view=reinterpret_cast<ConstParcel>(symbol(binder_library,nullptr,"_Z26AParcel_viewPlatformParcelPK7AParcel"));
+    // ROM libgui: non-const member, Parcel&, status_t return (x0=this,x1=parcel).
+    static auto write_surface=reinterpret_cast<WriteSurface>(symbol(gui,platform,"_ZN7android14SurfaceControl13writeToParcelERNS_6ParcelE"));
+    static auto read_transaction=reinterpret_cast<ReadTransaction>(symbol(gui,platform,"_ZN7android21SurfaceComposerClient11Transaction14readFromParcelEPKNS_6ParcelE"));
+    static auto merge_transaction=reinterpret_cast<MergeTransaction>(symbol(gui,platform,"_ZN7android21SurfaceComposerClient11Transaction5mergeEOS1_"));
+    if(!host_transaction || !icon_surface || !icon_parent ||
+       texture_width<=0 || texture_height<=0 || texture_width>1024 || texture_height>1024 ||
+       window_width<=0 || window_height<=window_width || window_width>16384 || window_height>16384 ||
+       !check || !mutable_view || !const_view || !write_surface || !read_transaction || !merge_transaction) return false;
+    AIBinder* binder=check("window");
+    if(!binder) return false;
+    if(!AIBinder_associateClass(binder,BridgeClass())) {AIBinder_decStrong(binder);return false;}
+    const IconPayload payload{icon_surface,icon_parent,texture_width,texture_height,window_width,window_height,
+                              mutable_view,write_surface};
+    AParcel* output=nullptr;
+    int32_t accepted=0;
+    const binder_status_t status=Send(binder,transition,5,&output,&accepted,&payload);
+    ASurfaceTransaction* publication=nullptr;
+    bool primed=false;
+    if(status==STATUS_OK && accepted==1 && output) {
+        publication=ASurfaceTransaction_create();
+        const void* parcel=const_view(output);
+        if(publication && parcel && read_transaction(publication,parcel)==0) {
+            // The native server commit listener travels with this merge. Never
+            // apply here: only the caller's first host publication releases it.
+            merge_transaction(host_transaction,publication);
+            primed=true;
+        }
+    }
+    if(publication) ASurfaceTransaction_delete(publication);
+    if(output) AParcel_delete(output);
+    AIBinder_decStrong(binder);
+    __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_WARN,"HHA.Bridge",
+        "icon before host leash=%d accepted=%d primed=%d status=%d texture=%dx%d domain=%dx%d",
+        transition.leash_layer,accepted,primed,status,texture_width,texture_height,window_width,window_height);
     return primed;
 }
 
