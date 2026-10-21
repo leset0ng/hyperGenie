@@ -18,7 +18,8 @@ static void ObserveAlpha(ASurfaceTransaction*,ASurfaceControl* surface,float val
 #undef ASurfaceTransaction_setBufferAlpha
 namespace {
 int assertions=0, prepared=0, retained=0, released=0, queued=0, cancelled=0, local_cancels=0;
-bool accept=true,reenter_replace=false;
+int preview_prepared=0,group_prepared=0;
+bool accept=true,reenter_replace=false,accept_preview=true,accept_group=true;
 void Check(bool yes,const char* text) {++assertions;if(!yes){std::fprintf(stderr,"FAIL %s\n",text);std::exit(1);}}
 struct Control {int id;std::string name;};
 Control app{11,"Task=7#11"},icon{22,"FloatingIcon_all#22"},child{23,"[BBQ] FloatingIcon_all#22"},new_child{24,"[BBQ] FloatingIcon_all#22"},desktop{25,"DesktopIcon"};
@@ -44,8 +45,10 @@ struct Param {
         }
         *link=node;nodes.push_back(std::move(storage));
     }
-    explicit Param(int type=1) {
-        int id=77;std::memcpy(object.data()+0x40,&type,4);std::memcpy(object.data()+0x48,&id,4);
+    explicit Param(int type=1,int id=77) {
+        const int adjust_type=type==-1?1:0;
+        std::memcpy(object.data()+0x40,&type,4);std::memcpy(object.data()+0x44,&adjust_type,4);
+        std::memcpy(object.data()+0x48,&id,4);
         Add("centerX",165.5f,560,21,.02f);Add("centerY",885.5f,1218,37,.03f);
         Add("width",171,1120,55,.04f);Add("height",171,2436,999,.9f);
         Add("ratio",1,2436.f/1120,9,.8f);Add("alpha",1,1,9,.7f);
@@ -62,6 +65,7 @@ void Reset() {
     g_layer=Layer;g_name=Name;g_stop=StockStop;g_transaction_id=TransactionId;
     alpha_writes=prepared=retained=released=queued=cancelled=local_cancels=0;
     suppressed=nullptr;accept=true;reenter_replace=false;
+    preview_prepared=group_prepared=0;accept_preview=accept_group=true;
 }
 void Seed(Param& source) {
     const void* control=&app;Observe(&control,source.Reference(),false);
@@ -73,6 +77,19 @@ void Seed(Param& source) {
     Check(g_last[0].host_transaction_id==0x1234,"successful App tune records exact host transaction before stock start");
 }
 void AddChild(){g_icons[0].surface=&child;g_icons[0].parent=icon.id;g_icons[0].width=171;g_icons[0].height=171;}
+Control prestart{31,"Pre startup opening leash#31"};
+void AnchorPrestart(){g_anchors[0]={prestart.id,app.id,7};}
+void Reverse(Param& parameters) {
+    for(const char* key:{"centerX","centerY","width","height","ratio","radius","cornerTLX"}) {
+        const auto spring=Spring(parameters.Reference(),key);
+        SetSpring(parameters.Reference(),key,spring.end,spring.start);
+    }
+}
+void CheckStock(const Param& parameters) {
+    const void* reference=&parameters.ref;
+    Check(Spring(reference,"ratio").start!=Spring(reference,"ratio").end,"rejected preparation preserves OEM aspect animation");
+    Check(g_last[0].host_transaction_id==0&&!g_last[0].supported,"rejected source cannot publish a custom viewport");
+}
 }
 namespace hha {
 void QueueTransition(const Transition&){++queued;}
@@ -81,8 +98,14 @@ bool WarmIconRenderer(){return true;}
 void RetainIconSurface(void*,const void*){++retained;}
 void ReleaseIconSurface(void* surface,const void*){if(surface)++released;}
 void CancelIconRenderer(){++local_cancels;}
-bool PrepareOpeningPreview(void*,void*,int,int,const Transition&){return true;}
-bool PrepareContentGroup(void*,void*,genie::Rect*,const Transition&){return true;}
+bool PrepareOpeningPreview(void*,void*,int,int,const Transition& transition) {
+    ++preview_prepared;
+    return accept_preview&&!transition.closing;
+}
+bool PrepareContentGroup(void*,void*,genie::Rect*,const Transition& transition) {
+    ++group_prepared;
+    return accept_group&&transition.task_id>=0;
+}
 bool PrepareIcon(void*,void* surface,void* parent,int tw,int th,int ww,int wh,const Transition&) {
     ++prepared;Check(surface==&child&&parent==&icon,"central registration uses exact retained capabilities");
     Check(tw==171&&th==171&&ww==1120&&wh==2436,"central registration preserves texture/window domains");
@@ -128,5 +151,89 @@ int main(){
     Reset();Param unavailable_source(2);Seed(unavailable_source);AddChild();g_transaction_id=nullptr;Param unavailable;
     TuneParent(reinterpret_cast<void*>(0x1234),&icon_control,unavailable.Reference());
     Check(prepared==1&&alpha_writes==0&&retained==released,"optional transaction diagnostics never disable the shared icon animation");
-    std::printf("PASS %d Launcher central-icon integration checks\n",assertions);
+    // Reused pre-start leashes have a cached Task even though their name still
+    // identifies an opening preview. Successful preview publication is enough.
+    Reset();AnchorPrestart();accept_group=false;Param anchored_open(2);
+    const void* prestart_control=&prestart;
+    Observe(&prestart_control,anchored_open.Reference(),false);
+    Check(g_last[0].transition.task_id==7&&queued==0,"anchored opening waits for its host transaction");
+    TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,anchored_open.Reference());
+    Check(preview_prepared==1&&group_prepared==0,"anchored opening selects only preview preparation");
+    Check(queued==1&&g_last[0].supported&&g_last[0].host_transaction_id==0x1234,"accepted preview publishes custom host despite unavailable group");
+    AddChild();Param anchored_icon;
+    TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,anchored_icon.Reference());
+    Check(prepared==1&&alpha_writes==0,"accepted preview remains eligible for shared icon publication");
+
+    // A close on that exact reused leash must use grouped live content, even
+    // when the opening-only preview capability is unavailable.
+    accept_preview=false;accept_group=true;Param reused_close(2);Reverse(reused_close);
+    Observe(&prestart_control,reused_close.Reference(),false);
+    Check(g_last[0].transition.closing&&queued==1,"reused close waits for grouped first-frame preparation");
+    TuneParent(reinterpret_cast<void*>(0x6789),&prestart_control,reused_close.Reference());
+    Check(preview_prepared==1&&group_prepared==1,"reused close bypasses opening preview and prepares live group");
+    Check(queued==2&&g_last[0].supported&&g_last[0].host_transaction_id==0x6789,"reused close publishes its own custom host epoch");
+    Param closing_icon;Reverse(closing_icon);
+    TuneParent(reinterpret_cast<void*>(0x789a),&icon_control,closing_icon.Reference());
+    Check(prepared==2&&alpha_writes==0,"reused close keeps paired icon on the custom route");
+
+    Reset();AnchorPrestart();accept_preview=false;Param rejected_preview(2);
+    Observe(&prestart_control,rejected_preview.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,rejected_preview.Reference());
+    Check(preview_prepared==1&&group_prepared==0&&queued==0,"failed preview cannot fall through to another publication route");
+    CheckStock(rejected_preview);
+
+    Reset();AnchorPrestart();accept_group=false;Param rejected_group(2);Reverse(rejected_group);
+    Observe(&prestart_control,rejected_group.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,rejected_group.Reference());
+    Check(preview_prepared==0&&group_prepared==1&&queued==0,"failed closing group never attempts opening preview or publishes geometry");
+    CheckStock(rejected_group);
+
+    Reset();Param unanchored_close(2);Reverse(unanchored_close);
+    Observe(&prestart_control,unanchored_close.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,unanchored_close.Reference());
+    Check(preview_prepared==0&&group_prepared==1&&queued==0,"unanchored pre-start close requires a verified group instead of publishing unprepared geometry");
+    CheckStock(unanchored_close);
+
+    Reset();Param fresh_preview(2);
+    Observe(&prestart_control,fresh_preview.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,fresh_preview.Reference());
+    Check(preview_prepared==1&&group_prepared==0&&queued==1,"unanchored opening retains preview-only publication");
+    Check(g_last[0].supported&&g_last[0].host_transaction_id==0x1234,"fresh preview publishes its custom host");
+
+    // Adjust already owns a prepared stream; it must not acquire new first-frame
+    // prerequisites when a rapid reversal changes direction.
+    AnchorPrestart();accept_preview=accept_group=false;Param reversal(2);Reverse(reversal);
+    const int next_animation=78;std::memcpy(reversal.object.data()+0x48,&next_animation,4);
+    Observe(&prestart_control,reversal.Reference(),true);
+    TuneParent(reinterpret_cast<void*>(0x9abc),&prestart_control,reversal.Reference());
+    Check(g_last[0].adjusting&&g_last[0].transition.closing,"higher-ID reverse callback retains prepared stream");
+    Check(preview_prepared==1&&group_prepared==0&&queued==2,"adjust bypasses both initial preparation routes");
+    Check(g_last[0].supported&&g_last[0].host_transaction_id==0x9abc,"adjust still publishes the retargeted viewport");
+    Control shell{41,"Surface(name=Task=7#11)/@test_transition-leash#41"};
+    const void* shell_control=&shell;
+    Reset();accept_group=false;Param not_ready(2);
+    Observe(&shell_control,not_ready.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1234),&shell_control,not_ready.Reference());
+    Check(group_prepared==1&&queued==0,"unavailable initial group preserves stock host");
+    CheckStock(not_ready);
+    Param still_not_ready(-1,78);
+    Observe(&shell_control,still_not_ready.Reference(),true);
+    TuneParent(reinterpret_cast<void*>(0x2345),&shell_control,still_not_ready.Reference());
+    Check(group_prepared==2&&queued==0,"unsupported adjust retries preparation without asynchronous publication");
+    CheckStock(still_not_ready);
+    const auto rejected_epoch=g_last[0].transition.event_ns;
+    Param stale(-1,77);Observe(&shell_control,stale.Reference(),true);
+    Check(g_last[0].transition.event_ns==rejected_epoch,"stale callback cannot retry or replace a rejected epoch");
+    accept_group=true;Param recovered(-1,79);
+    Observe(&shell_control,recovered.Reference(),true);
+    Check(!g_last[0].adjusting&&queued==0,"recovery adjust requires a fresh first-frame proof");
+    TuneParent(reinterpret_cast<void*>(0x3456),&shell_control,recovered.Reference());
+    Check(group_prepared==3&&queued==1&&g_last[0].supported&&g_last[0].host_transaction_id==0x3456,
+          "ready group recovers the same stream on a newer adjust");
+    accept_group=false;Param continuing(-1,80);
+    Observe(&shell_control,continuing.Reference(),true);
+    TuneParent(reinterpret_cast<void*>(0x4567),&shell_control,continuing.Reference());
+    Check(g_last[0].adjusting&&group_prepared==3&&queued==2&&g_last[0].host_transaction_id==0x4567,
+          "already prepared adjust keeps its fast continuation path");
+    std::printf("PASS %d Launcher integration checks\n",assertions);
 }

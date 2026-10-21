@@ -62,6 +62,10 @@ internal object ContentAnimator {
                eventTimeNanos: Long): Boolean = initialized &&
         nativeAttach(transaction, surface, parent, width, height, eventTimeNanos)
 
+    /** Clear a retired composition only in the transaction hiding its output. */
+    fun clearRetiredGroup(transaction: Long, surface: Long): Boolean = initialized &&
+        nativeClearRetiredGroup(transaction, surface)
+
     fun stopRequest(parent: Int, eventTimeNanos: Long) {
         if (initialized && parent >= 0) nativeStopRequest(parent.toLong(), eventTimeNanos)
     }
@@ -105,6 +109,7 @@ internal object ContentAnimator {
     @JvmStatic external fun nativeAttach(
         transaction: Long, surface: Long, parent: Long, width: Int, height: Int, eventNs: Long,
     ): Boolean
+    @JvmStatic external fun nativeClearRetiredGroup(transaction: Long, surface: Long): Boolean
     @JvmStatic external fun nativeStopRequest(parent: Long, eventNs: Long)
     @JvmStatic external fun nativeRunning(): Boolean
     @JvmStatic external fun nativeStop()

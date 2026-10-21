@@ -28,7 +28,7 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
     private val controllerClass = Class.forName("com.android.server.wm.TaskSnapshotController", false, loader)
     private val taskIdField = field(taskClass, "mTaskId")
     private val members = Members()
-    private val hooks = ArrayList<HookHandle>(2)
+    private val hooks = ArrayList<HookHandle>(5)
     private val states = ConcurrentHashMap<Int, State>()
     @Volatile private var closed = false
 
@@ -94,11 +94,47 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
                         chain.proceed()
                     }
                 }
+            installOemCaptures()
             report(Log.INFO, "task snapshot guard installed")
         } catch (error: Throwable) {
             close()
             throw error
         }
+    }
+
+    /** OEM startup caches capture the Task directly, bypassing TaskSnapshotController. */
+    private fun installOemCaptures() {
+        val manager = Class.forName("com.android.server.wm.PreStartingManager", false, taskClass.classLoader)
+        val activity = Class.forName("com.android.server.wm.ActivityRecord", false, taskClass.classLoader)
+        val display = Class.forName("com.android.server.wm.DisplayContent", false, taskClass.classLoader)
+        val signatures = listOf(
+            manager.getDeclaredMethod("captureSplashLayer", activity, display, taskClass) to 2,
+            manager.getDeclaredMethod("getBuffer", display, activity, taskClass, ArrayList::class.java) to 2,
+            manager.getDeclaredMethod("captureActivity", activity, display, taskClass,
+                Boolean::class.javaPrimitiveType) to 2,
+        )
+        for ((capture, taskArgument) in signatures) {
+            hooks += module.hook(capture)
+                .setPriority(XposedInterface.PRIORITY_DEFAULT)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId("pristine-oem-${capture.name}")
+                .intercept { chain ->
+                    val task = chain.getArg(taskArgument)
+                    if (closed || task == null) return@intercept chain.proceed()
+                    val id = taskIdField.getInt(task)
+                    val state = states.getOrPut(id) { State() }
+                    // Serialize the actual screenshot with block(), including
+                    // captures queued before the animation began. Returning null
+                    // is the ROM's existing no-buffer/void path, keeping its cache.
+                    state.lock.withLock {
+                        if (!closed && state.blocked) {
+                            report(Log.DEBUG, "skip OEM ${capture.name} task=$id while content is deformed")
+                            null
+                        } else chain.proceed()
+                    }
+                }
+        }
+        report(Log.INFO, "OEM startup capture guard installed (${signatures.size} paths)")
     }
 
     /** May wait for an existing pristine capture; returns before effects attach. */

@@ -283,6 +283,14 @@ void JniStopRequestValidation() {
     Check(controller.active->cancel_ns>=before+48000000LL &&
           controller.active->cancel_ns<=after+48000000LL,
           "JNI stop uses the same 48ms scoped grace as the native API");
+    ResetEvents();
+    auto* delayed_publication=ASurfaceTransaction_create();
+    Check(!QueueSession(312,3101,1120,2436,opening,false,request,{},true,0,0,delayed_publication),
+          "revoked epoch cannot prime newly discovered ordinary content before grace expires");
+    Check(!QueueSession(313,3101,1120,2436,opening,false,request,{},false),
+          "revoked epoch cannot queue ordinary worker content before grace expires");
+    Check(events.empty()&&!controller.pending,"rejected late content writes no shader and retains no pending owner");
+    ASurfaceTransaction_delete(delayed_publication);
     // Advance cancellation deterministically without depending on wall-clock scheduling.
     controller.active->cancel_ns=NowNs()-1;
     ResetEvents();Frame(NowNs(),&controller);
@@ -355,8 +363,16 @@ void OpeningPreviewLifetime() {
     Check(QueueSession(811,8101,1120,2436,opening,false,request+1,{},false),
           "new immutable request reuses the App surface");
     Pump(isolated);
-    Check(Cleared()==std::vector<int>{812} && isolated.active->companions.empty(),
-          "preview retention does not leak across request identity");
+    Check(Cleared().empty() && Owns(*isolated.active,812),
+          "new epoch on the same live stream retains verified visible starting buffers");
+    auto closing=opening;
+    for(size_t i=0;i<4;++i) std::swap(closing[i],closing[i+4]);
+    std::swap(closing[10],closing[11]);
+    Check(QueueSession(811,8101,1120,2436,closing,true,request+2,{},false),
+          "rapid closing reverses the same App while an OEM preview is still visible");
+    Pump(isolated);
+    Check(Owns(*isolated.active,812)&&border_widths[812]>0&&Cleared().empty(),
+          "direction reversal cannot clear a visible starting buffer into a rectangular backdrop");
     Stop(isolated);
     std::puts("PASS opening preview lifetime and immediate content handoff");
 }
@@ -849,10 +865,14 @@ void GestureClosingSessionPublication() {
     Check(controller.active->frames==1 && border_widths[1811]>0,
           "committed gesture close advances while retaining output protection");
     ResetEvents();Stop(controller);
+    Check(Cleared().empty() && border_widths[1811]>0,
+          "gesture worker retirement preserves the visible composed silhouette");
+    auto* restore=ASurfaceTransaction_create();
+    Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+              reinterpret_cast<jlong>(restore),1811),"gesture source restoration owns the final effect cleanup");
     Check(Cleared()==std::vector<int>{1811} && border_widths[1811]==0,
-          "gesture cleanup clears its shader and CLIENT guard together");
-    Check(controller.detaches_pending.load()==1 && Running(),
-          "gesture cleanup stays outstanding until detach completion");
+          "gesture restoration clears its shader and CLIENT guard together");
+    ASurfaceTransaction_delete(restore);
     DrainCompletions();Check(!Running(),"gesture renderer becomes idle after cleanup completion");
     std::puts("PASS gesture close full-domain session publication and cleanup");
 }
@@ -977,8 +997,55 @@ void GroupedSourcePublication() {
     Check(!AttachSession(transaction,1801,1800,1120,2436,request),
           "a late source show cannot reintroduce double deformation");
     ASurfaceTransaction_delete(transaction);
+    Check(QueueSession(1803,1800,1120,2436,opening,false,request,{1802},false),
+          "same-group discovery update retains composed-output ownership");
+    Pump(controller);
+    Check(controller.active && controller.active->unwarped_layer==1801,
+          "unprimed worker updates preserve the group's source identity");
+    controller.active->animation.Advance(1.0);
+    hha::genie::AdvanceScalar(&controller.active->corner,1.0,1.0);
+    ResetEvents();Frame(NowNs(),&controller);
+    Check(controller.active && controller.active->layer==1803 && border_widths[1803]>0,
+          "settled opening retains SELF while the composed output remains visible");
+    auto* restore=ASurfaceTransaction_create();
+    Check(!Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+              reinterpret_cast<jlong>(restore),1803),"restore cannot clear a group still owned by an animation");
+    Stop(controller);ResetEvents();
+    Check(border_widths[1803]>0,"worker retirement leaves the last masked group state until source restoration");
+    Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+              reinterpret_cast<jlong>(restore),1803),"retired output clears in the caller's visibility restoration transaction");
+    Check(Cleared()==std::vector<int>{1803}&&events[0].transaction==restore&&border_widths[1803]==0,
+          "group restoration atomically clears SELF and CLIENT border on the hidden output");
+    ASurfaceTransaction_delete(restore);
+    std::puts("PASS grouped-source publication and masked retirement");
+}
+
+void GroupReplacementDoesNotBecomePreview() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    const auto request=NowNs();
+    auto* first=ASurfaceTransaction_create();
+    Check(QueueSession(1841,1840,1120,2436,opening,false,request,{1843},false,
+                       0,0,first,reinterpret_cast<void*>(1842)),"seed composed output and OEM preview");
+    ASurfaceTransaction_apply(first);ASurfaceTransaction_delete(first);Commit(0);Pump(controller);
+    ResetEvents();
+    auto* replacement=ASurfaceTransaction_create();
+    Check(QueueSession(1844,1840,1120,2436,opening,false,request,{},false,
+                       0,0,replacement,reinterpret_cast<void*>(1845)),"replace a recreated source in the same Task/request");
+    Check(controller.pending && !Owns(*controller.pending,1841) && Owns(*controller.pending,1843),
+          "replacement retains the OEM preview but never inherits the previous composed output");
+    ASurfaceTransaction_apply(replacement);ASurfaceTransaction_delete(replacement);Commit(1);Pump(controller);
+    ResetEvents();Frame(NowNs(),&controller);
+    for(const auto& event:events) Check(event.layer!=1841,"new group cannot write or clear the previous group as a preview");
+    Check(border_widths[1841]>0,"old group keeps its mask until bridge visibility restoration");
     Stop(controller);
-    std::puts("PASS grouped-source publication prevents double deformation");
+    auto* restore=ASurfaceTransaction_create();
+    for(int layer:{1841,1844}) Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(
+        nullptr,nullptr,reinterpret_cast<jlong>(restore),layer),"hidden retired group releases its effect");
+    ASurfaceTransaction_delete(restore);
+    std::puts("PASS composed output replacement preserves visibility ownership");
 }
 
 std::array<float,12> LinkedGeometry(bool closing) {
@@ -1676,7 +1743,7 @@ int main() {
     PrimedCrossParentHandoff();DelayedPendingPreviewCoalescence();
     PublicationUnionAfterLateAttachment();OneShotOpeningPublication();ClosingGroupHostPublication();
     GestureClosingSessionPublication();GestureClosingHostPublication();GesturePublicationRejectsIncompatibleGeometry();
-    GroupedSourcePublication();
+    GroupedSourcePublication();GroupReplacementDoesNotBecomePreview();
     LateLinkedIconSharesFrames();LinkedIconBeforeAppHandoff();LinkedIconPublicationCancellation();
     LinkedIconSeedLosesToAppPublication();LinkedIconCannotCrossAppOwnership();
     LinkedIconPendingReversalPublication();LinkedIconSelectsPendingPublication();

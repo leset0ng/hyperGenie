@@ -106,11 +106,12 @@ On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
 controller in an isolated executable with fake surface capabilities and empty
 SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
 commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 10,503 checks; `ADB_SERIAL` selects a device. It does not
+The current suite passes 10,948 checks; `ADB_SERIAL` selects a device. It does not
 install the module or touch real App layers. `tests/run-launcher-device-tests.sh`
-adds 71 checks of the actual Launcher hooks with isolated parameter trees and
-fake capabilities, including separate OEM construction transactions and failure
-fallbacks.
+adds 111 checks of the actual Launcher hooks with isolated parameter trees and
+fake capabilities, including separate OEM construction transactions, reused
+pre-start closing, exclusive preview/group preparation, admission retries, and
+failure fallbacks.
 
 The module app has no Activity. Its metadata is shown by the framework.
 
@@ -158,10 +159,19 @@ app/src/main/
 
 ## Validation status
 
+**Task3 (AVD visual acceptance) is blocked.** Current captures still show square
+plates and small Settings content inside a larger OEM backdrop. The remaining
+`preSplashStarting` route includes unmasked **solid-color layers**; this is not
+evidence that snapshot pixels are poisoned. Nonuniform OEM closing crops also
+retain the stock route until their sampled crop can be converted safely. See
+[current fallback validation](docs/fallback-routing-validation.md) for the
+installed SHA, measured samples and remaining limits.
+
 The current build passes Android assembly/lint, 775 native geometry/reference
-checks, 10,503 isolated checks of the actual renderer and 71 Launcher-hook
+checks, 10,948 isolated checks of the actual renderer and 111 Launcher-hook
 integration checks. Shared frame regression covers publication order, distinct
-texture domains and source-authenticated rapid reversal. Installed AVD captures
+texture domains, source-authenticated rapid reversal and composed-output
+replacement ownership. Earlier installed AVD captures
 confirm six ordinary App/icon registrations and a close-to-open adjust with
 `accepted=1 primed=1`, stable core processes and no new crash entries. See
 [shared animation frames](docs/animation-frame-sync.md). Retired helper-only
@@ -182,10 +192,10 @@ configured device radius is 180px. Position and velocity survive reversal.
 
 OEM preview selection also uses the verified type mapping: `1=Snapshot`,
 `2=Splash`. Snapshot requires its observed identity draw domain; Splash uses its
-fixed full-size Canvas domain. The latest installed capture found no shader
+fixed full-size Canvas domain. An earlier installed capture found no shader
 loss after attachment across 14 sampled preview layers and no shadow draw
-scopes; core processes and the crash buffer remained unchanged. The user
-reports ordinary opening now looks correct.
+scopes; core processes and the crash buffer remained unchanged. Those bounded
+samples do not establish current visual acceptance.
 
 Cold startup and rapid switching now use event-driven content discovery rather
 than 16/50ms polling. Standard App/starting buffers are protected at creation,
@@ -215,9 +225,9 @@ tracked hide/show transaction into Launcher's first host transaction, so a
 planar video child cannot leak while the bridge worker catches up.
 
 Rapid parallel previews now use the exact opening Change/domain proof, including
-merged-animation lifetime and pre-enqueue Snapshot validation. The final cold
-and rapid captures have zero rejected preparations, first-draw misses or
-uncovered BBQ descendants. See [live child content and validation](docs/live-child-content.md)
+merged-animation lifetime and pre-enqueue Snapshot validation. Earlier cold
+and rapid captures had zero rejected preparations, first-draw misses or
+uncovered BBQ descendants in their samples. See [live child content and validation](docs/live-child-content.md)
 for measured coverage, lifecycle behavior and the extra composition cost.
 
 Gesture-release closing keeps the dragged presentation rectangle separate from
@@ -234,7 +244,8 @@ viewports with `accepted=1 primed=1`; core process IDs, crash logs and runtime
 configuration remain stable. Production Binder probes also reject distorted
 and oversized closes, a partial opening and the older protocol version. Sampled
 recording frames show the closing contour deforming before icon handoff.
-This repairs the release animation; continuous finger-tracking Genie deformation
+This validates the sampled release path; current fallback and visual failures
+remain recorded above. Continuous finger-tracking Genie deformation
 remains outside the implemented path.
 
 The emulator has a separate verified host-capture buffer-selection problem

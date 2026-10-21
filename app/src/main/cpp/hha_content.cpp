@@ -148,6 +148,7 @@ struct Companion {
     // Floating icons share the owner's mesh but sample a square source buffer.
     int texture_width=0;
     int texture_height=0;
+    bool starting=false;
 };
 
 struct Session {
@@ -276,7 +277,10 @@ bool Submit(Controller& controller, Session& session, bool detach,
                 ++cleared;
             }
         };
-        clear(session.surface,session.layer);
+        // Composed outputs can remain visible after worker retirement. Keep
+        // their last masked state until the bridge hides them and restores the
+        // source in one transaction; clearing SELF alone exposes a rectangle.
+        if(session.unwarped_layer<0) clear(session.surface,session.layer);
         for(const auto& companion:session.companions) clear(companion.surface,companion.layer);
         if(!cleared) {
             if(!supplied) ASurfaceTransaction_delete(transaction);
@@ -377,6 +381,7 @@ void DetachLostSurfaces(Controller& controller,const Session& previous,const Ses
     std::vector<Companion> surfaces{{previous.surface,previous.layer}};
     surfaces.insert(surfaces.end(),previous.companions.begin(),previous.companions.end());
     for(const auto& item:surfaces) {
+        if(item.layer==previous.layer && previous.unwarped_layer>=0) continue;
         if(item.layer>=0 && !LiveOwner(controller,previous,item.layer,&next))
             ClearSurface(transaction,item.surface);
     }
@@ -441,19 +446,23 @@ void PreserveLinkedIcons(Session& next,const Session& previous) {
 // behind the animated App. The immutable request, parent and extent bound reuse.
 void PreserveOpeningPreviews(Session& next, const Session& previous) {
     PreserveLinkedIcons(next,previous);
-    if(next.closing || previous.closing || next.request_ns!=previous.request_ns ||
-       next.width!=previous.width ||
-       next.height!=previous.height) return;
-    auto retain=[&](void* surface,int32_t layer,int texture_width,int texture_height) {
+    if(next.width!=previous.width || next.height!=previous.height) return;
+    const bool same_request=next.request_ns==previous.request_ns;
+    auto retain=[&](void* surface,int32_t layer,int texture_width,int texture_height,bool starting) {
         if(!surface || layer<0 || layer==next.layer || layer==next.unwarped_layer ||
            std::any_of(next.companions.begin(),next.companions.end(),
                [&](const Companion& item) {return item.layer==layer;})) return;
-        next.companions.push_back({surface,layer,texture_width,texture_height});
+        next.companions.push_back({surface,layer,texture_width,texture_height,starting});
         g_inc_strong(surface,&next);
     };
     for(const auto& item:previous.companions)
-        retain(item.surface,item.layer,item.texture_width,item.texture_height);
-    retain(previous.surface,previous.layer,previous.texture_width,previous.texture_height);
+        if(same_request || item.starting)
+            retain(item.surface,item.layer,item.texture_width,item.texture_height,item.starting);
+    // A composed output has its own visibility owner. Carrying it as an
+    // ordinary preview loses its masked-retirement contract and can clear SELF
+    // while a newer group is visible. The bridge hides it on group replacement.
+    if(previous.unwarped_layer<0 && (same_request || previous.starting))
+        retain(previous.surface,previous.layer,previous.texture_width,previous.texture_height,previous.starting);
     std::sort(next.companions.begin(),next.companions.end(),
         [](const Companion& a,const Companion& b) {return a.layer<b.layer;});
 }
@@ -472,6 +481,8 @@ void AdoptCommand(Controller& controller) {
         if (next->request_ns<current.request_ns) return;
         current.request_ns=next->request_ns;
         current.cancel_ns=next->cancel_ns;
+        current.starting=next->starting;
+        current.unwarped_layer=next->unwarped_layer;
         if(next->primed_continuation) {
             // Adopt the exact state already published with the parent viewport.
             // Replaying a fresh endpoint for one transaction causes a flash
@@ -679,7 +690,10 @@ void FrameCurrent(Controller& controller,int64_t frame_time) {
     // A minimized shader is still the visible silhouette. Clearing it as soon
     // as springs settle exposes the rectangular backing canvas before SF has
     // removed/faded the task. Keep it until platform ownership ends.
-    if (!session.closing && !session.starting && session.animation.Settled() && corner_settled)
+    // A composed output remains visible until the bridge restores its source.
+    // Its host has no OEM mask, so it needs SELF even after opening settles.
+    if (!session.closing && !session.starting && session.unwarped_layer<0 &&
+        session.animation.Settled() && corner_settled)
         Finish(controller, "settled");
     else if (elapsed >= 1.5) Finish(controller, "deadline");
 }
@@ -851,7 +865,7 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
         const int32_t layer=g_layer_id(overlay);
         if(layer!=next->layer && layer!=next->unwarped_layer && std::none_of(next->companions.begin(),next->companions.end(),
             [&](const Companion& existing) {return existing.layer==layer;})) {
-            next->companions.push_back({overlay,layer});
+            next->companions.push_back({overlay,layer,0,0,true});
             g_inc_strong(overlay,next.get());
         }
     }
@@ -868,9 +882,9 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     // Initial transaction construction/publication and worker writes share one
     // lock. A frame cannot retire an old session after its successor is primed.
     std::unique_lock<std::mutex> lock(controller->mutex);
-    if(linked_icon && (controller->stop_requested ||
+    if((linked_icon && controller->stop_requested) ||
        std::find(controller->retired_requests.begin(),controller->retired_requests.end(),event_ns)!=
-           controller->retired_requests.end())) return false;
+           controller->retired_requests.end()) return false;
     Session* previous=nullptr;
     auto inspect=[&](const std::unique_ptr<Session>& session) {
         if(session && Related(*session,*next) && (!previous ||
@@ -881,6 +895,8 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     inspect(controller->active);inspect(controller->pending);
     for(const auto& session:controller->overlapping) inspect(session);
     for(const auto& session:controller->queued) inspect(session);
+    if(previous && previous->layer==next->layer && next->unwarped_layer<0)
+        next->unwarped_layer=previous->unwarped_layer;
     if(linked_icon && previous) {
         // A content publication may have won the race while this provisional
         // icon was built. Join that owner instead of replacing its App buffer.
@@ -1178,6 +1194,22 @@ Java_ng_lst_hha_ContentAnimator_nativeAttach(JNIEnv*,jclass,jlong transaction,jl
         parent,width,height,event_ns)?JNI_TRUE:JNI_FALSE;
 }
 
+extern "C" JNIEXPORT jboolean JNICALL
+Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(JNIEnv*,jclass,jlong transaction,jlong surface) {
+    auto* controller=g_controller.load(std::memory_order_acquire);
+    if(!controller || !transaction || !surface) return JNI_FALSE;
+    std::lock_guard<std::mutex> lock(controller->mutex);
+    void* control=reinterpret_cast<void*>(static_cast<uintptr_t>(surface));
+    const int layer=g_layer_id(control);
+    auto owns=[&](const std::unique_ptr<Session>& session) {return session && Owns(*session,layer);};
+    if(owns(controller->active) || owns(controller->pending) ||
+       std::any_of(controller->queued.begin(),controller->queued.end(),owns) ||
+       std::any_of(controller->overlapping.begin(),controller->overlapping.end(),owns) ||
+       std::any_of(controller->retiring.begin(),controller->retiring.end(),owns)) return JNI_FALSE;
+    ClearSurface(reinterpret_cast<ASurfaceTransaction*>(static_cast<uintptr_t>(transaction)),control);
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_ng_lst_hha_ContentAnimator_nativeStopRequest(JNIEnv*,jclass,jlong parent,jlong event_ns) {
     if(parent<=0 || parent>INT32_MAX) return;
@@ -1254,8 +1286,10 @@ void CancelIconRenderer(RenderIdentity identity) {
     if(auto* controller=g_controller.load(std::memory_order_acquire)) {
         std::lock_guard<std::mutex> lock(controller->mutex);
         auto stop=[&](const std::unique_ptr<Session>& session) {
-            if(session && SameRender(identity,{session->parent_layer,session->request_ns}))
+            if(session && SameRender(identity,{session->parent_layer,session->request_ns})) {
+                RememberRetired(*controller,session->request_ns);
                 session->cancel_ns=NowNs()+48000000LL;
+            }
         };
         stop(controller->active);stop(controller->pending);
         for(const auto& session:controller->overlapping) stop(session);

@@ -223,7 +223,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     if (type!=2 && !(adjust && type==-1 && adjust_type==1 && cached.valid)) return;
     if(Fixed(parameters,"isNoSourceAnim")!=0 || Fixed(parameters,"bigIcon")!=0) return;
     // Match SF's target-ID ordering before assigning a new local timestamp.
-    if (adjust && cached.valid && !cached.supported) return;
+    const bool continuing=adjust && cached.valid && cached.supported;
     if (adjust && cached.valid && animation_id<=cached.animation_id) return;
     const Config config = ReadConfig();
     if (!config.enabled || !config.content) {
@@ -310,7 +310,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         previous->host_velocity={x.velocity,y.velocity,w.velocity};
         previous->host_delay={x.delay,y.delay,w.delay};
         previous->host_transaction_id=0;
-        previous->adjusting=adjust && cached.valid;
+        previous->adjusting=continuing;
         previous->transition=request;
         previous->animation_id=animation_id;
         previous->valid=true;
@@ -326,7 +326,9 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     // Pre-start's exact preview is primed in the same Launcher transaction
     // before the custom viewport. The restricted prepare RPC publishes this
     // geometry to the central worker without taking the WM lock.
-    if(!adjust && (request.task_id>=0 ||
+    // A rejected initial publication may become ready before a later adjust.
+    // Retry its first-frame proof instead of permanently leaving it on stock.
+    if(!continuing && (request.task_id>=0 ||
        (g_name && g_name(control).find("Pre startup opening leash")==0))) return;
     hha::QueueTransition(request);
 }
@@ -421,8 +423,8 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         const hha::genie::Rect icon{geometry[small],geometry[small+1],geometry[small+2],geometry[small+3]};
         hha::genie::Rect window=snapshot.window.width>0?snapshot.window:
             hha::genie::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
-        if(!is_icon && !snapshot.adjusting && g_name &&
-           g_name(control).find("Pre startup opening leash")==0) {
+        const bool prestart=g_name && g_name(control).find("Pre startup opening leash")==0;
+        if(!is_icon && !snapshot.adjusting && !snapshot.transition.closing && prestart) {
             if(!hha::PrepareOpeningPreview(transaction,const_cast<void*>(control),
                 static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition)) {
                 std::lock_guard<std::mutex> lock(g_mutex);
@@ -434,8 +436,9 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             // Also arm the launcher's existing runtime-disable watchdog. The
             // server retains any stronger Task anchor established meanwhile.
             hha::QueueTransition(snapshot.transition);
-        }
-        if(!is_icon && !snapshot.adjusting && snapshot.transition.task_id>=0) {
+        } else if(!is_icon && !snapshot.adjusting && (snapshot.transition.task_id>=0 || prestart)) {
+            // Pre-start closes require a verified Task group too. An absent
+            // anchor must reject preparation before any host viewport changes.
             if(!hha::PrepareContentGroup(transaction,const_cast<void*>(control),&window,snapshot.transition)) {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 for(auto& source:g_last) if(source.valid &&

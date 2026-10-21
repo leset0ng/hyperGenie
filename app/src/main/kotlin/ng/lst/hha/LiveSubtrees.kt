@@ -30,6 +30,8 @@ internal class LiveSubtrees(
     private val listenerType = Class.forName("android.view.SurfaceControl\$TransactionCommittedListener")
     private val copySurface = sc.getConstructor(sc, String::class.java)
     private val surfaceLock = sc.getDeclaredField("mLock").apply { isAccessible = true }
+    private val nativeObject = sc.getDeclaredField("mNativeObject").apply { isAccessible = true }
+    private val transactionObject = transactionType.getDeclaredField("mNativeObject").apply { isAccessible = true }
     private val validSurface = sc.getMethod("isValid")
     private val surfaceLayer = sc.getMethod("getLayerId")
     private val releaseSurface = sc.getMethod("release")
@@ -183,6 +185,13 @@ internal class LiveSubtrees(
     fun guard(transaction: Any, sourceLayer: Int): Boolean = synchronized(lock) {
         val record = records[sourceLayer] ?: return@synchronized false
         if (closed || record.retired) return@synchronized false
+        if (record.active && !record.activeCommitted) {
+            // Activation belongs to a borrowed Launcher host transaction. A
+            // concurrent WMS show may guard the source, but cannot reveal the
+            // output before that host geometry reaches SF.
+            hide.invoke(transaction, record.hideTarget)
+            return@synchronized true
+        }
         publication(record, transaction, active = record.active, guarded = true)
     }
 
@@ -195,6 +204,10 @@ internal class LiveSubtrees(
         val record = records.values.lastOrNull {
             !it.retired && it.hideLayer == hideTargetLayer && (it.active || it.guarded)
         } ?: return@synchronized false
+        if (record.active && !record.activeCommitted) {
+            hide.invoke(transaction, record.hideTarget)
+            return@synchronized true
+        }
         publication(record, transaction, record.active, record.guarded)
     }
 
@@ -203,6 +216,14 @@ internal class LiveSubtrees(
         val record = entry.record
         if (!entry.valid() || closed || records[entry.sourceLayer] !== record ||
             record.retired || !record.bufferReady) return@synchronized false
+        // A recreated WindowState can produce a new source for the same Task
+        // while the previous group is still animating. Retire its visibility
+        // in this publication, before the new output is revealed.
+        for (previous in records.values) {
+            if (previous !== record && !previous.retired && previous.task === record.task &&
+                (previous.active || previous.guarded) &&
+                !publication(previous, transaction, active = false, guarded = false)) return@synchronized false
+        }
         publication(record, transaction, active = true, guarded = false)
     }
 
@@ -317,6 +338,7 @@ internal class LiveSubtrees(
         val outputCopy = record.output?.let { retain(it, "HHA.subtree.publication.output") }
         val serial = ++record.visibilitySerial
         record.active = active
+        if (active) record.activeCommitted = false
         record.guarded = guarded
         record.touched = true
         try {
@@ -326,7 +348,11 @@ internal class LiveSubtrees(
                         val stale = synchronized(lock) {
                             if (record.retired || records[record.sourceLayer] !== record ||
                                 record.visibilitySerial != serial) true
-                            else { if (!record.active && !record.guarded) record.touched = false; false }
+                            else {
+                                record.activeCommitted = active
+                                if (!record.active && !record.guarded) record.touched = false
+                                false
+                            }
                         }
                         if (stale) repair(record, hideCopy, outputCopy)
                     } finally { release(hideCopy); release(outputCopy) }
@@ -348,7 +374,15 @@ internal class LiveSubtrees(
         return try {
             if (active || guarded) hide.invoke(transaction, record.hideTarget)
             else show.invoke(transaction, record.hideTarget)
-            record.output?.let { if (active) show.invoke(transaction, it) else hide.invoke(transaction, it) }
+            record.output?.let {
+                if (active) show.invoke(transaction, it)
+                else {
+                    hide.invoke(transaction, it)
+                    if (!guarded) synchronized(checkNotNull(surfaceLock.get(it))) {
+                        ContentAnimator.clearRetiredGroup(transactionObject.getLong(transaction), nativeObject.getLong(it))
+                    }
+                }
+            }
             true
         } catch (error: Throwable) {
             ++record.visibilitySerial // Any partially appended transaction now requires commit repair.
@@ -361,13 +395,14 @@ internal class LiveSubtrees(
     }
 
     /** Correct only our own visibility changes; never reparent a source or clear another group's effect. */
-    private fun repair(record: Record, hideTarget: Any, oldOutput: Any?) {
-        val desired = synchronized(lock) {
-            val owner = records.values.lastOrNull {
-                !it.retired && it.hideLayer == record.hideLayer && (it.active || it.guarded)
-            }
-            (owner != null) to (owner === record && record.active)
+    private fun repair(record: Record, hideTarget: Any, oldOutput: Any?) = synchronized(lock) {
+        val owner = records.values.lastOrNull {
+            !it.retired && it.hideLayer == record.hideLayer && (it.active || it.guarded)
         }
+        // Neither reveal nor hide over a borrowed host activation. Its commit
+        // establishes visibility; a stale cleanup transaction cannot order it.
+        if (owner === record && record.active && !record.activeCommitted) return@synchronized
+        val desired = (owner != null) to (owner === record && record.active && record.activeCommitted)
         runCatching {
             ownedTransaction { transaction ->
                 if (valid(hideTarget)) {
@@ -504,6 +539,7 @@ internal class LiveSubtrees(
         var destroyed = false
         var bufferReady = false
         var active = false
+        var activeCommitted = false
         var guarded = false
         var touched = false
         var visibilitySerial = 0L
