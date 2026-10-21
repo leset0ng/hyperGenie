@@ -43,6 +43,13 @@ void RetainIconSurface(void* surface,const void* owner);
 void ReleaseIconSurface(void* surface,const void* owner);
 // The first icon shader is appended to the launcher's own host transaction.
 // Subsequent vsync writes wait for that transaction's on-commit callback.
+// One publication in the supplied first-show transaction. The server owns
+// subsequent preview frames and retirement, so this creates no icon session.
+bool PrimeOpeningPreview(void* transaction,void* surface,void* parent,int width,int height,
+                         const Transition& transition);
+// Resolve only an authenticated OEM preview, without any WMS lookup/wait.
+bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
+                           const Transition& transition);
 bool RenderIcon(void* transaction,void* surface,void* parent,int texture_width,int texture_height,
                 int window_width,int window_height,const Transition& transition);
 void CancelIconRenderer();

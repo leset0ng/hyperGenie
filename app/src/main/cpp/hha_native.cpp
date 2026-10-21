@@ -214,10 +214,11 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     if (type!=2 && !(adjust && type==-1 && adjust_type==1 && cached.valid)) return;
     if(Fixed(parameters,"isNoSourceAnim")!=0 || Fixed(parameters,"bigIcon")!=0) return;
     // Match SF's target-ID ordering before assigning a new local timestamp.
+    if (adjust && cached.valid && !cached.supported) return;
     if (adjust && cached.valid && animation_id<=cached.animation_id) return;
     const Config config = ReadConfig();
     if (!config.enabled || !config.content) {
-        hha::QueueCancel(id,Now());
+        hha::QueueCancel(-1,Now());
         hha::CancelIconRenderer();
         return;
     }
@@ -303,6 +304,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         previous->transition=request;
         previous->animation_id=animation_id;
         previous->valid=true;
+        previous->supported=true;
     }
     if (config.verbose) {
         __android_log_print(ANDROID_LOG_INFO,kTag,
@@ -311,9 +313,10 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
             request.geometry[0],request.geometry[1],w.start,h.start,
             request.geometry[4],request.geometry[5],w.end,h.end,x.velocity,y.velocity);
     }
-    // A pre-start surface has no Task identity yet. Its reparent hook forwards
-    // this immutable request as soon as Shell supplies the actual Task leash.
-    if(request.task_id<0 && g_name && g_name(control).find("Pre startup opening leash")==0) return;
+    // Pre-start's exact preview is primed in the same Launcher transaction
+    // before the custom viewport. The restricted prepare RPC publishes this
+    // geometry to the central worker without taking the WM lock.
+    if(!adjust && g_name && g_name(control).find("Pre startup opening leash")==0) return;
     hha::QueueTransition(request);
 }
 void SetSpring(const void* parameters,const char* key,float start,float end) {
@@ -380,7 +383,7 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 }
             }
         }
-        if(!snapshot.valid) return;
+        if(!snapshot.valid || !snapshot.supported) return;
         const auto& geometry=snapshot.transition.geometry;
         const size_t small=snapshot.transition.closing?4:0;
         const size_t full=snapshot.transition.closing?0:4;
@@ -389,6 +392,20 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             hha::genie::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
         hha::genie::Rect minimized;
         if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) return;
+        if(!is_icon && !snapshot.adjusting && g_name &&
+           g_name(control).find("Pre startup opening leash")==0) {
+            if(!hha::PrepareOpeningPreview(transaction,const_cast<void*>(control),
+                static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition)) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(auto& source:g_last) if(source.valid &&
+                    source.transition.event_ns==snapshot.transition.event_ns &&
+                    source.transition.leash_layer==snapshot.transition.leash_layer) source.supported=false;
+                return;
+            }
+            // Also arm the launcher's existing runtime-disable watchdog. The
+            // server retains any stronger Task anchor established meanwhile.
+            hha::QueueTransition(snapshot.transition);
+        }
         if(is_icon) {
             bool rendering=false;
             std::lock_guard<std::mutex> lock(g_mutex);
@@ -464,8 +481,8 @@ void* Reparent(void* transaction,const void* child,const void* parent) {
                     std::lock_guard<std::mutex> lock(g_mutex);
                     g_anchors[g_next_anchor++%g_anchors.size()]={parent_id,anchor.container,anchor.task};
                     for(auto& last:g_last) {
-                        if(last.valid && last.transition.leash_layer==parent_id &&
-                           Now()-last.transition.event_ns<500000000LL) {
+                        if(last.valid && last.supported && last.transition.leash_layer==parent_id &&
+                           Now()-last.transition.event_ns<1500000000LL) {
                             last.transition.container_layer=anchor.container;
                             last.transition.task_id=anchor.task;
                             updated=last.transition;

@@ -9,6 +9,8 @@ import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
 import java.util.function.Supplier
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * Keeps task snapshots pristine while the central renderer deforms App content.
@@ -35,7 +37,7 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
      * Locks have process lifetime so removing an idle entry cannot create two
      * different locks for the same Task during an in-flight capture.
      */
-    private class State { var blocked = false }
+    private class State { val lock = ReentrantLock(); var blocked = false; var ownerNs = 0L }
 
     fun install() {
         check(!closed && hooks.isEmpty())
@@ -60,7 +62,7 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
                     }
                     val id = taskIdField.getInt(source)
                     val state = states.getOrPut(id) { State() }
-                    synchronized(state) {
+                    state.lock.withLock {
                         if (!closed && state.blocked) {
                             report(Log.DEBUG, "skip capture task=$id while content is deformed")
                             null
@@ -81,7 +83,7 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
                     if (closed || source == null) return@intercept chain.proceed()
                     val id = taskIdField.getInt(source)
                     val state = states.getOrPut(id) { State() }
-                    val blocked = synchronized(state) { !closed && state.blocked }
+                    val blocked = state.lock.withLock { !closed && state.blocked }
                     if (blocked) {
                         report(Log.DEBUG, "keep cached snapshot task=$id while content is deformed")
                         null
@@ -100,18 +102,36 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
     }
 
     /** May wait for an existing pristine capture; returns before effects attach. */
-    fun block(taskId: Int) {
-        if (taskId < 0 || closed) return
+    fun block(taskId: Int, ownerNs: Long): Boolean {
+        if (taskId < 0 || ownerNs <= 0 || closed) return false
         val state = states.getOrPut(taskId) { State() }
-        synchronized(state) {
-            if (!closed) state.blocked = true
+        return state.lock.withLock {
+            if (closed || ownerNs < state.ownerNs) false else {
+                state.ownerNs = ownerNs
+                state.blocked = true
+                true
+            }
         }
     }
 
-    /** Caller must have confirmed detachment and checked its own generation. */
-    fun unblock(taskId: Int) {
+    /** First-show hooks must not wait for an in-flight screenshot under WMS. */
+    fun tryBlock(taskId: Int, ownerNs: Long): Boolean {
+        if (taskId < 0 || ownerNs <= 0 || closed) return false
+        val state = states.getOrPut(taskId) { State() }
+        if (!state.lock.tryLock()) return false
+        return try {
+            if (closed || ownerNs < state.ownerNs) false else {
+                state.ownerNs = ownerNs
+                state.blocked = true
+                true
+            }
+        } finally { state.lock.unlock() }
+    }
+
+    /** An old release cannot unblock a later first-show publication. */
+    fun unblock(taskId: Int, ownerNs: Long) {
         val state = states[taskId] ?: return
-        synchronized(state) { state.blocked = false }
+        state.lock.withLock { if (state.ownerNs == ownerNs) state.blocked = false }
     }
 
     /**
@@ -130,7 +150,7 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
             val globalLock = members.value(service, "mGlobalLock") ?: return false
             val supplier: Supplier<*> = synchronized(globalLock) {
                 val state = states.getOrPut(taskId) { State() }
-                synchronized(state) {
+                state.lock.withLock {
                     if (closed || state.blocked) return false
                     val root = members.value(service, "mRoot") ?: return false
                     val task = members.method(root, "anyTaskForId", Int::class.javaPrimitiveType!!,
@@ -187,7 +207,7 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
         closed = true
         hooks.asReversed().forEach { handle -> runCatching { handle.unhook() } }
         hooks.clear()
-        states.values.forEach { state -> synchronized(state) { state.blocked = false } }
+        states.values.forEach { state -> state.lock.withLock { state.blocked = false } }
     }
 
     private fun report(priority: Int, message: String, error: Throwable? = null) {

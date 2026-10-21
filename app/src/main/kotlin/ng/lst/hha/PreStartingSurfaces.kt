@@ -13,7 +13,18 @@ import java.util.concurrent.locks.ReentrantLock
 
 /** Copies only OEM previews whose local domain matches the selected fullscreen window. */
 @SuppressLint("PrivateApi", "BlockedPrivateApi", "SoonBlockedPrivateApi")
-internal class PreStartingSurfaces(private val module: XposedModule, private val loader: ClassLoader) : AutoCloseable {
+internal class PreStartingSurfaces(
+    private val module: XposedModule,
+    private val loader: ClassLoader,
+    private val onChanged: () -> Unit = {},
+) : AutoCloseable {
+    /** Independently owned copies; neither object is borrowed from an OEM registry. */
+    data class Preview(val surface: Any, val parent: Any, val width: Int, val height: Int) : AutoCloseable {
+        override fun close() {
+            runCatching { surface.javaClass.getMethod("release").invoke(surface) }
+            runCatching { parent.javaClass.getMethod("release").invoke(parent) }
+        }
+    }
     /** The caller must retry without retiring its currently attached content. */
     class Busy : RuntimeException()
 
@@ -28,12 +39,39 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
     private val surfaceLock = surfaceClass.getDeclaredField("mLock").apply { isAccessible = true }
     private val managerFactory = factory("com.android.server.wm.PreStartingManager")
     private val controllerFactory = factory("com.android.server.wm.PreStartupAnimationController")
-    private var manager: Any? = null
-    private var controller: Any? = null
+    private val controllerInstance = runCatching {
+        controllerFactory?.declaringClass?.getDeclaredField("sInstance")?.apply { isAccessible = true }
+    }.getOrNull()
+    @Volatile private var manager: Any? = null
+    @Volatile private var controller: Any? = null
     private var drawHook: HookHandle? = null
-    private val drawDomains = LinkedHashMap<Int, Rect>()
+    private var optionsHook: HookHandle? = null
+    private val launchTokens = ConcurrentHashMap<Any, Long>()
 
     fun install() {
+        // WMS consumes mPendingRemoteTransition before some manager previews
+        // show. Retain its exact token at the assignment event, not by package.
+        runCatching {
+            val activity = Class.forName("com.android.server.wm.ActivityRecord", false, loader)
+            val options = activity.declaredMethods.single { it.name == "setOptions" && it.parameterCount == 1 }
+            optionsHook = module.hook(options)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId("prestarting-activity-transition-token")
+                .intercept { chain ->
+                    val owner = chain.thisObject
+                    val argument = chain.getArg(0)
+                    val remote = argument?.let { members.call(it, "getRemoteTransition") }
+                    val token = remote?.let { members.call(it, "getHyperToken") as? Long }
+                    val result = chain.proceed()
+                    if (owner != null) {
+                        if (token != null && token != 0L) {
+                            launchTokens[owner] = token
+                            while (launchTokens.size > MAX_DRAW_DOMAINS) launchTokens.remove(launchTokens.keys.first())
+                        } else launchTokens.remove(owner)
+                    }
+                    result
+                }
+        }.onFailure { module.log(Log.WARN, TAG, "early Activity transition observer unavailable", it) }
         // SC builder dimensions alone do not prove the opening snapshot's
         // domain: this OEM draw can subsequently rotate and scale its buffer.
         runCatching {
@@ -62,7 +100,7 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
                     if (layer != null) synchronized(drawDomains) { drawDomains.remove(layer) }
                     val result = chain.proceed()
                     if (aligned && surface != null && bounds != null && layer != null) {
-                        synchronized(surfaceLock.get(surface)) {
+                        synchronized(checkNotNull(surfaceLock.get(surface))) {
                             if (surfaceValid.invoke(surface) == true) synchronized(drawDomains) {
                                 drawDomains[layer] = bounds
                                 while (drawDomains.size > MAX_DRAW_DOMAINS) {
@@ -71,6 +109,9 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
                             }
                         }
                     }
+                    // Notify after releasing SC/domain locks. The callback only
+                    // wakes the bridge worker; it must not run a WMS lookup here.
+                    runCatching { onChanged() }
                     result
                 }
         }.onFailure {
@@ -82,6 +123,92 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
     fun prepare() {
         manager = managerFactory?.invoke(null)
         controller = controllerFactory?.invoke(null)
+    }
+
+    /** Bind an early request using the OEM's exact remote-transition token. */
+    fun matchesOpening(activity: Any, leash: Int, width: Int, height: Int): Boolean {
+        val remote = members.field(activity, "mPendingRemoteTransition")
+        val token = remote?.let { members.call(it, "getHyperToken") as? Long }
+            ?: launchTokens[activity] ?: return false
+        if (token == 0L) return false
+        val task = members.call(activity, "getTask") ?: return false
+        val frame = Rect(0, 0, width, height)
+        val display = identityDisplay(activity, task, frame, width, height) ?: return false
+        val animations = controller?.let { members.call(it, "getAnimations") } as? Map<*, *> ?: return false
+        val animation = animations[token] ?: return false
+        return members.field(animation, "mDisplayContent") === display &&
+            members.call(animation, "getUserId") == members.field(activity, "mUserId") &&
+            members.call(animation, "isParallel") == false && openingChange(animation, leash, frame) != null
+    }
+
+    /** Called outside WMS/manager locks, before a Task anchor exists. */
+    fun opening(leash: Int, width: Int, height: Int): Preview? {
+        if (leash < 0 || width <= 0 || height <= width) return null
+        // Initialization may finish after renderer warmup. Read the OEM's
+        // volatile singleton directly; never acquire its class/WMS monitor in
+        // the synchronous pre-start capability endpoint.
+        if (controller == null) controller = controllerInstance?.get(null)
+        if (controller == null) return null
+        val animations = controller?.let { members.call(it, "getAnimations") } as? Map<*, *>
+            ?: return null
+        val matches = animations.values.filterNotNull().filter { animation ->
+            val parent = members.field(animation, "mOpeningLeash")
+            parent != null && runCatching { layer(parent) == leash }.getOrDefault(false)
+        }
+        val animation = matches.singleOrNull() ?: return null
+        val frame = Rect(0, 0, width, height)
+        val display = members.field(animation, "mDisplayContent") ?: return null
+        if (members.call(display, "getRotation") != 0 ||
+            members.call(display, "getBounds") != frame ||
+            members.call(animation, "isParallel") != false) return null
+        val source = alignedOpening(animation, leash, frame) ?: return null
+        val parent = members.field(animation, "mOpeningLeash") ?: return null
+        val copies = ArrayList<Any>(1)
+        var parentCopy: Any? = null
+        try {
+            addCopy(source, width, height, false, mutableSetOf(), copies)
+            val surfaceCopy = copies.singleOrNull() ?: return null
+            synchronized(checkNotNull(surfaceLock.get(parent))) {
+                if (surfaceValid.invoke(parent) != true || surfaceLayer.invoke(parent) != leash) return null
+                parentCopy = copySurface.newInstance(parent, "HHA.central.prestarting.parent")
+            }
+            return Preview(surfaceCopy, checkNotNull(parentCopy), width, height).also {
+                copies.clear()
+                parentCopy = null
+            }
+        } finally {
+            copies.forEach(::release)
+            parentCopy?.let(::release)
+        }
+    }
+
+    /** Exact opening ownership and identity-domain proof, shared by both lookup paths. */
+    private fun openingChange(animation: Any, leash: Int, frame: Rect?): Any? {
+        if (frame == null) return null
+        val info = members.field(animation, "mTransitionInfo") ?: return null
+        val changes = members.call(info, "getChanges") as? List<*> ?: return null
+        val opening = changes.filterNotNull().singleOrNull { change ->
+            val control = members.call(change, "getLeash")
+            control != null && runCatching { layer(control) == leash }.getOrDefault(false)
+        } ?: return null
+        return opening.takeIf {
+            members.call(opening, "getStartRotation") == 0 &&
+                members.call(opening, "getEndRotation") == 0 &&
+                members.call(opening, "getStartAbsBounds") == frame &&
+                members.call(opening, "getEndAbsBounds") == frame
+        }
+    }
+
+    private fun alignedOpening(animation: Any, leash: Int, frame: Rect?): Any? {
+        openingChange(animation, leash, frame) ?: return null
+        val surface = members.call(animation, "getPreStartingSurface") ?: return null
+        val type = members.call(animation, "getPreStartingType")
+        // Snapshot may rotate or scale its SC after allocation. Splash paints
+        // a full-size Canvas and rotates only the pixels inside that domain.
+        return surface.takeIf {
+            type == PRESTART_SPLASH ||
+                (type == PRESTART_SNAPSHOT && observedDomain(layer(surface)) == frame)
+        }
     }
 
     /** Caller holds WMS.mGlobalLock. Returned surfaces are exclusively owned copies. */
@@ -126,32 +253,7 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
             val animation = matches.singleOrNull()
             if (animation != null && members.field(animation, "mDisplayContent") === display &&
                 members.call(animation, "isParallel") == false) {
-                val info = members.field(animation, "mTransitionInfo")
-                val changes = info?.let { members.call(it, "getChanges") } as? List<*>
-                val opening = changes?.filterNotNull()?.singleOrNull { change ->
-                    val control = members.call(change, "getLeash")
-                    control != null && runCatching { layer(control) == leash }.getOrDefault(false)
-                }
-                if (opening != null && members.call(opening, "getStartRotation") == 0 &&
-                    members.call(opening, "getEndRotation") == 0 &&
-                    members.call(opening, "getStartAbsBounds") == frame &&
-                    members.call(opening, "getEndAbsBounds") == frame) {
-                    val surface = members.call(animation, "getPreStartingSurface")
-                    val type = members.call(animation, "getPreStartingType")
-                    val observed = surface?.let { source ->
-                        runCatching {
-                            val sourceLayer = layer(source)
-                            synchronized(drawDomains) { drawDomains[sourceLayer]?.let(::Rect) }
-                        }.getOrNull()
-                    }
-                    // OEM type 1 posts a TaskSnapshot and may change the SC
-                    // scale/rotation, so require its observed identity domain.
-                    // Type 2 paints Splash pixels into a full-sized Canvas;
-                    // bitmap rotation does not change the SurfaceControl domain.
-                    if (type == PRESTART_SPLASH || (type == PRESTART_SNAPSHOT && observed == frame)) {
-                        addCopy(surface, width, height, false, seen, owned)
-                    }
-                }
+                addCopy(alignedOpening(animation, leash, frame), width, height, false, seen, owned)
             }
             return owned
         } catch (error: Throwable) {
@@ -183,7 +285,7 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
     private fun addCopy(source: Any?, width: Int, height: Int, color: Boolean,
                         seen: MutableSet<Int>, owned: MutableList<Any>) {
         if (source == null) return
-        synchronized(surfaceLock.get(source)) {
+        synchronized(checkNotNull(surfaceLock.get(source))) {
             if (surfaceValid.invoke(source) != true) return
             val layer = surfaceLayer.invoke(source) as Int
             if (layer < 0 || layer in seen) return
@@ -202,7 +304,7 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
         }
     }
 
-    private fun layer(surface: Any): Int = synchronized(surfaceLock.get(surface)) {
+    private fun layer(surface: Any): Int = synchronized(checkNotNull(surfaceLock.get(surface))) {
         if (surfaceValid.invoke(surface) == true) surfaceLayer.invoke(surface) as Int else -1
     }
 
@@ -210,6 +312,9 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
 
     override fun close() {
         runCatching { drawHook?.unhook() }
+        runCatching { optionsHook?.unhook() }
+        optionsHook = null
+        launchTokens.clear()
         drawHook = null
         synchronized(drawDomains) { drawDomains.clear() }
     }
@@ -240,10 +345,16 @@ internal class PreStartingSurfaces(private val module: XposedModule, private val
         }
     }
 
-    private companion object {
-        const val TAG = "HHA.PreStarting"
-        const val PRESTART_SNAPSHOT = 1
-        const val PRESTART_SPLASH = 2
-        const val MAX_DRAW_DOMAINS = 64
+    companion object {
+        private const val TAG = "HHA.PreStarting"
+        private const val PRESTART_SNAPSHOT = 1
+        private const val PRESTART_SPLASH = 2
+        private const val MAX_DRAW_DOMAINS = 64
+        private val drawDomains = LinkedHashMap<Int, Rect>()
+
+        /** Shared with show observers; only the completed Snapshot draw can publish proof. */
+        fun observedDomain(layer: Int): Rect? = synchronized(drawDomains) {
+            drawDomains[layer]?.let(::Rect)
+        }
     }
 }

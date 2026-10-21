@@ -38,6 +38,8 @@ shadow guard produced a dark exterior. Detachment clears the effect and border
 together. Initial publication, frame
 writes and retirement share one controller lock. Replacements keep shared
 primary/companion layers, and icon stops match both parent and request epoch.
+Different App/icon streams keep independent overlapping sessions. A superseded
+closing silhouette stays protected through its existing retirement deadline.
 Superseded primed transactions remain owned until commit and cleanup; snapshot
 capture waits for every detach completion. The destination's tall virtual
 crop remains separate from the square icon's sampled source footprint, so the
@@ -56,11 +58,13 @@ Native-only launcher
   start / adjust / stopSFAnimation hooks
   -> actual icon/window endpoints + generation ordering
   -> pre-start reparent correlates Shell leash with actual Task SC
-  -> asynchronous authenticated Binder geometry request
+  -> exact pre-start preview capability -> shader in initial host transaction
+  -> asynchronous authenticated Binder geometry/Task updates
 
 system_server: WMS.onTransact
   -> authenticate launcher, validate protocol, post worker
   -> under WMS lock: match trusted Task/container and copy BLAST controls
+  -> surface creation/draw/show events, with first-state writes in show transactions
   -> outside WMS lock: native display-event worker
   -> 19 springs -> SELF mesh on App + aligned starting content
   -> handoff / reverse / clear and release
@@ -92,7 +96,7 @@ On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
 controller in an isolated executable with fake surface capabilities and empty
 SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
 commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 677 checks; `ADB_SERIAL` selects a device. It does not
+The current suite passes 1,221 checks; `ADB_SERIAL` selects a device. It does not
 install the module or touch
 real App layers.
 
@@ -123,11 +127,12 @@ app/src/main/
 │   ├── HookEntry.kt          # system_server module entry
 │   ├── CentralBridge.kt      # authenticated lookup, ownership and lifecycle
 │   ├── PreStartingSurfaces.kt # owned OEM preview copies and domain checks
+│   ├── SurfaceEvents.kt      # first-show transactions and lifecycle wakeups
 │   ├── SnapshotGuard.kt      # prevent snapshots of deformed Task content
 │   └── ContentAnimator.kt    # central JNI boundary
 ├── cpp/
 │   ├── hha_native.cpp        # launcher event/geometry correlation
-│   ├── hha_bridge.h/.cpp     # asynchronous Binder dispatcher
+│   ├── hha_bridge.h/.cpp     # authenticated preview preparation and async updates
 │   ├── hha_content.cpp       # SELF renderer, vsync, handoff and retarget
 │   ├── hha_genie.h/.cpp      # recovered geometry and oscillator model
 │   └── hha_viewport.h        # uniform host and mesh contour adaptation
@@ -140,8 +145,8 @@ app/src/main/
 
 ## Validation status
 
-The current build passes Android assembly/lint, 781 native geometry checks and
-677 isolated checks of the actual renderer. Sampled Settings/Calculator
+The current build passes Android assembly/lint, 784 native geometry checks and
+1,221 isolated checks of the actual renderer. Sampled Settings/Calculator
 transitions verify content access, composition and cleanup; these checks do not
 establish complete visual fidelity. The earlier positive-shadow CLIENT guard
 caused a visible dark exterior and has been replaced by a fully transparent
@@ -162,11 +167,29 @@ loss after attachment across 14 sampled preview layers and no shadow draw
 scopes; core processes and the crash buffer remained unchanged. The user
 reports ordinary opening now looks correct.
 
-**Cold launches and rapid switching between Apps still have visible issues.**
-Some preview layers are drawn for one to three samples before central takeover;
-current validation does not establish an atomic cold-launch or cross-App first
-frame. These paths remain follow-up work. See
-[the composition fix and evidence](docs/client-composition-fix.md).
+Cold startup and rapid switching now use event-driven content discovery rather
+than 16/50ms polling. Standard App/starting buffers are protected at creation,
+client attachment and first layout, before an already-shown container can
+expose the producer's first buffer. Client attach also appends SELF to the real
+pending/sync publication transactions; ordinary show and manager-preview
+hooks reinforce their actual show transaction. Early effect-only transactions
+are owned by the bridge, while borrowed platform transactions are only appended.
+The independent OEM
+pre-start preview is resolved by exact ownership through a restricted capability
+request, then primed in the launcher's first host transaction before stock
+cropping is removed. That request never takes the WM lock or waits for rendering;
+ordinary App capabilities remain server-only. An unavailable proof keeps both
+App/icon stock viewports.
+
+Same-Task/UID/fullscreen Activity handoffs preserve motion instead of cancelling
+on every token change. Different Apps keep independent overlapping lifetimes,
+per-stream event ordering, and all outstanding publication commit barriers.
+Per-request snapshot ownership also covers a window cancelled before worker
+lookup, and old cleanup cannot unblock or replace a newer request's release.
+See [first-frame publication and validation](docs/first-frame-publication.md)
+for exact capture counts and the separation between directly covered surfaces,
+stock fallback and independent child-layer coverage. Independent SurfaceView
+and `[BBQ]` content descendants remain outside the current shader coverage.
 
 The emulator has a separate verified host-capture buffer-selection problem
 when its secondary display is enabled; recordings temporarily disable it and

@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Runs the actual renderer with fake capabilities and real, empty SDK transactions.
+#include <android/surface_control.h>
+#include <atomic>
+static std::atomic<int> renderer_applies{0};
+static void ObserveRendererApply(ASurfaceTransaction* transaction) {
+    ++renderer_applies;
+    ASurfaceTransaction_apply(transaction);
+}
+#define ASurfaceTransaction_apply ObserveRendererApply
 #include "../app/src/main/cpp/hha_content.cpp"
+#undef ASurfaceTransaction_apply
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -193,10 +202,15 @@ void ScopedCancellation() {
     const int64_t requested=NowNs();
     hha::CancelIconRenderer(b);
     {std::lock_guard<std::mutex> lock(controller.mutex);
-     Check(controller.active && !controller.cancellation.Due(b,requested+47000000LL),
-           "matching B retains its 48ms cancellation grace");}
+     Check(controller.active && controller.active->cancel_ns>=requested+47000000LL,
+           "matching B records a scoped cancellation without changing its watchdog");}
     std::this_thread::sleep_for(60ms);ResetEvents();Frame(NowNs(),&controller);
-    Check(!controller.active && Cleared()==std::vector<int>{301},"matching B clears after grace");
+    Check(controller.active && Cleared().empty() && border_widths[301]>0,
+          "closing B remains protected after stop because SF stop does not hide it");
+    controller.active->started_ns=NowNs()-2000000000LL;
+    Frame(NowNs(),&controller);
+    Check(!controller.active && Cleared()==std::vector<int>{301},
+          "stopped closing B retires at its existing deadline");
     // Pending replacement also wins over an old active stop.
     Check(Queue(302,3002),"seed another active session");Pump(controller);
     hha::RenderIdentity old{controller.active->parent_layer,controller.active->request_ns};
@@ -415,6 +429,301 @@ void PrimedReversalContinuity() {
     }
     Stop(controller);std::puts("PASS primed reversal preserves the published contour");
 }
+void OverlappingRequests() {
+    auto& controller=Fresh();
+    const int64_t a_request=NowNs();
+    Check(QueueSession(901,9001,1120,2436,Geometry(1120,2436),true,a_request,{},false),
+          "queue closing App A");
+    Pump(controller);
+    auto* a=controller.active.get();
+    a->animation.Advance(.12);hha::genie::AdvanceScalar(&a->corner,.12,1.0);
+    const int64_t b_request=a_request-1000;
+    ResetEvents();
+    Check(QueueSession(902,9002,1120,2436,Geometry(1120,2436),true,b_request,{},false),
+          "independent older B event is accepted without a global watermark");
+    Pump(controller);
+    Check(controller.active->layer==902 && controller.overlapping.size()==1 &&
+          controller.overlapping[0].get()==a,"B adoption retains independent closing A");
+    Check(Cleared().empty() && border_widths[901]>0 && border_widths[902]>0,
+          "new App never exposes the old closing host by clearing its shader");
+    const auto a_frames=a->frames;
+    const auto b_frames=controller.active->frames;
+    Frame(NowNs(),&controller);
+    Check(a->frames>a_frames && controller.active->frames>b_frames,
+          "both independent sessions receive display-event updates");
+    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,9001,a_request);
+    a->cancel_ns=NowNs()-1;
+    ResetEvents();Frame(NowNs(),&controller);
+    Check(Cleared().empty() && a->cancel_ns && controller.active->cancel_ns==0,
+          "scoped A stop leaves both closing silhouettes protected and cannot stop B");
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    a->last_ns=NowNs()+10000000LL;
+    const auto corner=a->corner;
+    Check(QueueSession(901,9001,1120,2436,opening,false,NowNs(),{},false),
+          "reverse nonforeground A while B remains live");
+    Pump(controller);
+    Check(controller.active.get()==a && !a->closing && a->corner.value==corner.value &&
+          a->corner.velocity==corner.velocity && !a->cancel_ns,
+          "nonforeground reversal recovers exact motion state and clears stale stop");
+    Check(controller.overlapping.size()==1 && controller.overlapping[0]->layer==902,
+          "A reversal preserves independent B ownership");
+    Stop(controller);DrainCompletions();Check(!Running(),"global stop retires every overlap and detach");
+    std::puts("PASS independent overlapping requests and scoped retirement");
+}
+
+void IndependentCommitGates() {
+    auto& controller=Fresh();
+    auto a=Prime(911,9101);
+    auto b=Prime(912,9102);
+    Check(controller.queued.size()==1,"unrelated pending A is queued rather than superseded");
+    Commit(b);Pump(controller);
+    Check(controller.active && controller.active->layer==912 && controller.queued.size()==1 &&
+          controller.queued[0]->layer==911,"committed B starts while A show remains owned and uncommitted");
+    const auto frames=controller.active->frames;
+    Frame(NowNs(),&controller);
+    Check(controller.active->frames>frames,"uncommitted unrelated A cannot stall B frames");
+    ResetEvents();Commit(a);Pump(controller);
+    Check(controller.active->layer==911 && controller.overlapping.size()==1 &&
+          controller.overlapping[0]->layer==912 && Cleared().empty(),
+          "late A commit starts A without clearing already-visible B");
+    Stop(controller);
+    std::puts("PASS independent out-of-order publication commits");
+}
+
+void CrossParentPreviewHandoff() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    const auto request=NowNs();
+    Check(QueueSession(921,9201,1120,2436,opening,false,request,{922},true),
+          "seed early preview before actual Task anchor");
+    Pump(controller);
+    controller.active->animation.Advance(.14);
+    hha::genie::AdvanceScalar(&controller.active->corner,.14,1.0);
+    controller.active->last_ns=NowNs()+10000000LL;
+    const auto scalars=controller.active->animation.Scalars();
+    const auto corner=controller.active->corner;
+    ResetEvents();
+    Check(QueueSession(923,9202,1120,2436,opening,false,request,{},false),
+          "same trusted immutable request resolves to actual Task parent");
+    Pump(controller);
+    Check(controller.active->layer==923 && controller.active->parent_layer==9202 &&
+          controller.overlapping.empty(),"early preview and Task are one continuing request");
+    for(size_t i=0;i<scalars.size();++i)
+        Check(controller.active->animation.Scalars()[i].value==scalars[i].value &&
+              controller.active->animation.Scalars()[i].velocity==scalars[i].velocity,
+              "cross-parent handoff preserves each spring position and velocity");
+    Check(controller.active->corner.value==corner.value && controller.active->corner.velocity==corner.velocity,
+          "cross-parent handoff preserves corner motion");
+    Check(controller.active->companions.size()==2 && Cleared().empty() &&
+          border_widths[921]>0 && border_widths[922]>0 && border_widths[923]>0,
+          "cross-parent handoff keeps old visible preview buffers under shared contour");
+    Stop(controller);
+    std::puts("PASS trusted early-preview to Task handoff");
+}
+
+void AtomicCompanionAttachment() {
+    auto& controller=Fresh();Check(Queue(931,9301),"seed live request for atomic show attachment");
+    Pump(controller);
+    const auto request=controller.active->request_ns;
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create companion show transaction");
+    ResetEvents();
+    Check(Java_ng_lst_hha_ContentAnimator_nativeAttach(nullptr,nullptr,
+              reinterpret_cast<jlong>(transaction),932,9301,1120,2436,request)==JNI_TRUE,
+          "nativeAttach appends new compatible buffer to exact request");
+    Check(events.size()==1 && events[0].layer==932 && events[0].transaction==transaction &&
+          border_widths[932]>0,"new buffer SELF and border use supplied show transaction only");
+    const auto first=layer_uniforms[932];
+    const auto frames=controller.active->frames;
+    Frame(NowNs(),&controller);
+    Check(controller.active->frames==frames && layer_uniforms[932]==first,
+          "frame writer cannot overtake uncommitted companion first state");
+    Check(!AttachSession(transaction,933,9302,1120,2436,request) &&
+          !AttachSession(transaction,933,9301,1080,2340,request) &&
+          !AttachSession(transaction,933,9301,1120,2436,request+1),
+          "attachment rejects wrong parent, extent, and immutable epoch");
+    auto* another=ASurfaceTransaction_create();Check(another,"create second show transaction");
+    Check(AttachSession(another,934,9301,1120,2436,request),"second surface has independent show commit");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    ASurfaceTransaction_apply(another);ASurfaceTransaction_delete(another);
+    Commit(1);Frame(NowNs(),&controller);
+    Check(controller.active->frames==frames,"later show commit cannot release earlier outstanding publication");
+    Commit(0);Frame(NowNs(),&controller);
+    Check(controller.active->frames>frames && border_widths[932]>0 && border_widths[934]>0,
+          "all shown buffers continue together after every publication commits");
+    Stop(controller);
+    std::puts("PASS atomic companion show attachment and independent commit barriers");
+}
+
+void StopDuringCompanionPublication() {
+    auto& controller=Fresh();Check(Queue(941,9401),"seed session before publication cancellation");Pump(controller);
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create canceled companion transaction");
+    Check(AttachSession(transaction,942,9401,1120,2436,controller.active->request_ns),
+          "prime companion before global disable");
+    ResetEvents();Stop(controller);
+    Check(!controller.active && controller.retiring.size()==1 && Cleared().empty() && Running(),
+          "global disable retains uncommitted show until it can be safely cleared");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    Commit(0);Pump(controller);
+    auto cleared=Cleared();std::sort(cleared.begin(),cleared.end());
+    Check(cleared==std::vector<int>({941,942}) && controller.retiring.empty(),
+          "eventual show commit retires both primary and companion after disable");
+    DrainCompletions();Check(!Running(),"disabled publication idle after cleanup completion");
+    std::puts("PASS global disable during atomic companion publication");
+}
+void RepeatedPrimeCommitGates() {
+    auto& controller=Fresh();
+    auto a=Prime(951,9501);
+    auto b=Prime(951,9501);
+    ResetEvents();Commit(b);Pump(controller);
+    Check(!controller.active && controller.pending && !Committed(*controller.pending),
+          "later same-buffer show cannot advance before its earlier publication commits");
+    Check(Cleared().empty(),"reordered same-buffer publication does not retire a visible prime");
+    Commit(a);Pump(controller);
+    Check(controller.active && controller.active->layer==951 && controller.retiring.empty(),
+          "same-buffer session adopts after both publication commits");
+    Stop(controller);
+    std::puts("PASS repeated same-buffer priming commit dependencies");
+}
+
+void PrimedCrossParentHandoff() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    const auto request=NowNs();
+    Check(QueueSession(961,9601,1120,2436,opening,false,request,{},true),
+          "seed early preview for atomic cross-parent handoff");
+    Pump(controller);
+    controller.active->animation.Advance(.1);
+    hha::genie::AdvanceScalar(&controller.active->corner,.1,1.0);
+    controller.active->last_ns=NowNs()+10000000LL;
+    const auto mesh=hha::genie::ContourMesh(controller.active->animation,controller.active->parameters);
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create actual Task show transaction");
+    Check(QueueSession(962,9602,1120,2436,opening,false,request,{},false,0,0,transaction),
+          "prime actual Task in its own show transaction using trusted original request");
+    Check(controller.pending->primed_continuation,"cross-parent prime inherits preview motion");
+    for(size_t i=0;i<mesh.size();++i)
+        Check(std::abs(layer_uniforms[962][i*4]-mesh[i].x)<1e-6 &&
+              std::abs(layer_uniforms[962][i*4+1]-mesh[i].y)<1e-6,
+              "first actual Task shader preserves preview mesh before commit");
+    const auto primed=controller.pending->animation.Scalars();
+    const auto frames=controller.active->frames;
+    Frame(NowNs(),&controller);
+    Check(controller.active->frames==frames,"old preview updates wait for atomic Task show commit");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);Commit(0);Pump(controller);
+    Check(controller.active->layer==962 && controller.active->companions.size()==1,
+          "committed Task carries old preview protection across parent change");
+    for(size_t i=0;i<primed.size();++i)
+        Check(controller.active->animation.Scalars()[i].value==primed[i].value &&
+              controller.active->animation.Scalars()[i].velocity==primed[i].velocity,
+              "cross-parent adoption uses exactly the state already published in show");
+    Stop(controller);
+    std::puts("PASS atomic cross-parent preview handoff continuity");
+}
+void DelayedPendingPreviewCoalescence() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    const auto request=NowNs()-700000000LL;
+    auto* manager_show=ASurfaceTransaction_create();Check(manager_show,"create delayed manager preview show");
+    Check(QueueSession(982,979,1120,2436,opening,false,request,{},true,0,0,manager_show),
+          "manager preview primes before delayed worker resolves independent preview");
+    Check(QueueSession(973,975,1120,2436,opening,false,request,{},true),
+          "worker coalesces a same-request preview after original event is over500ms old");
+    Check(controller.pending && Owns(*controller.pending,982),
+          "coalesced worker request owns the earlier manager publication");
+    ASurfaceTransaction_apply(manager_show);ASurfaceTransaction_delete(manager_show);
+    ResetEvents();Commit(0);Pump(controller);
+    Check(controller.active && controller.active->layer==973 && Owns(*controller.active,982),
+          "delayed coalesced worker adopts instead of silently dropping published preview ownership");
+    Check(Cleared().empty() && border_widths[982]>0,
+          "retiring superseded manager prime cannot clear its still-visible buffer");
+    Check(QueueSession(986,979,1120,2436,opening,false,request,{982},true),
+          "standard starting buffer subsequently arrives under actual Task parent");
+    auto* starting_show=ASurfaceTransaction_create();Check(starting_show,"create delayed starting buffer show");
+    Check(QueueSession(986,979,1120,2436,opening,false,request,{},true,0,0,starting_show),
+          "standard starting show primes the continuing immutable request");
+    ASurfaceTransaction_apply(starting_show);ASurfaceTransaction_delete(starting_show);
+    Commit(1);Pump(controller);
+    Check(controller.active->layer==986 && Owns(*controller.active,973) && Owns(*controller.active,982),
+          "real starting primary inherits manager and independent preview ownership");
+    Check(Cleared().empty() && border_widths[982]>0 && border_widths[973]>0,
+          "pending coalescence and prime adoption expose no earlier preview rectangle");
+    Stop(controller);
+    std::puts("PASS delayed same-request pending preview coalescence");
+}
+void PublicationUnionAfterLateAttachment() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    const auto request=NowNs();
+    Check(QueueSession(991,9901,1120,2436,opening,false,request,{},false),
+          "seed real primary before same-request parent changes");
+    Pump(controller);
+    auto* next_show=ASurfaceTransaction_create();Check(next_show,"create alternate parent show");
+    Check(QueueSession(992,9902,1120,2436,opening,false,request,{},false,0,0,next_show),
+          "prime same-request nonstarting primary under another verified parent");
+    auto* late_show=ASurfaceTransaction_create();Check(late_show,"create late old-parent preview show");
+    Check(AttachSession(late_show,993,9901,1120,2436,request),
+          "old-parent event adds a preview after pending successor was cloned");
+    Check(QueueSession(994,9902,1120,2436,opening,false,request,{},false),
+          "worker coalesces successor after publications diverge");
+    Check(Owns(*controller.pending,991) && Owns(*controller.pending,992) && Owns(*controller.pending,993),
+          "successor owns union of live and pending publications rather than one selected source");
+    Check(controller.pending->commit_dependencies.size()==2,
+          "successor carries both distinct outstanding show barriers without duplicates");
+    ASurfaceTransaction_apply(next_show);ASurfaceTransaction_delete(next_show);
+    ASurfaceTransaction_apply(late_show);ASurfaceTransaction_delete(late_show);
+    const auto frames=controller.active->frames;
+    ResetEvents();Commit(0);Pump(controller);Frame(NowNs(),&controller);
+    Check(controller.active->layer==991 && controller.active->frames==frames && Cleared().empty(),
+          "successor and current frame writer wait for late old-parent show commit");
+    Commit(1);Pump(controller);
+    Check(controller.active->layer==994 && controller.overlapping.empty() &&
+          Owns(*controller.active,993) && Cleared().empty(),
+          "same immutable request merges every publication across nonstarting parent changes");
+    Stop(controller);
+    std::puts("PASS same-request publication union and late attachment barriers");
+}
+void OneShotOpeningPublication() {
+    auto& controller=Fresh();
+    hha::Transition request;
+    request.geometry=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(request.geometry[i],request.geometry[i+4]);
+    std::swap(request.geometry[10],request.geometry[11]);
+    request.event_ns=NowNs()-30000000LL;
+    request.leash_layer=9950;
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create first preview transaction");
+    const auto applications=renderer_applies.load();
+    Check(hha::PrimeOpeningPreview(transaction,reinterpret_cast<void*>(995),
+        reinterpret_cast<void*>(9950),1120,2436,request),"verified preview receives one-shot opening shader");
+    Check(events.size()==1 && events[0].layer==995 && !events[0].clear && events[0].transaction==transaction,
+          "preview shader is already in the actual first-show transaction before its caller applies");
+    Check(renderer_applies.load()==applications,"one-shot priming never applies a separate transaction");
+    Check(!controller.active && !controller.pending && controller.queued.empty() &&
+          controller.overlapping.empty() && commits.empty() && completions.empty(),
+          "one-shot publication creates no launcher frame writer or retirement callbacks");
+    Check(controller.submitted_serial.load()==0 && !Java_ng_lst_hha_ContentAnimator_nativeRunning(nullptr,nullptr),
+          "server-owned one-shot does not poison launcher retirement bookkeeping");
+    Check(layer_uniforms[995][8]-layer_uniforms[995][0]<.99f && layer_uniforms[995][36]==1120,
+          "first publication uses elapsed opening deformation and full buffer domain");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    request.closing=true;
+    transaction=ASurfaceTransaction_create();
+    Check(!hha::PrimeOpeningPreview(transaction,reinterpret_cast<void*>(995),
+        reinterpret_cast<void*>(9950),1120,2436,request),"closing request cannot use opening capability priming");
+    // The central renderer owns real preview retirement, represented here by
+    // its same-transaction SELF/guard clear after the one-shot was delivered.
+    ClearSurface(transaction,reinterpret_cast<void*>(995));
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    std::puts("PASS atomic one-shot preview publication without a second frame writer");
+}
 } // namespace
 
 int main() {
@@ -425,7 +734,11 @@ int main() {
           "CLIENT guard stays finite, strictly positive, and below one thousandth of a pixel");
     FramePrimeOrdering();ReplacementPreservesSharedLayers();ScopedCancellation();PendingRetirement();
     IndependentDetachCompletions();PrimedReversalContinuity();CornerEndpointRadii();
-    CornerRetargetAndHandoff();OpeningPreviewLifetime();DrainCompletions();
+    CornerRetargetAndHandoff();OpeningPreviewLifetime();
+    OverlappingRequests();IndependentCommitGates();CrossParentPreviewHandoff();
+    AtomicCompanionAttachment();StopDuringCompanionPublication();RepeatedPrimeCommitGates();
+    PrimedCrossParentHandoff();DelayedPendingPreviewCoalescence();
+    PublicationUnionAfterLateAttachment();OneShotOpeningPublication();DrainCompletions();
     {std::lock_guard<std::mutex> lock(test_mutex);
      for(const auto& entry:border_widths) Check(entry.second==0.0f,"all CLIENT guards cleared after retirement");
      for(const auto& entry:references) Check(entry.second==0,"all fake capabilities released");

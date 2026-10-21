@@ -16,14 +16,16 @@ import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** System-server-only content ownership bridge. No hooks are installed in target Apps. */
 @SuppressLint("PrivateApi", "BlockedPrivateApi", "SoonBlockedPrivateApi")
 internal class CentralBridge(private val module: XposedModule, loader: ClassLoader) : AutoCloseable {
     private val access = Access()
     private val snapshots = SnapshotGuard(module, loader)
-    private val preStarting = PreStartingSurfaces(module, loader)
-    private val snapshotReleases = HashMap<Int, Any>()
+    private val preStarting = PreStartingSurfaces(module, loader, ::surfacesChanged)
+    private val events = SurfaceEvents(module, loader, ::surfaceShowing, ::surfacesChanged)
+    private val snapshotReleases = HashMap<Int, SnapshotRelease>()
     private val wmsClass = Class.forName("com.android.server.wm.WindowManagerService", false, loader)
     private val scClass = Class.forName("android.view.SurfaceControl")
     private val copySurface = scClass.getConstructor(scClass, String::class.java)
@@ -34,13 +36,25 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val surfaceHeight = scClass.getMethod("getHeight")
     private val surfaceLock = scClass.getDeclaredField("mLock").apply { isAccessible = true }
     private val nativeObject = scClass.getDeclaredField("mNativeObject").apply { isAccessible = true }
-    private val stateLock = Any()
+    private val nativeWriteSurface = runCatching {
+        scClass.getDeclaredMethod("nativeWriteToParcel", Long::class.javaPrimitiveType,
+            Parcel::class.java).apply { isAccessible = true }
+    }.getOrNull()
+    private val transactionClass = Class.forName("android.view.SurfaceControl\$Transaction")
+    private val transactionObject = transactionClass.getDeclaredField("mNativeObject").apply { isAccessible = true }
+    private val newTransaction = transactionClass.getConstructor()
+    private val applyTransaction = transactionClass.getMethod("apply")
+    private val closeTransaction = transactionClass.getMethod("close")
+    private val requests = ConcurrentHashMap<Int, Envelope>()
+    private val owners = ConcurrentHashMap<Long, Owner>()
+    private val earlyPublications = ConcurrentHashMap<Int, Long>()
+    private val sessions = LinkedHashMap<Int, Active>() // Bridge worker only.
+    private val lastEvents = HashMap<Int, Long>()
+    private val changeQueued = AtomicBoolean()
     private val worker = HandlerThread("HHA.Bridge").apply { start() }
     private val handler = Handler(worker.looper)
     private var hook: HookHandle? = null
     private var generation = 0L
-    private var lastEventNs = 0L
-    private var active: Active? = null
     @Volatile private var closed = false
     @Volatile private var rendererReady = false
 
@@ -49,6 +63,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         try {
             snapshots.install()
             preStarting.install()
+            events.install()
             installHook()
         } catch (error: Throwable) {
             close()
@@ -84,23 +99,32 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 reply.writeException(SecurityException("HHA bridge is restricted to the launcher UID"))
                 return
             }
+            var prepared = false
             val accepted = runCatching {
                 input.enforceInterface(DESCRIPTOR)
                 val request = Request.read(input) ?: return@runCatching false
                 if (closed) return@runCatching false
+                if (request.operation == PREPARE_PREVIEW) {
+                    prepared = preparePreview(service, context, request, reply)
+                    return@runCatching prepared
+                }
                 if (!rendererReady && request.operation != CANCEL) {
                     handler.post { prepareRenderer() }
                     return@runCatching false
                 }
-                // Native launcher submission can be reached from a WM remote
-                // callback. Never acquire mGlobalLock or call native rendering
-                // synchronously on this Binder thread.
+                // Publish immutable authenticated geometry before the worker
+                // runs, so a concurrent first-show hook can join the same t.
+                if (request.operation == TRANSITION) {
+                    publish(Envelope(service, context, request))
+                }
                 handler.post { process(service, context, request) }
             }.onFailure {
                 report(Log.WARN, "request rejected; keeping stock animation", it)
             }.getOrDefault(false)
-            reply.writeNoException()
-            reply.writeInt(if (accepted) 1 else 0)
+            if (!prepared) {
+                reply.writeNoException()
+                reply.writeInt(if (accepted) 1 else 0)
+            }
         } catch (error: Throwable) {
             report(Log.ERROR, "bridge transaction failed", error)
             reply.writeNoException()
@@ -108,6 +132,43 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         } finally {
             Binder.restoreCallingIdentity(identity)
         }
+    }
+
+    private fun publish(next: Envelope) {
+        requests.compute(next.request.leash) { _, old ->
+            when {
+                old == null || old.request.eventNs < next.request.eventNs -> next
+                old.request.eventNs > next.request.eventNs -> old
+                old.request.taskId >= 0 -> old // Never downgrade an established Task anchor.
+                else -> next
+            }
+        }
+    }
+
+    /** Exact pre-start capability only; no WMS lock, native render or worker wait. */
+    private fun preparePreview(service: Any, context: Context, request: Request, reply: Parcel): Boolean {
+        val writer = nativeWriteSurface ?: return false
+        if (!rendererReady || !animationsEnabled(context) || request.closing ||
+            (request.taskId < 0 && request.containerLayer != request.leash)) return false
+        val width = request.geometry[6].toInt()
+        val height = request.geometry[7].toInt()
+        preStarting.opening(request.leash, width, height)?.use { preview ->
+            val encoded = Parcel.obtain()
+            try {
+                synchronized(checkNotNull(surfaceLock.get(preview.surface))) {
+                    writer.invoke(null, nativeObject.getLong(preview.surface), encoded)
+                }
+                val transition = Request(TRANSITION, request.leash, request.containerLayer,
+                    request.taskId, request.closing, request.eventNs, request.geometry)
+                publish(Envelope(service, context, transition))
+                handler.post { process(service, context, transition) }
+                reply.writeNoException()
+                reply.writeInt(1)
+                reply.appendFrom(encoded, 0, encoded.dataSize())
+                return true
+            } finally { encoded.recycle() }
+        }
+        return false
     }
 
     /** Resolve package ownership outside the WMS lock; reject shared-UID callers. */
@@ -126,28 +187,22 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         scale.isFinite() && scale > 0f
     }
 
-    private fun cancel(request: Request): Boolean {
-        val current = active
-        if (request.leash != -1 && current?.parentLayer != request.leash) return false
-        // A stop for the previous leash can arrive after the next pre-start
-        // began but before its Task anchor is delivered. Do not move the global
-        // transition watermark past that queued replacement's original clock.
+    private fun cancel(request: Request) {
         if (request.leash == -1) {
-            lastEventNs = request.eventNs
-            stopLocked("cancelled")
-        } else if (current != null) {
-            // Launcher emits stop(old) immediately before start/adjust(new).
-            // Defer retirement briefly so the successor can inherit all 19
-            // live states; an isolated cancellation still detaches promptly.
-            val cancelledGeneration = current.generation
-            handler.postDelayed({
-                synchronized(stateLock) {
-                    if (active === current && generation == cancelledGeneration &&
-                        lastEventNs <= request.eventNs) stopLocked("cancelled")
-                }
-            }, CANCEL_GRACE_MS)
+            requests.clear()
+            earlyPublications.clear()
+            sessions.values.toList().forEach { stop(it, "disabled") }
+            ContentAnimator.stop()
+            return
         }
-        return true
+        val current = sessions[request.leash] ?: return
+        requests.computeIfPresent(request.leash) { _, entry ->
+            entry.takeIf { it.request.eventNs > request.eventNs }
+        }
+        handler.postDelayed({
+            if (sessions[request.leash] === current &&
+                (lastEvents[request.leash] ?: 0L) <= request.eventNs) stop(current, "cancelled")
+        }, CANCEL_GRACE_MS)
     }
 
     private fun start(match: Snapshot, request: Request, service: Any): Boolean {
@@ -156,8 +211,9 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         // while any prior generation still has an uncommitted detach.
         if (request.closing && !match.starting && !ContentAnimator.running())
             snapshots.refresh(service, match.taskId)
-        snapshotReleases.remove(match.taskId)
-        snapshots.block(match.taskId)
+        if (!snapshots.block(match.taskId, request.eventNs)) return false
+        if ((snapshotReleases[match.taskId]?.eventNs ?: 0L) <= request.eventNs)
+            snapshotReleases.remove(match.taskId)
         // These are bridge-owned copies. The WMS global lock was released before
         // acquiring these locks or calling JNI, which may transact with SF.
         // Fixed order: parent, primary content, then companions in layer order.
@@ -181,135 +237,298 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
 
     private fun prepareRenderer() {
         if (closed || rendererReady) return
+        preStarting.prepare()
         rendererReady = runCatching { ContentAnimator.initialize() }.onFailure {
             report(Log.WARN, "native renderer unavailable; keeping stock animation", it)
         }.getOrDefault(false)
     }
 
     private fun process(service: Any, context: Context, request: Request) {
-        synchronized(stateLock) {
-            if (closed || request.eventNs < lastEventNs) return
-            if (request.operation == CANCEL) {
-                cancel(request)
-                return
-            }
-            lastEventNs = request.eventNs
-            val previous = active
-            // Keep a still-live content mesh until the replacement is resolved.
-            // Native compares actual content identity and can preserve all 19
-            // states even when Shell has installed a new transition leash.
-            val next = Active(++generation, service, context, request)
-            // Metadata is reused only for the same exact parent, to prevent a
-            // pending retry from attaching to another Activity under that leash.
-            if (previous?.parentLayer == request.leash) {
-                next.activityToken = previous.activityToken
-                next.taskId = previous.taskId
-                next.uid = previous.uid
-            }
-            active = next
-            if (previous != null) releaseSnapshotAfterDetach(previous)
-            checkCurrent(next)
+        if (closed || request.eventNs < (lastEvents[request.leash] ?: 0L)) return
+        lastEvents[request.leash] = request.eventNs
+        if (request.operation == CANCEL) {
+            cancel(request)
+            return
+        }
+        val resolved = requests[request.leash]?.request?.takeIf {
+            it.eventNs == request.eventNs && it.taskId >= 0
+        } ?: request
+        val previous = sessions[request.leash]
+        if (previous != null && previous.request.eventNs == resolved.eventNs &&
+            previous.request.taskId == resolved.taskId && previous.request.containerLayer == resolved.containerLayer) {
+            checkCurrent(previous)
+            return
+        }
+        val next = Active(++generation, service, context, resolved)
+        if (previous != null) {
+            next.activityToken = previous.activityToken
+            next.taskId = previous.taskId
+            next.uid = previous.uid
+            next.task = previous.task
+            next.nativeParent = previous.nativeParent
+            next.contentLayer = previous.contentLayer
+            next.companionLayers = previous.companionLayers
+            next.starting = previous.starting
+            next.width = previous.width
+            next.height = previous.height
+            next.snapshotBlocked = previous.snapshotBlocked
+        }
+        sessions[request.leash] = next
+        checkCurrent(next)
+        // A single deadline is a cleanup watchdog, never a content lookup clock.
+        val remaining = ((SESSION_NS - (System.nanoTime() - request.eventNs)) / 1_000_000L).coerceAtLeast(1L)
+        handler.postDelayed({ if (sessions[request.leash] === next) stop(next, "watchdog") }, remaining)
+    }
+
+    private fun surfacesChanged() {
+        if (closed || !changeQueued.compareAndSet(false, true)) return
+        handler.post {
+            changeQueued.set(false)
+            if (!closed) sessions.values.toList().forEach(::checkCurrent)
         }
     }
 
-    private fun schedule(current: Active, delay: Long) {
-        handler.postDelayed({
-            synchronized(stateLock) { checkCurrent(current) }
-        }, delay)
-    }
-
-    /** Worker-thread only. accepted=1 means queued, never a synchronous takeover. */
+    /** Events wake this lookup. No retry or periodic surface discovery timer. */
     private fun checkCurrent(current: Active) {
-        if (closed || active !== current || current.generation != generation) return
+        if (closed || sessions[current.parentLayer] !== current) return
+        val updated = requests[current.parentLayer]?.request
+        if (updated != null && updated.eventNs == current.request.eventNs &&
+            current.request.taskId < 0 && updated.taskId >= 0) {
+            process(current.service, current.context, updated)
+            return
+        }
         try {
-            val age = System.nanoTime() - current.request.eventNs
-            if (current.snapshotBlocked && age > 150_000_000L && !ContentAnimator.running()) {
-                current.snapshotBlocked = false
-                snapshots.unblock(current.taskId)
-                if (!current.request.closing) snapshots.refresh(current.service, current.taskId)
-            }
-            if (!animationsEnabled(current.context) || age > SESSION_NS) {
-                stopLocked("watchdog")
+            if (!animationsEnabled(current.context)) {
+                stop(current, "disabled")
+                ContentAnimator.stop()
                 return
             }
             val match = lookup(current.service, current.request)
             if (match == null) {
-                if (current.contentLayer < 0 && age < SURFACE_WAIT_NS) schedule(current, RETRY_MS)
-                else stopLocked("leash-removed")
+                if (!current.request.closing && current.contentLayer < 0) startOpeningPreview(current)
+                // Creation, first draw, anchor and removal events drive the next
+                // check. A transient empty tree does not prove visible removal.
                 return
             }
             match.use {
-                if (current.activityToken != null && (it.activityToken !== current.activityToken ||
-                        it.taskId != current.taskId || it.uid != current.uid)) {
-                    stopLocked("owner-changed")
+                if (current.taskId >= 0 && (it.taskId != current.taskId || it.uid != current.uid ||
+                        it.task !== current.task || (it.content != null && current.width > 0 &&
+                        (it.width != current.width || it.height != current.height)))) {
+                    stop(current, "owner-changed")
                     return
                 }
+                if (current.activityToken != null && it.activityToken !== current.activityToken &&
+                    !verifiedActivityHandoff(current, it)) {
+                    stop(current, "owner-changed")
+                    return
+                }
+                val changed = current.contentLayer != it.contentLayer ||
+                    current.companionLayers != it.companionLayers || current.nativeParent != it.parentLayer ||
+                    current.appliedEventNs != current.request.eventNs
+                if (it.content != null && changed) {
+                    if (!start(it, current.request, current.service)) {
+                        stop(current, "native-rejected")
+                        return
+                    }
+                    report(Log.INFO, "attached parent=${current.parentLayer} content=${it.contentLayer} " +
+                        "companions=${it.companionLayers} starting=${it.starting} " +
+                        "task=${it.taskId} uid=${it.uid} closing=${current.request.closing}")
+                }
+                owners[current.request.eventNs] = Owner(it.task, it.uid, it.width, it.height)
                 current.activityToken = it.activityToken
                 current.taskId = it.taskId
+                current.task = it.task
                 current.uid = it.uid
-                if (current.contentLayer < 0) {
-                    if (it.content != null) {
-                        if (!start(it, current.request, current.service)) {
-                            stopLocked("native-rejected")
-                            return
-                        }
-                        rememberLayers(current, it)
-                        report(Log.INFO, "attached parent=${current.parentLayer} content=${it.contentLayer} " +
-                            "companions=${it.companionLayers} starting=${it.starting} " +
-                            "task=${it.taskId} uid=${it.uid} closing=${current.request.closing}")
-                        schedule(current, CHECK_MS)
-                    } else if (age < SURFACE_WAIT_NS) {
-                        schedule(current, RETRY_MS)
-                    } else {
-                        stopLocked("first-draw-timeout")
+                if (it.content != null) rememberLayers(current, it)
+                // A newer verified request for the same actual Task supersedes
+                // discovery only; native preserves same-layer state and guards.
+                sessions.values.filter { old -> old !== current && old.task === it.task &&
+                    old.request.eventNs < current.request.eventNs }.toList().forEach { old ->
+                    sessions.remove(old.parentLayer)
+                    requests.computeIfPresent(old.parentLayer) { _, envelope ->
+                        envelope.takeIf { entry -> entry.request.eventNs > old.request.eventNs }
                     }
-                } else if (it.width != current.width || it.height != current.height) {
-                    stopLocked("extent-changed")
-                } else if (it.contentLayer != current.contentLayer ||
-                    it.companionLayers != current.companionLayers) {
-                    val contentChanged = it.contentLayer != current.contentLayer
-                    // The same Activity's real content replaces its starting
-                    // BLAST without resetting the request or 19-state model.
-                    val onlyRemoved = !contentChanged &&
-                        it.companionLayers.all { layer -> layer in current.companionLayers }
-                    if (onlyRemoved && !ContentAnimator.running()) {
-                        // A removed preview after settlement needs no new native
-                        // session. Reattaching would expose the already-finished mesh.
-                        current.companionLayers = it.companionLayers
-                        schedule(current, CHECK_MS)
-                    } else if (it.content == null || (contentChanged && (!current.starting || it.starting))) {
-                        stopLocked("surface-replaced")
-                    } else if (!start(it, current.request, current.service)) {
-                        stopLocked("handoff-rejected")
-                    } else {
-                        report(Log.INFO, "handoff parent=${current.parentLayer} " +
-                            "content=${current.contentLayer}->${it.contentLayer} " +
-                            "companions=${current.companionLayers}->${it.companionLayers} " +
-                            "starting=${current.starting}->${it.starting}")
-                        rememberLayers(current, it)
-                        schedule(current, CHECK_MS)
-                    }
-                } else {
-                    schedule(current, CHECK_MS)
                 }
             }
         } catch (_: PreStartingSurfaces.Busy) {
-            // OEM preload may acquire its lock before WMS. Never wait for it
-            // under mGlobalLock or mistake contention for a removed leash.
-            schedule(current, RETRY_MS)
+            // A later OEM lifecycle event retries after lock contention.
         } catch (error: Throwable) {
             report(Log.WARN, "lifecycle check failed; releasing effect", error)
-            stopLocked("lookup-failed")
+            stop(current, "lookup-failed")
         }
     }
 
+    private fun startOpeningPreview(current: Active) {
+        val request = current.request
+        val full = if (request.closing) 0 else 4
+        val width = request.geometry[full + 2].toInt()
+        val height = request.geometry[full + 3].toInt()
+        preStarting.opening(request.leash, width, height)?.use { preview ->
+            val content = nativeObject.getLong(preview.surface)
+            val parent = nativeObject.getLong(preview.parent)
+            if (ContentAnimator.transition(content, parent, width, height, request.geometry,
+                    false, request.eventNs, starting = true)) {
+                current.contentLayer = surfaceLayer.invoke(preview.surface) as Int
+                current.nativeParent = surfaceLayer.invoke(preview.parent) as Int
+                current.starting = true
+                current.width = width
+                current.height = height
+                report(Log.INFO, "early preview parent=${request.leash} content=${current.contentLayer}")
+            }
+        }
+    }
+
+    private fun verifiedActivityHandoff(current: Active, next: Snapshot): Boolean =
+        !current.request.closing && current.task != null && current.task === next.task &&
+            current.taskId == next.taskId && current.uid == next.uid &&
+            current.nativeParent == next.parentLayer && next.identityDomain &&
+            (current.width == 0 || (current.width == next.width && current.height == next.height))
+
     private fun rememberLayers(current: Active, match: Snapshot) {
+        current.appliedEventNs = current.request.eventNs
         current.contentLayer = match.contentLayer
+        current.nativeParent = match.parentLayer
         current.companionLayers = match.companionLayers
         current.starting = match.starting
         current.snapshotBlocked = true
         current.width = match.width
         current.height = match.height
+    }
+
+    /** Runs at content creation/attachment or show, without waiting on bridge/WM work. */
+    private fun surfaceShowing(show: SurfaceEvents.Show) {
+        if (closed || !rendererReady || requests.isEmpty()) return
+        runCatching {
+            val now = System.nanoTime()
+            val entries = requests.values.filter { now - it.request.eventNs in 0..SESSION_NS }
+            val activity = show.activity
+            val task = activity?.let { access.call(it, "getTask") }
+            val taskId = task?.let { access.field(it, "mTaskId") as? Int }
+            val uid = activity?.let { access.field(it, "info") as? android.content.pm.ActivityInfo }
+                ?.applicationInfo?.uid
+            val envelope = entries.filter { entry ->
+                val request = entry.request
+                if (show.leash >= 0) request.leash == show.leash
+                else activity != null && task != null && uid != null &&
+                    ((taskId == request.taskId && (request.containerLayer < 0 ||
+                        isLayer(access.field(task, "mSurfaceControl"), request.containerLayer) ||
+                        (show.window != null && matchingParent(show.window, request.containerLayer) != null))) ||
+                        (request.taskId < 0 && preStarting.matchesOpening(activity, request.leash,
+                            request.geometry[6].toInt(), request.geometry[7].toInt())))
+            }.maxByOrNull { it.request.eventNs } ?: return
+            val request = envelope.request
+            if (request.closing) return // Newly opening buffers are never attached to an old close.
+            val full = 4
+            val width = request.geometry[full + 2].toInt()
+            val height = request.geometry[full + 3].toInt()
+            val frame = Rect(0, 0, width, height)
+            var parent = show.parent
+            if (show.leash < 0) {
+                if (activity == null || task == null || taskId == null || uid == null ||
+                    !identityDomain(activity, task, frame, width, height)) return
+                val owner = owners[request.eventNs]
+                if (owner != null && (owner.task !== task || owner.uid != uid)) return
+                val window = show.window
+                if (window != null) {
+                    val attrs = access.field(window, "mAttrs") as? WindowManager.LayoutParams ?: return
+                    if (attrs.type !in 1..3 || attrs.packageName == LAUNCHER ||
+                        attrs.flags and WindowManager.LayoutParams.FLAG_SECURE != 0 ||
+                        (attrs.type != 3 && access.field(window, "mOwnerUid") != uid) ||
+                        access.call(window, "getFrame") != frame) return
+                } else {
+                    // OEM manager callbacks carry no WindowState. Reuse only
+                    // an identity already validated by a WM-owned lookup.
+                    if (owner == null && request.taskId >= 0) return
+                    if (owner != null && owner.width > 0 && (owner.width != width || owner.height != height)) return
+                }
+                parent = access.field(task, "mSurfaceControl") ?: return
+                if (request.taskId < 0) {
+                    // The server-owned remote token proves this Task belongs to
+                    // the early opening before Shell's later reparent callback.
+                    val bound = Request(request.operation, request.leash, surfaceLayer.invoke(parent) as Int,
+                        taskId, request.closing, request.eventNs, request.geometry)
+                    val next = Envelope(envelope.service, envelope.context, bound)
+                    var published = false
+                    requests.compute(request.leash) { _, old ->
+                        if (old?.request?.eventNs == request.eventNs && old.request.taskId < 0) {
+                            published = true
+                            next
+                        } else old
+                    }
+                    if (published) handler.post { process(next.service, next.context, bound) }
+                }
+                if (!snapshots.tryBlock(taskId, request.eventNs)) return
+                val blockedTask = taskId
+                val blockedParent = surfaceLayer.invoke(parent) as Int
+                handler.post {
+                    // Publication may be the only moment ownership is visible:
+                    // cancellation can remove the window before worker lookup.
+                    val current = sessions[request.leash]?.takeIf { it.request.eventNs == request.eventNs }
+                    if (current != null && (current.taskId < 0 || current.taskId == blockedTask)) {
+                        current.taskId = blockedTask
+                        current.task = task
+                        current.uid = uid
+                        current.nativeParent = blockedParent
+                        current.snapshotBlocked = true
+                    } else {
+                        val cleanup = Active(++generation, envelope.service, envelope.context, request)
+                        cleanup.taskId = blockedTask
+                        cleanup.snapshotBlocked = true
+                        releaseSnapshotAfterDetach(cleanup)
+                    }
+                }
+            }
+            parent ?: return
+            if (!isValid(show.surface) || !isValid(parent)) return
+            val actualWidth = surfaceWidth.invoke(show.surface) as Int
+            val actualHeight = surfaceHeight.invoke(show.surface) as Int
+            if ((actualWidth != width || actualHeight != height) &&
+                !(show.leash < 0 && actualWidth <= 0 && actualHeight <= 0)) return
+            val layer = surfaceLayer.invoke(show.surface) as Int
+            // Layout may run repeatedly before mSurfaceShown flips. One early
+            // publication per request/layer suffices; real show/attach
+            // transactions must still receive their own atomic protection.
+            if (show.transaction == null && earlyPublications[layer] == request.eventNs) return
+            val surface = nativeObject.getLong(show.surface)
+            val parentPointer = nativeObject.getLong(parent)
+            if (surface == 0L || parentPointer == 0L) return
+            // A null transaction denotes creation, before the control is handed
+            // to its producer or attached below a visible window. Submit only
+            // effects through our own transaction, then also join the actual
+            // pending/sync publication. Borrowed transactions are never applied.
+            val owned = if (show.transaction == null) newTransaction.newInstance() else null
+            val publication = show.transaction ?: checkNotNull(owned)
+            try {
+                val transaction = transactionObject.getLong(publication)
+                if (transaction == 0L) return
+                val attached = ContentAnimator.attach(transaction, surface, parentPointer, width, height, request.eventNs) ||
+                    ContentAnimator.prime(transaction, surface, parentPointer, width, height,
+                        request.geometry, false, request.eventNs,
+                        starting = show.window == null || (access.field(show.window, "mAttrs") as? WindowManager.LayoutParams)?.type == 3)
+                if (attached) {
+                    if (owned != null) {
+                        applyTransaction.invoke(owned)
+                        earlyPublications[layer] = request.eventNs
+                        earlyPublications.entries.removeIf { now - it.value > SESSION_NS }
+                    }
+                    report(Log.INFO, "${if (owned == null) "show" else "created"} primed " +
+                        "leash=${request.leash} layer=$layer")
+                    surfacesChanged()
+                }
+            } finally {
+                if (owned != null) closeTransaction.invoke(owned)
+            }
+        }.onFailure { report(Log.WARN, "first-show priming skipped", it) }
+    }
+
+    private fun identityDomain(activity: Any, task: Any, frame: Rect?, width: Int, height: Int): Boolean {
+        if (width <= 0 || height <= width || frame != Rect(0, 0, width, height) ||
+            access.call(task, "getWindowingMode") != 1 || access.call(activity, "getWindowingMode") != 1 ||
+            access.call(activity, "isEmbedded") != false || access.call(activity, "hasFixedRotationTransform") != false ||
+            access.call(activity, "isLetterboxedForFixedOrientationAndAspectRatio") != false ||
+            access.call(activity, "getBounds") != frame || access.call(task, "getBounds") != frame) return false
+        val display = access.call(activity, "getDisplayContent") ?: return false
+        return access.call(display, "getRotation") == 0 && access.call(display, "getBounds") == frame
     }
 
     /** Copies only while WM's ownership is stable, never returns borrowed surfaces. */
@@ -389,7 +608,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     .sortedBy { surfaceLayer.invoke(it) as Int }
                 Snapshot(parentCopy, contentCopy, companions, selected.type == 3,
                     size?.first ?: 0, size?.second ?: 0, selected.activityToken,
-                    selected.taskId, selected.uid).also {
+                    selected.taskId, selected.uid, selected.task,
+                    size != null && identityDomain(selected.activity, selected.task, frame, size.first, size.second)).also {
                     parentCopy = null; contentCopy = null; companionCopy = null
                     oemCopies = emptyList()
                 }
@@ -444,32 +664,34 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         if (surface != null) runCatching { releaseSurface.invoke(surface) }
     }
 
-    private fun stopLocked(reason: String) {
-        generation++
-        val previous = active
-        active = null
-        ContentAnimator.stop()
-        if (previous != null) {
-            releaseSnapshotAfterDetach(previous)
-            report(Log.INFO, "stop parent=${previous.parentLayer} reason=$reason")
+    private fun stop(current: Active, reason: String) {
+        if (sessions[current.parentLayer] !== current) return
+        sessions.remove(current.parentLayer)
+        requests.computeIfPresent(current.parentLayer) { _, envelope ->
+            envelope.takeIf { it.request.eventNs > current.request.eventNs }
         }
+        owners.remove(current.request.eventNs)
+        earlyPublications.entries.removeIf { it.value == current.request.eventNs }
+        ContentAnimator.stopRequest(current.nativeParent, current.request.eventNs)
+        releaseSnapshotAfterDetach(current)
+        report(Log.INFO, "stop parent=${current.parentLayer} reason=$reason")
     }
 
     private fun releaseSnapshotAfterDetach(previous: Active) {
         if (previous.taskId < 0) return
-        val token = Any()
+        if ((snapshotReleases[previous.taskId]?.eventNs ?: 0L) > previous.request.eventNs) return
+        val token = SnapshotRelease(previous.request.eventNs)
         snapshotReleases[previous.taskId] = token
         fun check() {
             if (closed || snapshotReleases[previous.taskId] !== token) return
-            val current = active
-            if (current?.taskId == previous.taskId && current.snapshotBlocked) {
+            if (sessions.values.any { it.taskId == previous.taskId && it.snapshotBlocked }) {
                 snapshotReleases.remove(previous.taskId)
                 return
             }
             if (ContentAnimator.running()) handler.postDelayed({ check() }, CHECK_MS)
             else {
                 snapshotReleases.remove(previous.taskId)
-                snapshots.unblock(previous.taskId)
+                snapshots.unblock(previous.taskId, previous.request.eventNs)
                 if (!previous.request.closing) snapshots.refresh(previous.service, previous.taskId)
             }
         }
@@ -477,11 +699,13 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     }
 
     override fun close() {
-        synchronized(stateLock) {
-            if (closed) return
-            closed = true
-            stopLocked("module-unloaded")
-        }
+        if (closed) return
+        closed = true
+        requests.clear()
+        owners.clear()
+        earlyPublications.clear()
+        ContentAnimator.stop()
+        runCatching { events.close() }
         runCatching { hook?.unhook() }
         hook = null
         handler.removeCallbacksAndMessages(null)
@@ -499,7 +723,9 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private inner class Snapshot(
         val parent: Any, val content: Any?, val companions: List<Any>, val starting: Boolean,
         val width: Int, val height: Int, val activityToken: Any, val taskId: Int, val uid: Int,
+        val task: Any, val identityDomain: Boolean,
     ) : AutoCloseable {
+        val parentLayer = surfaceLayer.invoke(parent) as Int
         val contentLayer = content?.let { surfaceLayer.invoke(it) as Int } ?: -1
         val companionLayers = companions.map { surfaceLayer.invoke(it) as Int }
         override fun close() { companions.forEach(::release); release(content); release(parent) }
@@ -511,6 +737,9 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private class Active(val generation: Long, val service: Any, val context: Context,
         val request: Request) {
         val parentLayer = request.leash
+        var nativeParent = -1
+        var appliedEventNs = 0L
+        var task: Any? = null
         var activityToken: Any? = null
         var taskId = -1
         var uid = -1
@@ -521,6 +750,10 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         var width = 0
         var height = 0
     }
+
+    private class SnapshotRelease(val eventNs: Long)
+    private data class Envelope(val service: Any, val context: Context, val request: Request)
+    private data class Owner(val task: Any, val uid: Int, val width: Int, val height: Int)
 
     private class Request(val operation: Int, val leash: Int, val containerLayer: Int,
         val taskId: Int, val closing: Boolean, val eventNs: Long, val geometry: FloatArray) {
@@ -535,10 +768,10 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 val eventNs = parcel.readLong()
                 val geometry = FloatArray(12) { parcel.readFloat() }
                 val age = System.nanoTime() - eventNs
-                if (parcel.dataAvail() != 0 || operation !in TRANSITION..CANCEL ||
+                if (parcel.dataAvail() != 0 || operation !in TRANSITION..PREPARE_PREVIEW ||
                     direction !in 0..1 || eventNs <= 0 || age !in -FUTURE_NS..MAX_EVENT_AGE_NS ||
                     geometry.any { !it.isFinite() }) return null
-                if (operation == TRANSITION && (leash < 0 || taskId < -1 ||
+                if (operation != CANCEL && (leash < 0 || taskId < -1 ||
                     (containerLayer < 0 && taskId < 0) ||
                     intArrayOf(2, 3, 6, 7).any { geometry[it] <= 0f || geometry[it] > MAX_EXTENT } ||
                     intArrayOf(0, 1, 4, 5).any { kotlin.math.abs(geometry[it]) > 32768f } ||
@@ -582,12 +815,11 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         const val VERSION = 2
         const val TRANSITION = 1
         const val CANCEL = 2
+        const val PREPARE_PREVIEW = 3
         const val MAX_EXTENT = 16384
         const val CANCEL_GRACE_MS = 48L
-        const val RETRY_MS = 16L
-        const val CHECK_MS = 50L
-        const val SURFACE_WAIT_NS = 200_000_000L
-        const val MAX_EVENT_AGE_NS = 500_000_000L
+        const val CHECK_MS = 50L // Detachment completion cleanup only.
+        const val MAX_EVENT_AGE_NS = 1_500_000_000L
         const val FUTURE_NS = 100_000_000L
         const val SESSION_NS = 1_500_000_000L
         val SCALE_KEYS = arrayOf(Settings.Global.ANIMATOR_DURATION_SCALE,

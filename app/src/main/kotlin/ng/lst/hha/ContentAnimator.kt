@@ -5,7 +5,7 @@ import android.util.Log
 /** JNI boundary for system_server-owned content animation. Never initialized in Zygote. */
 internal object ContentAnimator {
     private var loaded = false
-    private var initialized = false
+    @Volatile private var initialized = false
 
     @Synchronized
     fun initialize(): Boolean {
@@ -22,7 +22,6 @@ internal object ContentAnimator {
     }
 
     /** All copied SurfaceControl locks stay held until native retains its own refs. */
-    @Synchronized
     fun transition(
         surface: Long,
         parent: Long,
@@ -44,10 +43,23 @@ internal object ContentAnimator {
         }.getOrDefault(false)
     }
 
-    @Synchronized
+    /** Append to a caller-owned show transaction; never apply or close it here. */
+    fun prime(transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
+              geometry: FloatArray, closing: Boolean, eventTimeNanos: Long,
+              companions: LongArray = longArrayOf(), starting: Boolean = false): Boolean =
+        initialized && nativePrime(transaction, surface, parent, width, height, geometry,
+            closing, eventTimeNanos, companions, starting)
+
+    fun attach(transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
+               eventTimeNanos: Long): Boolean = initialized &&
+        nativeAttach(transaction, surface, parent, width, height, eventTimeNanos)
+
+    fun stopRequest(parent: Int, eventTimeNanos: Long) {
+        if (initialized && parent >= 0) nativeStopRequest(parent.toLong(), eventTimeNanos)
+    }
+
     fun running(): Boolean = initialized && nativeRunning()
 
-    @Synchronized
     fun stop() {
         if (!initialized) return
         runCatching { nativeStop() }.onFailure {
@@ -67,6 +79,15 @@ internal object ContentAnimator {
         companions: LongArray,
         starting: Boolean,
     ): Boolean
+    @JvmStatic external fun nativePrime(
+        transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
+        geometry: FloatArray, closing: Boolean, eventNs: Long,
+        companions: LongArray, starting: Boolean,
+    ): Boolean
+    @JvmStatic external fun nativeAttach(
+        transaction: Long, surface: Long, parent: Long, width: Int, height: Int, eventNs: Long,
+    ): Boolean
+    @JvmStatic external fun nativeStopRequest(parent: Long, eventNs: Long)
     @JvmStatic external fun nativeRunning(): Boolean
     @JvmStatic external fun nativeStop()
 
