@@ -2,6 +2,7 @@ package ng.lst.hha
 
 import android.annotation.SuppressLint
 import android.graphics.Rect
+import android.graphics.Point
 import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.HookHandle
@@ -18,6 +19,8 @@ internal class SurfaceEvents(
     private val loader: ClassLoader,
     private val onShow: (Show) -> Unit,
     private val onChanged: () -> Unit,
+    private val onBufferCreated: (Any) -> Unit,
+    private val onSourceRemoved: (Int) -> Unit,
 ) : AutoCloseable {
     data class Show(
         val surface: Any,
@@ -26,10 +29,13 @@ internal class SurfaceEvents(
         val activity: Any? = null,
         val parent: Any? = null,
         val leash: Int = -1,
+        val verifiedManager: Boolean = false,
     )
 
     private val members = Members()
     private val hooks = ArrayList<HookHandle>()
+    private data class Producer(val show: Show, val frame: Rect, val registeredNs: Long)
+    private val localProducers = ConcurrentHashMap<Int, Producer>()
     private val surfaceClass = Class.forName("android.view.SurfaceControl")
     private val surfaceValid = surfaceClass.getMethod("isValid")
     private val surfaceLayer = surfaceClass.getMethod("getLayerId")
@@ -66,7 +72,42 @@ internal class SurfaceEvents(
                     changed()
                     result
                 }
+            optional("content source removal") {
+                for (destroy in animator.declaredMethods.filter { it.name == "destroySurfaceLocked" }) {
+                    hooks += module.hook(destroy)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("content-source-destroy-${destroy.parameterCount}")
+                        .intercept { chain ->
+                            val source = chain.thisObject?.let { members.field(it, "mSurfaceControl") }
+                            val id = source?.let { runCatching { layer(it) }.getOrDefault(-1) } ?: -1
+                            val result = chain.proceed()
+                            observe { if (id >= 0) onSourceRemoved(id) }
+                            result
+                        }
+                }
+            }
             creationEvents(animator)
+            optional("local legacy buffer creation") {
+                val surface = Class.forName("android.view.Surface", false, loader)
+                val copy = surface.getDeclaredMethod("copyFrom", surfaceClass)
+                hooks += module.hook(copy)
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .setId("content-local-bbq-creation")
+                    .intercept { chain ->
+                        val result = chain.proceed()
+                        observe {
+                            val source = chain.getArg(0) ?: return@observe
+                            val producer = localProducers[layer(source)]
+                            if (producer != null && producer.show.surface === source &&
+                                System.nanoTime() - producer.registeredNs in 0..1_500_000_000L &&
+                                identityFrame(checkNotNull(producer.show.activity)) == producer.frame) {
+                                onShow(producer.show)
+                            }
+                            onBufferCreated(source)
+                        }
+                        result
+                    }
+            }
             for (name in listOf("finishDrawingLocked", "destroySurfaceLocked", "hide")) {
                 lifecycle(animator, name)
             }
@@ -254,7 +295,15 @@ internal class SurfaceEvents(
                 members.call(snapshot, "getHardwareBufferWidth") != frame.width() ||
                 members.call(snapshot, "getHardwareBufferHeight") != frame.height()) return
         }
-        if (extent(surface, frame, color)) onShow(Show(surface, transaction, activity = activity, parent = parent))
+        if (extent(surface, frame, color)) {
+            val show = Show(surface, transaction, activity = activity, parent = parent, verifiedManager = true)
+            val now = System.nanoTime()
+            // Retain no borrowed transaction. If Surface(sc) materializes its
+            // local BBQ after show, protect that buffer before its first post.
+            localProducers[layer(surface)] = Producer(show.copy(transaction = null), Rect(frame), now)
+            localProducers.entries.removeIf { now - it.value.registeredNs > 1_500_000_000L }
+            onShow(show)
+        }
     }
 
     private inline fun withManagerLock(owner: Any, action: () -> Unit) {
@@ -266,7 +315,6 @@ internal class SurfaceEvents(
     }
 
     private fun openingShow(animation: Any) {
-        if (members.call(animation, "isParallel") != false) return
         val display = members.field(animation, "mDisplayContent") ?: return
         val frame = (members.call(display, "getBounds") as? Rect)?.let(::Rect) ?: return
         if (frame.left != 0 || frame.top != 0 || frame.width() <= 0 || frame.height() <= frame.width() ||
@@ -283,7 +331,8 @@ internal class SurfaceEvents(
         val change = changes.filterNotNull().singleOrNull {
             members.call(it, "getLeash")?.let(::layer) == leash
         } ?: return
-        if (members.call(change, "getStartRotation") != 0 || members.call(change, "getEndRotation") != 0 ||
+        if (members.call(change, "getMode") != 1 || members.call(change, "getEndRelOffset") != Point(0, 0) ||
+            members.call(change, "getStartRotation") != 0 || members.call(change, "getEndRotation") != 0 ||
             members.call(change, "getStartAbsBounds") != frame || members.call(change, "getEndAbsBounds") != frame) return
         onShow(Show(source, transaction, parent = parent, leash = leash))
     }
@@ -352,6 +401,7 @@ internal class SurfaceEvents(
         closed = true
         hooks.asReversed().forEach { runCatching { it.unhook() } }
         hooks.clear()
+        localProducers.clear()
     }
 
     private class Members {

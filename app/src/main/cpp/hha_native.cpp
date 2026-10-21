@@ -316,7 +316,8 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     // Pre-start's exact preview is primed in the same Launcher transaction
     // before the custom viewport. The restricted prepare RPC publishes this
     // geometry to the central worker without taking the WM lock.
-    if(!adjust && g_name && g_name(control).find("Pre startup opening leash")==0) return;
+    if(!adjust && (request.task_id>=0 ||
+       (g_name && g_name(control).find("Pre startup opening leash")==0))) return;
     hha::QueueTransition(request);
 }
 void SetSpring(const void* parameters,const char* key,float start,float end) {
@@ -404,6 +405,17 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             }
             // Also arm the launcher's existing runtime-disable watchdog. The
             // server retains any stronger Task anchor established meanwhile.
+            hha::QueueTransition(snapshot.transition);
+        }
+        if(!is_icon && !snapshot.adjusting && snapshot.transition.task_id>=0) {
+            if(!hha::PrepareContentGroup(transaction,const_cast<void*>(control),
+                static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition)) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(auto& source:g_last) if(source.valid &&
+                    source.transition.event_ns==snapshot.transition.event_ns &&
+                    source.transition.leash_layer==snapshot.transition.leash_layer) source.supported=false;
+                return;
+            }
             hha::QueueTransition(snapshot.transition);
         }
         if(is_icon) {

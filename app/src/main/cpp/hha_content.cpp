@@ -60,6 +60,12 @@ StrongFn g_dec_strong = nullptr;
 PostFn g_post = nullptr;
 BorderFn g_border = nullptr;
 LayerIdFn g_layer_id = nullptr;
+struct SurfaceResult {
+    void* ptr = nullptr;
+    ~SurfaceResult() { if (ptr && g_dec_strong) g_dec_strong(ptr, this); }
+};
+using ParentingFn = SurfaceResult (*)(const void*);
+ParentingFn g_parenting = nullptr; // Optional; only resolves same-process BBQ owners.
 using CommitFn = void (*)(ASurfaceTransaction*,void*,ASurfaceTransaction_OnCommit);
 CommitFn g_on_commit = nullptr;
 using CompleteFn = void (*)(ASurfaceTransaction*,void*,ASurfaceTransaction_OnComplete);
@@ -147,6 +153,7 @@ struct Session {
     std::vector<Companion> companions;
     int32_t layer = -1;
     int32_t parent_layer = -1;
+    int32_t unwarped_layer = -1; // A live subtree's source must never be warped twice.
     int width = 0;
     int height = 0;
     int texture_width = 0;
@@ -416,7 +423,7 @@ void PreserveOpeningPreviews(Session& next, const Session& previous) {
        next.width!=previous.width ||
        next.height!=previous.height) return;
     auto retain=[&](void* surface,int32_t layer) {
-        if(!surface || layer<0 || layer==next.layer ||
+        if(!surface || layer<0 || layer==next.layer || layer==next.unwarped_layer ||
            std::any_of(next.companions.begin(),next.companions.end(),
                [&](const Companion& item) {return item.layer==layer;})) return;
         next.companions.push_back({surface,layer});
@@ -722,6 +729,7 @@ bool Initialize() {
     g_post = reinterpret_cast<PostFn>(dlsym(gui, kPost));
     g_border = reinterpret_cast<BorderFn>(dlsym(gui, kBorder));
     g_layer_id = reinterpret_cast<LayerIdFn>(dlsym(gui, "_ZNK7android14SurfaceControl10getLayerIdEv"));
+    g_parenting = reinterpret_cast<ParentingFn>(dlsym(gui, "_ZN7android14SurfaceControl17getParentingLayerEv"));
     g_inc_strong = reinterpret_cast<StrongFn>(dlsym(utils, "_ZNK7android7RefBase9incStrongEPKv"));
     g_dec_strong = reinterpret_cast<StrongFn>(dlsym(utils, "_ZNK7android7RefBase9decStrongEPKv"));
     g_on_commit = reinterpret_cast<CommitFn>(dlsym(platform, "ASurfaceTransaction_setOnCommit"));
@@ -752,6 +760,23 @@ bool Initialize() {
 }
 }  // namespace
 
+extern "C" JNIEXPORT jlong JNICALL
+Java_ng_lst_hha_ContentAnimator_nativeBufferSurfaceCopy(JNIEnv* env, jclass, jlong source) {
+    if (!source || !g_parenting || !g_controller.load(std::memory_order_acquire)) return 0;
+    void* original = reinterpret_cast<void*>(static_cast<uintptr_t>(source));
+    // The caller holds the original Java SC lock. Its local +0x58 owner is lost
+    // by the regular SC copy constructor and cannot be recovered by layer ID.
+    SurfaceResult buffer = g_parenting(original);
+    if (!buffer.ptr || buffer.ptr == original || g_layer_id(buffer.ptr) == g_layer_id(original)) return 0;
+    jclass surface_class = env->FindClass("android/view/SurfaceControl");
+    if (!surface_class) return 0;
+    jmethodID copy = env->GetStaticMethodID(surface_class, "nativeCopyFromSurfaceControl", "(J)J");
+    const jlong result = copy ? env->CallStaticLongMethod(surface_class, copy,
+        static_cast<jlong>(reinterpret_cast<uintptr_t>(buffer.ptr))) : 0;
+    env->DeleteLocalRef(surface_class);
+    return result;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_ng_lst_hha_ContentAnimator_nativeInitialize(JNIEnv*, jclass) {
     return Initialize() ? JNI_TRUE : JNI_FALSE;
@@ -759,7 +784,7 @@ Java_ng_lst_hha_ContentAnimator_nativeInitialize(JNIEnv*, jclass) {
 
 static bool QueueSession(jlong surface,jlong parent,int width,int height,
     const std::array<float,12>& values,bool closing,int64_t event_ns,const std::vector<jlong>& companions,bool starting,
-    int texture_width=0,int texture_height=0,void* initial_transaction=nullptr) {
+    int texture_width=0,int texture_height=0,void* initial_transaction=nullptr,void* unwarped_source=nullptr) {
     auto* controller=g_controller.load(std::memory_order_acquire);
     if (!controller || !surface || !parent || width<=0 || height<=0 || width>16384 || height>16384) return false;
     for(float value:values) if(!std::isfinite(value)) return JNI_FALSE;
@@ -795,11 +820,12 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     g_inc_strong(next->parent,next.get());
     next->layer=g_layer_id(next->surface);
     next->parent_layer=g_layer_id(next->parent);
+    next->unwarped_layer=unwarped_source?g_layer_id(unwarped_source):-1;
     for(jlong companion:companions) {
         if(!companion) continue;
         void* overlay=reinterpret_cast<void*>(static_cast<uintptr_t>(companion));
         const int32_t layer=g_layer_id(overlay);
-        if(layer!=next->layer && std::none_of(next->companions.begin(),next->companions.end(),
+        if(layer!=next->layer && layer!=next->unwarped_layer && std::none_of(next->companions.begin(),next->companions.end(),
             [&](const Companion& existing) {return existing.layer==layer;})) {
             next->companions.push_back({overlay,layer});
             g_inc_strong(overlay,next.get());
@@ -882,6 +908,9 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
         next->last_ns=std::max(now,event_ns);
         next->elapsed=std::max(0.0,static_cast<double>(now-next->started_ns)/1e9);
         auto* transaction=static_cast<ASurfaceTransaction*>(initial_transaction);
+        // Transfer away from direct SELF in the publication that reveals the
+        // grouped buffer. Pending same-request adoption blocks further old writes.
+        if(unwarped_source) ClearSurface(transaction,unwarped_source);
         if(!Submit(*controller,*next,false,transaction)) return false;
         GateCommit(*controller,*next,transaction);
     }
@@ -912,6 +941,7 @@ static bool AttachSession(void* transaction,jlong surface,jlong parent,int width
     if(!current) return false;
     void* control=reinterpret_cast<void*>(static_cast<uintptr_t>(surface));
     const int32_t layer=g_layer_id(control);
+    if (layer == current->unwarped_layer) return false;
     // The caller has already proved ownership and the output domain. A buffer
     // currently owned by another stream cannot be adopted by this attachment.
     auto conflicting=[&](const std::unique_ptr<Session>& owner) {
@@ -946,7 +976,7 @@ static bool AttachSession(void* transaction,jlong surface,jlong parent,int width
 
 static jboolean TransitionJni(JNIEnv* env,jlong transaction,jlong surface,jlong parent,
     jint width,jint height,jfloatArray geometry,jboolean closing,jlong event_ns,
-    jlongArray companion_array,jboolean starting) {
+    jlongArray companion_array,jboolean starting,jlong unwarped_source=0) {
     if(!geometry || env->GetArrayLength(geometry)!=12 || !companion_array ||
        env->GetArrayLength(companion_array)>8) return JNI_FALSE;
     std::array<float,12> values{};
@@ -955,7 +985,8 @@ static jboolean TransitionJni(JNIEnv* env,jlong transaction,jlong surface,jlong 
     env->GetFloatArrayRegion(geometry,0,values.size(),values.data());
     if(env->ExceptionCheck()) return JNI_FALSE;
     return QueueSession(surface,parent,width,height,values,closing,event_ns,companions,starting,
-        0,0,reinterpret_cast<void*>(static_cast<uintptr_t>(transaction)))?JNI_TRUE:JNI_FALSE;
+        0,0,reinterpret_cast<void*>(static_cast<uintptr_t>(transaction)),
+        reinterpret_cast<void*>(static_cast<uintptr_t>(unwarped_source)))?JNI_TRUE:JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -968,9 +999,10 @@ Java_ng_lst_hha_ContentAnimator_nativeTransition(JNIEnv* env,jclass,jlong surfac
 extern "C" JNIEXPORT jboolean JNICALL
 Java_ng_lst_hha_ContentAnimator_nativePrime(JNIEnv* env,jclass,jlong transaction,jlong surface,
     jlong parent,jint width,jint height,jfloatArray geometry,jboolean closing,
-    jlong event_ns,jlongArray companion_array,jboolean starting) {
+    jlong event_ns,jlongArray companion_array,jboolean starting,jlong unwarped_source) {
     if(!transaction) return JNI_FALSE;
-    return TransitionJni(env,transaction,surface,parent,width,height,geometry,closing,event_ns,companion_array,starting);
+    return TransitionJni(env,transaction,surface,parent,width,height,geometry,closing,event_ns,companion_array,starting,
+        unwarped_source);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1001,26 +1033,28 @@ namespace hha {
 bool WarmIconRenderer() {return Initialize();}
 void RetainIconSurface(void* surface,const void* owner) {if(surface && g_inc_strong) g_inc_strong(surface,owner);}
 void ReleaseIconSurface(void* surface,const void* owner) {if(surface && g_dec_strong) g_dec_strong(surface,owner);}
-bool PrimeOpeningPreview(void* transaction,void* surface,void* parent,int width,int height,
-                         const Transition& request) {
+bool PrimeContentPublication(void* transaction,void* surface,void* parent,int width,int height,
+                             const Transition& request) {
     auto* controller=g_controller.load(std::memory_order_acquire);
-    if(!controller || !transaction || !surface || !parent || request.closing ||
+    if(!controller || !transaction || !surface || !parent ||
        width<=0 || height<=0 || width>16384 || height>16384) return false;
     const auto& values=request.geometry;
     for(float value:values) if(!std::isfinite(value)) return false;
     const int64_t now=NowNs();
+    const size_t full=request.closing?0:4;
+    const size_t small=request.closing?4:0;
     if(request.event_ns<=0 || request.event_ns>now+100000000LL ||
-       now-request.event_ns>1500000000LL || std::abs(values[6]-width)>=2 ||
-       std::abs(values[7]-height)>=2) return false;
-    const genie::Rect icon{values[0],values[1],values[2],values[3]};
-    const genie::Rect window{values[4],values[5],static_cast<double>(width),static_cast<double>(height)};
+       now-request.event_ns>1500000000LL || std::abs(values[full+2]-width)>=2 ||
+       std::abs(values[full+3]-height)>=2) return false;
+    const genie::Rect icon{values[small],values[small+1],values[small+2],values[small+3]};
+    const genie::Rect window{values[full],values[full+1],static_cast<double>(width),static_cast<double>(height)};
     Session publication;
     if(!genie::ParametersForIcon(icon,window,&publication.parameters)) return false;
-    publication.parameters.response=genie::kOpeningResponse;
-    if(!publication.animation.Reset(publication.parameters,true) ||
-       !publication.animation.Retarget(false)) return false;
-    publication.corner={genie::CornerRatio(values[10],icon),0.0,
-        genie::CornerRatio(values[11],window),publication.parameters.response};
+    publication.parameters.response=request.closing?genie::kClosingResponse:genie::kOpeningResponse;
+    if(!publication.animation.Reset(publication.parameters,!request.closing) ||
+       !publication.animation.Retarget(request.closing)) return false;
+    publication.corner={genie::CornerRatio(values[10],request.closing?window:icon),0.0,
+        genie::CornerRatio(values[11],request.closing?icon:window),publication.parameters.response};
     const double elapsed=std::max(0.0,static_cast<double>(now-request.event_ns)/1e9);
     publication.animation.Advance(elapsed);
     genie::AdvanceScalar(&publication.corner,elapsed,1.0);
@@ -1033,6 +1067,10 @@ bool PrimeOpeningPreview(void* transaction,void* surface,void* parent,int width,
     std::lock_guard<std::mutex> lock(controller->mutex);
     if(!controller->shader) return false;
     return Submit(*controller,publication,false,static_cast<ASurfaceTransaction*>(transaction),nullptr,false);
+}
+bool PrimeOpeningPreview(void* transaction,void* surface,void* parent,int width,int height,
+                         const Transition& request) {
+    return !request.closing && PrimeContentPublication(transaction,surface,parent,width,height,request);
 }
 bool RenderIcon(void* transaction,void* surface,void* parent,int texture_width,int texture_height,
                 int window_width,int window_height,const Transition& transition) {

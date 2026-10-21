@@ -73,7 +73,11 @@ folders above, `first-frame-evidence.json`, `first-frame-release-cleanup/`,
 physical recordings, module logs and trace line references. Captures without an
 actual supported Genie opening were rejected by the analyzer.
 
-## Remaining limits
+## Remaining limits at this revision
+
+The independent-child and parallel-preview gaps below were subsequently
+addressed by [live child content and rapid preview handoffs](live-child-content.md).
+The counts above remain the historical validation of the preceding repair.
 
 These checks establish first-frame protection for directly selected surfaces;
 they do not establish complete content-tree coverage. Independently generated

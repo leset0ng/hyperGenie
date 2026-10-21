@@ -46,9 +46,10 @@ internal object ContentAnimator {
     /** Append to a caller-owned show transaction; never apply or close it here. */
     fun prime(transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
               geometry: FloatArray, closing: Boolean, eventTimeNanos: Long,
-              companions: LongArray = longArrayOf(), starting: Boolean = false): Boolean =
+              companions: LongArray = longArrayOf(), starting: Boolean = false,
+              unwarpedSource: Long = 0L): Boolean =
         initialized && nativePrime(transaction, surface, parent, width, height, geometry,
-            closing, eventTimeNanos, companions, starting)
+            closing, eventTimeNanos, companions, starting, unwarpedSource)
 
     fun attach(transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
                eventTimeNanos: Long): Boolean = initialized &&
@@ -67,6 +68,11 @@ internal object ContentAnimator {
         }
     }
 
+    /** Resolve only a buffer child owned by this process's original control. */
+    fun bufferSurfaceCopy(surface: Long): Long =
+        if (initialized && surface != 0L) nativeBufferSurfaceCopy(surface) else 0L
+
+    @JvmStatic external fun nativeBufferSurfaceCopy(surface: Long): Long
     @JvmStatic external fun nativeInitialize(): Boolean
     @JvmStatic external fun nativeTransition(
         surface: Long,
@@ -82,7 +88,7 @@ internal object ContentAnimator {
     @JvmStatic external fun nativePrime(
         transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
         geometry: FloatArray, closing: Boolean, eventNs: Long,
-        companions: LongArray, starting: Boolean,
+        companions: LongArray, starting: Boolean, unwarpedSource: Long,
     ): Boolean
     @JvmStatic external fun nativeAttach(
         transaction: Long, surface: Long, parent: Long, width: Int, height: Int, eventNs: Long,

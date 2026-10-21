@@ -724,6 +724,58 @@ void OneShotOpeningPublication() {
     ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
     std::puts("PASS atomic one-shot preview publication without a second frame writer");
 }
+void ClosingGroupHostPublication() {
+    auto& controller=Fresh();
+    hha::Transition request;
+    request.geometry=Geometry(1120,2436);
+    request.closing=true;request.event_ns=NowNs()-16000000LL;
+    auto* transaction=ASurfaceTransaction_create();
+    const auto applies=renderer_applies.load();
+    Check(hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1799),
+        reinterpret_cast<void*>(1790),1120,2436,request),"closing live group primes its host transaction");
+    Check(events.size()==1 && !events[0].clear && events[0].layer==1799 &&
+          events[0].transaction==transaction,"closing output protection joins the caller's first host transaction");
+    Check(!controller.active && !controller.pending && commits.empty() && renderer_applies.load()==applies,
+          "closing one-shot creates neither a second writer nor an independent apply");
+    ClearSurface(transaction,reinterpret_cast<void*>(1799));
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    std::puts("PASS closing group first host publication");
+}
+void GroupedSourcePublication() {
+    auto& controller=Fresh();
+    auto opening=Geometry(1120,2436);
+    for(size_t i=0;i<4;++i) std::swap(opening[i],opening[i+4]);
+    std::swap(opening[10],opening[11]);
+    const auto request=NowNs();
+    Check(QueueSession(1801,1800,1120,2436,opening,false,request,{1802},false),
+          "seed direct content with a starting companion");
+    Pump(controller);ResetEvents();
+    auto* transaction=ASurfaceTransaction_create();
+    Check(QueueSession(1803,1800,1120,2436,opening,false,request,{1801,1802},false,
+                       0,0,transaction,reinterpret_cast<void*>(1801)),
+          "prime live grouped output in its reveal transaction");
+    Check(controller.pending && !Owns(*controller.pending,1801) && Owns(*controller.pending,1802),
+          "grouping excludes its source from explicit and inherited companions while retaining previews");
+    Check(border_widths[1801]==0 && border_widths[1803]>0,
+          "group source is cleared in the same publication as output SELF");
+    Check(events.size()>=2 && events.front().clear && events.front().layer==1801 &&
+          events.front().transaction==transaction && events[1].transaction==transaction,
+          "source restoration and grouped first effect use the caller's one transaction");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    ResetEvents();Frame(NowNs(),&controller);
+    Check(events.empty(),"old source writer pauses while grouped first publication is uncommitted");
+    Commit(0);Pump(controller);ResetEvents();Frame(NowNs(),&controller);
+    Check(controller.active && controller.active->layer==1803 && !Owns(*controller.active,1801),
+          "grouped output adopts the same request without retaining its source");
+    for(const auto& event:events) Check(event.layer!=1801 || event.clear,
+          "no subsequent frame rewrites SELF on the live source");
+    transaction=ASurfaceTransaction_create();
+    Check(!AttachSession(transaction,1801,1800,1120,2436,request),
+          "a late source show cannot reintroduce double deformation");
+    ASurfaceTransaction_delete(transaction);
+    Stop(controller);
+    std::puts("PASS grouped-source publication prevents double deformation");
+}
 } // namespace
 
 int main() {
@@ -738,7 +790,7 @@ int main() {
     OverlappingRequests();IndependentCommitGates();CrossParentPreviewHandoff();
     AtomicCompanionAttachment();StopDuringCompanionPublication();RepeatedPrimeCommitGates();
     PrimedCrossParentHandoff();DelayedPendingPreviewCoalescence();
-    PublicationUnionAfterLateAttachment();OneShotOpeningPublication();DrainCompletions();
+    PublicationUnionAfterLateAttachment();OneShotOpeningPublication();ClosingGroupHostPublication();GroupedSourcePublication();DrainCompletions();
     {std::lock_guard<std::mutex> lock(test_mutex);
      for(const auto& entry:border_widths) Check(entry.second==0.0f,"all CLIENT guards cleared after retirement");
      for(const auto& entry:references) Check(entry.second==0,"all fake capabilities released");

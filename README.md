@@ -96,7 +96,7 @@ On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
 controller in an isolated executable with fake surface capabilities and empty
 SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
 commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 1,221 checks; `ADB_SERIAL` selects a device. It does not
+The current suite passes 1,301 checks; `ADB_SERIAL` selects a device. It does not
 install the module or touch
 real App layers.
 
@@ -146,7 +146,7 @@ app/src/main/
 ## Validation status
 
 The current build passes Android assembly/lint, 784 native geometry checks and
-1,221 isolated checks of the actual renderer. Sampled Settings/Calculator
+1,301 isolated checks of the actual renderer. Sampled Settings/Calculator
 transitions verify content access, composition and cleanup; these checks do not
 establish complete visual fidelity. The earlier positive-shadow CLIENT guard
 caused a visible dark exterior and has been replaced by a fully transparent
@@ -187,9 +187,18 @@ per-stream event ordering, and all outstanding publication commit barriers.
 Per-request snapshot ownership also covers a window cancelled before worker
 lookup, and old cleanup cannot unblock or replace a newer request's release.
 See [first-frame publication and validation](docs/first-frame-publication.md)
-for exact capture counts and the separation between directly covered surfaces,
-stock fallback and independent child-layer coverage. Independent SurfaceView
-and `[BBQ]` content descendants remain outside the current shader coverage.
+for the preceding publication repair. Independent SurfaceView content now uses
+a live subtree mirror, private virtual display and owned BLAST output; SELF
+warps that composed buffer once. Local legacy `[BBQ]` previews resolve their
+actual buffer child before copying the producer control. Closing transfers the
+tracked hide/show transaction into Launcher's first host transaction, so a
+planar video child cannot leak while the bridge worker catches up.
+
+Rapid parallel previews now use the exact opening Change/domain proof, including
+merged-animation lifetime and pre-enqueue Snapshot validation. The final cold
+and rapid captures have zero rejected preparations, first-draw misses or
+uncovered BBQ descendants. See [live child content and validation](docs/live-child-content.md)
+for measured coverage, lifecycle behavior and the extra composition cost.
 
 The emulator has a separate verified host-capture buffer-selection problem
 when its secondary display is enabled; recordings temporarily disable it and

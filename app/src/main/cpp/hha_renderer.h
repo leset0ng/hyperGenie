@@ -48,6 +48,9 @@ void ReleaseIconSurface(void* surface,const void* owner);
 bool PrimeOpeningPreview(void* transaction,void* surface,void* parent,int width,int height,
                          const Transition& transition);
 // Resolve only an authenticated OEM preview, without any WMS lookup/wait.
+bool PrepareContentGroup(void* transaction,void* parent,int width,int height,const Transition& transition);
+bool PrimeContentPublication(void* transaction,void* surface,void* parent,int width,int height,
+                             const Transition& transition);
 bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
                            const Transition& transition);
 bool RenderIcon(void* transaction,void* surface,void* parent,int texture_width,int texture_height,
