@@ -96,7 +96,7 @@ On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
 controller in an isolated executable with fake surface capabilities and empty
 SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
 commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 1,301 checks; `ADB_SERIAL` selects a device. It does not
+The current suite passes 1,401 checks; `ADB_SERIAL` selects a device. It does not
 install the module or touch
 real App layers.
 
@@ -146,7 +146,7 @@ app/src/main/
 ## Validation status
 
 The current build passes Android assembly/lint, 784 native geometry checks and
-1,301 isolated checks of the actual renderer. Sampled Settings/Calculator
+1,401 isolated checks of the actual renderer. Sampled Settings/Calculator
 transitions verify content access, composition and cleanup; these checks do not
 establish complete visual fidelity. The earlier positive-shadow CLIENT guard
 caused a visible dark exterior and has been replaced by a fully transparent
@@ -199,6 +199,23 @@ merged-animation lifetime and pre-enqueue Snapshot validation. The final cold
 and rapid captures have zero rejected preparations, first-draw misses or
 uncovered BBQ descendants. See [live child content and validation](docs/live-child-content.md)
 for measured coverage, lifecycle behavior and the extra composition cost.
+
+Gesture-release closing keeps the dragged presentation rectangle separate from
+the full content buffer. The authenticated group preparation returns its actual
+buffer dimensions to Launcher for App/icon publication; scaled closing endpoints
+are checked for uniform scale instead of being required to equal fullscreen
+size. One-shot and tracked publications share the full content origin and the
+release corner metric. The regression suite covers translated/scaled closing,
+first-frame commit/cleanup, and rejection of distorted, oversized or incomplete
+opening domains. Installed AVD checks pass five gesture closes (including a
+fresh Launcher with no cached opening, two swipe lengths, Settings, Contacts
+and Calculator) plus two Home-key closes. Every close publishes both App/icon
+viewports with `accepted=1 primed=1`; core process IDs, crash logs and runtime
+configuration remain stable. Production Binder probes also reject distorted
+and oversized closes, a partial opening and the older protocol version. Sampled
+recording frames show the closing contour deforming before icon handoff.
+This repairs the release animation; continuous finger-tracking Genie deformation
+remains outside the implemented path.
 
 The emulator has a separate verified host-capture buffer-selection problem
 when its secondary display is enabled; recordings temporarily disable it and

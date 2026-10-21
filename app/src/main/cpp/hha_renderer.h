@@ -47,8 +47,9 @@ void ReleaseIconSurface(void* surface,const void* owner);
 // subsequent preview frames and retirement, so this creates no icon session.
 bool PrimeOpeningPreview(void* transaction,void* surface,void* parent,int width,int height,
                          const Transition& transition);
-// Resolve only an authenticated OEM preview, without any WMS lookup/wait.
-bool PrepareContentGroup(void* transaction,void* parent,int width,int height,const Transition& transition);
+// Return the server-verified full content domain independently of a gesture's
+// current presentation. No cached opening is required for a closing request.
+bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,const Transition& transition);
 bool PrimeContentPublication(void* transaction,void* surface,void* parent,int width,int height,
                              const Transition& transition);
 bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,

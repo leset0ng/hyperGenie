@@ -188,11 +188,27 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         contentEnabled = true
         val source = groupTasks[request.taskId] ?: return false
         subtrees.ready(source)?.use { entry ->
-            val full = if (request.closing) 0 else 4
             if (access.field(entry.task, "mTaskId") != request.taskId ||
-                (request.containerLayer >= 0 && surfaceLayer.invoke(entry.parent) != request.containerLayer) ||
-                kotlin.math.abs(request.geometry[full + 2] - entry.width) >= 2 ||
-                kotlin.math.abs(request.geometry[full + 3] - entry.height) >= 2) return false
+                (request.containerLayer >= 0 && surfaceLayer.invoke(entry.parent) != request.containerLayer)) return false
+            // A close starts at the gesture's translated/scaled presentation,
+            // while the owned buffer keeps its original fullscreen dimensions.
+            // Require uniform scaling of that verified domain; opens still
+            // need an exact full-size endpoint before the host can be changed.
+            val full = if (request.closing) 0 else 4
+            val width = request.geometry[full + 2]
+            val height = request.geometry[full + 3]
+            val domainMatches = if (request.closing) {
+                width <= entry.width + 2f && height <= entry.height + 2f &&
+                    kotlin.math.abs(height - width * entry.height / entry.width) < 2f
+            } else {
+                kotlin.math.abs(width - entry.width) < 2f &&
+                    kotlin.math.abs(height - entry.height) < 2f
+            }
+            if (!domainMatches) {
+                report(Log.DEBUG, "group domain rejected leash=${request.leash} closing=${request.closing} " +
+                    "presentation=${width}x$height buffer=${entry.width}x${entry.height}")
+                return false
+            }
             val transition = Request(TRANSITION, request.leash, request.containerLayer, request.taskId,
                 request.closing, request.eventNs, request.geometry)
             // Unlike a WMS show hook, this authenticated Binder endpoint holds
@@ -234,6 +250,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     writeTransaction.invoke(null, transactionObject.getLong(hostPublication), encoded)
                     reply.writeNoException()
                     reply.writeInt(1)
+                    reply.writeInt(entry.width)
+                    reply.writeInt(entry.height)
                     reply.appendFrom(encoded, 0, encoded.dataSize())
                 } finally {
                     closeTransaction.invoke(hostPublication)
@@ -1071,7 +1089,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         const val DESCRIPTOR = "android.view.IWindowManager"
         const val TRANSACTION = 0x484841
         const val MAGIC = 0x48484131
-        const val VERSION = 2
+        const val VERSION = 3
         const val TRANSITION = 1
         const val CANCEL = 2
         const val PREPARE_PREVIEW = 3

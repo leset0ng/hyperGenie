@@ -741,6 +741,165 @@ void ClosingGroupHostPublication() {
     ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
     std::puts("PASS closing group first host publication");
 }
+void GestureClosingSessionPublication() {
+    auto& controller=Fresh();
+    const std::array<float,12> release={456.9f,289.9f,663,1442.1f,80,2117,171,171,
+                                        458,-335,106.56f,45.61f};
+    const hha::genie::Rect icon{80,2117,171,171},window{0,0,1120,2436};
+    hha::genie::Parameters expected;
+    Check(hha::genie::ParametersForIcon(icon,window,&expected),"gesture reference uses the authoritative content domain");
+    expected.response=hha::genie::kClosingResponse;
+    // The bridge accepts small future clock skew. Keep the initial publication
+    // exactly at release time so elapsed scheduling cannot hide a wrong seed.
+    const auto request=NowNs()+50000000LL;
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create gesture group reveal transaction");
+    const auto applies=renderer_applies.load();
+    Check(QueueSession(1811,1810,1120,2436,release,true,request,{},false,
+                       0,0,transaction,reinterpret_cast<void*>(1812)),
+          "gesture close primes a full buffer from a scaled translated release");
+    Check(controller.pending && controller.pending->closing && controller.pending->width==1120 &&
+          controller.pending->height==2436,"gesture session retains full buffer dimensions rather than release dimensions");
+    auto& pending=*controller.pending;
+    Check(pending.parameters.width==expected.width && pending.parameters.height==expected.height &&
+          pending.parameters.icon_x==expected.icon_x && pending.parameters.icon_y==expected.icon_y &&
+          pending.parameters.window_x==expected.window_x && pending.parameters.window_y==expected.window_y &&
+          pending.parameters.minimized_scale==expected.minimized_scale &&
+          pending.parameters.genie_amount_y==expected.genie_amount_y,
+          "gesture translation and scale do not become the content geometry basis");
+    const double start_corner=static_cast<double>(release[10])/release[2];
+    const double end_corner=static_cast<double>(release[11])/release[6];
+    Check(std::abs(pending.corner.value-start_corner)<1e-12 &&
+          std::abs(pending.corner.target-end_corner)<1e-12,
+          "gesture corners use released visible width and destination icon width");
+    Check(pending.corner.response==hha::genie::kClosingResponse,
+          "gesture close preserves ordinary closing corner dynamics");
+    Check(events.size()==2 && events[0].clear && events[0].layer==1812 &&
+          !events[1].clear && events[1].layer==1811 &&
+          events[0].transaction==transaction && events[1].transaction==transaction,
+          "gesture source restoration and first output shader share the reveal transaction");
+    Check(layer_uniforms[1811][36]==1120 && layer_uniforms[1811][37]==2436 &&
+          layer_uniforms[1811][40]==1120 && layer_uniforms[1811][41]==2436,
+          "gesture first shader uses the full buffer for destination and source extents");
+    Check(std::abs(layer_uniforms[1811][38]-start_corner)<1e-7,
+          "gesture first shader preserves the release radius instead of dividing it by full width");
+    Check(commits.size()==1 && renderer_applies.load()==applies && border_widths[1811]>0 && border_widths[1812]==0,
+          "gesture first publication is commit gated with atomic CLIENT protection and no separate apply");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    ResetEvents();Frame(request,&controller);
+    Check(events.empty() && controller.pending && !controller.active,
+          "gesture renderer cannot advance before its reveal transaction commits");
+    Commit(0);Pump(controller);
+    Check(controller.active && controller.active->layer==1811 && !controller.pending,
+          "gesture closing session adopts after its reveal commit");
+    ResetEvents();Frame(request+120000000LL,&controller);
+    hha::genie::Animation reference;
+    Check(reference.Reset(expected,false) && reference.Retarget(true),"initialize independently based gesture closing reference");
+    reference.Advance(.12);
+    const auto mesh=hha::genie::ContourMesh(reference,expected);
+    for(size_t i=0;i<mesh.size();++i) {
+        Check(std::abs(layer_uniforms[1811][i*4]-mesh[i].x)<1e-6 &&
+              std::abs(layer_uniforms[1811][i*4+1]-mesh[i].y)<1e-6,
+              "gesture mesh advances in the authoritative origin and full content domain");
+    }
+    Check(controller.active->frames==1 && border_widths[1811]>0,
+          "committed gesture close advances while retaining output protection");
+    ResetEvents();Stop(controller);
+    Check(Cleared()==std::vector<int>{1811} && border_widths[1811]==0,
+          "gesture cleanup clears its shader and CLIENT guard together");
+    Check(controller.detaches_pending.load()==1 && Running(),
+          "gesture cleanup stays outstanding until detach completion");
+    DrainCompletions();Check(!Running(),"gesture renderer becomes idle after cleanup completion");
+    std::puts("PASS gesture close full-domain session publication and cleanup");
+}
+void GestureClosingHostPublication() {
+    auto& controller=Fresh();
+    hha::Transition request;
+    request.geometry={456.9f,289.9f,663,1442.1f,80,2117,171,171,458,-335,106.56f,45.61f};
+    request.closing=true;request.event_ns=NowNs()+50000000LL;
+    auto* transaction=ASurfaceTransaction_create();Check(transaction,"create gesture first host transaction");
+    const auto applies=renderer_applies.load();
+    Check(hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1821),
+        reinterpret_cast<void*>(1820),1120,2436,request),
+        "gesture host publication accepts actual full dimensions with a scaled translated release");
+    Check(events.size()==1 && !events[0].clear && events[0].layer==1821 && events[0].transaction==transaction,
+          "gesture output shader is in the first host transaction before the caller applies it");
+    Check(layer_uniforms[1821][36]==1120 && layer_uniforms[1821][37]==2436 &&
+          layer_uniforms[1821][40]==1120 && layer_uniforms[1821][41]==2436,
+          "gesture host publication samples the authoritative full content buffer");
+    Check(std::abs(layer_uniforms[1821][38]-static_cast<double>(request.geometry[10])/request.geometry[2])<1e-7,
+          "gesture host first corner ratio uses the scaled release width");
+    Check(!controller.active && !controller.pending && controller.queued.empty() &&
+          controller.overlapping.empty() && commits.empty() && completions.empty() &&
+          renderer_applies.load()==applies && controller.submitted_serial.load()==0 && !Running(),
+          "gesture host one-shot creates no extra renderer session, callbacks, or independent apply");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    // An elapsed frame distinguishes the content's (0,0) origin from the
+    // translated release origin; the zero-time identity mesh alone cannot.
+    ResetEvents();transaction=ASurfaceTransaction_create();Check(transaction,"create elapsed gesture host transaction");
+    request.event_ns=NowNs()-120000000LL;
+    const auto before=NowNs();
+    Check(hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1821),
+        reinterpret_cast<void*>(1820),1120,2436,request),"elapsed gesture host publication retains the full content domain");
+    const auto after=NowNs();
+    hha::genie::Parameters expected;
+    Check(hha::genie::ParametersForIcon({80,2117,171,171},{0,0,1120,2436},&expected),
+          "elapsed gesture reference uses full-screen origin instead of release translation");
+    expected.response=hha::genie::kClosingResponse;
+    hha::genie::Animation first,last;
+    Check(first.Reset(expected,false) && first.Retarget(true) && last.Reset(expected,false) && last.Retarget(true),
+          "initialize elapsed gesture reference at both observed publication times");
+    first.Advance(static_cast<double>(before-request.event_ns)/1e9);
+    last.Advance(static_cast<double>(after-request.event_ns)/1e9);
+    const auto first_mesh=hha::genie::ContourMesh(first,expected);
+    const auto last_mesh=hha::genie::ContourMesh(last,expected);
+    for(size_t i=0;i<first_mesh.size();++i) {
+        const double x=layer_uniforms[1821][i*4],y=layer_uniforms[1821][i*4+1];
+        Check(x>=std::min(first_mesh[i].x,last_mesh[i].x)-1e-6 &&
+              x<=std::max(first_mesh[i].x,last_mesh[i].x)+1e-6 &&
+              y>=std::min(first_mesh[i].y,last_mesh[i].y)-1e-6 &&
+              y<=std::max(first_mesh[i].y,last_mesh[i].y)+1e-6,
+              "elapsed first-host mesh uses authoritative geometry within the observed clock interval");
+    }
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    ResetEvents();transaction=ASurfaceTransaction_create();Check(transaction,"create gesture host cleanup transaction");
+    ClearSurface(transaction,reinterpret_cast<void*>(1821));
+    Check(events.size()==1 && events[0].clear && events[0].layer==1821 &&
+          events[0].transaction==transaction && border_widths[1821]==0,
+          "central-owner cleanup removes gesture host SELF and CLIENT guard atomically");
+    ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
+    std::puts("PASS gesture close full-domain first host publication");
+}
+void GesturePublicationRejectsIncompatibleGeometry() {
+    auto& controller=Fresh();
+    hha::Transition release;
+    release.geometry={456.9f,289.9f,663,1442.1f,80,2117,171,171,458,-335,106.56f,45.61f};
+    release.closing=true;
+    auto distorted=release;distorted.geometry[3]=1500;
+    auto oversized=release;oversized.geometry[2]=1232;oversized.geometry[3]=2679.6f;
+    auto opening=release;opening.closing=false;
+    for(size_t i=0;i<4;++i) std::swap(opening.geometry[i],opening.geometry[i+4]);
+    std::swap(opening.geometry[10],opening.geometry[11]);
+    const std::array<std::pair<hha::Transition,const char*>,3> cases{{
+        {distorted,"distorted gesture close cannot publish a mismatched buffer aspect"},
+        {oversized,"uniformly scaled close larger than the authoritative domain is rejected"},
+        {opening,"partial opening cannot borrow the scaled-close publication exception"},
+    }};
+    for(const auto& item:cases) {
+        auto request=item.first;request.event_ns=NowNs();
+        auto* transaction=ASurfaceTransaction_create();Check(transaction,"create rejected gesture publication transaction");
+        const auto applies=renderer_applies.load();
+        const auto retained=references;
+        Check(!hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1831),
+            reinterpret_cast<void*>(1830),1120,2436,request),item.second);
+        Check(events.empty() && border_widths.empty() && commits.empty() && completions.empty() &&
+              !controller.active && !controller.pending && !Running() && controller.submitted_serial.load()==0,
+              "rejected gesture geometry publishes no shader, CLIENT guard, session, or callbacks");
+        Check(renderer_applies.load()==applies && references==retained,
+              "rejected gesture geometry applies no transaction and retains no capabilities");
+        ASurfaceTransaction_delete(transaction);
+    }
+    std::puts("PASS gesture publication rejects distorted, oversized, and partial-opening domains");
+}
 void GroupedSourcePublication() {
     auto& controller=Fresh();
     auto opening=Geometry(1120,2436);
@@ -790,7 +949,9 @@ int main() {
     OverlappingRequests();IndependentCommitGates();CrossParentPreviewHandoff();
     AtomicCompanionAttachment();StopDuringCompanionPublication();RepeatedPrimeCommitGates();
     PrimedCrossParentHandoff();DelayedPendingPreviewCoalescence();
-    PublicationUnionAfterLateAttachment();OneShotOpeningPublication();ClosingGroupHostPublication();GroupedSourcePublication();DrainCompletions();
+    PublicationUnionAfterLateAttachment();OneShotOpeningPublication();ClosingGroupHostPublication();
+    GestureClosingSessionPublication();GestureClosingHostPublication();GesturePublicationRejectsIncompatibleGeometry();
+    GroupedSourcePublication();DrainCompletions();
     {std::lock_guard<std::mutex> lock(test_mutex);
      for(const auto& entry:border_widths) Check(entry.second==0.0f,"all CLIENT guards cleared after retirement");
      for(const auto& entry:references) Check(entry.second==0,"all fake capabilities released");

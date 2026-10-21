@@ -16,7 +16,7 @@ namespace hha {
 // only an exactly owned OEM pre-start preview for same-transaction publication.
 constexpr int32_t kBridgeCode = 0x484841;
 constexpr int32_t kBridgeMagic = 0x48484131;
-constexpr int32_t kBridgeVersion = 2;
+constexpr int32_t kBridgeVersion = 3;
 
 struct Transition {
     int32_t leash_layer = -1;

@@ -141,7 +141,6 @@ Property Spring(const void* parameters, const char* key) {
 using Last = hha::AnimationSource;
 std::array<Last,32> g_last{};
 size_t g_next = 0;
-hha::genie::Rect g_window{0,0,0,0};
 
 struct IconBuffer {
     void* surface=nullptr;
@@ -297,8 +296,8 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         for(auto& slot:g_last) if(slot.valid && slot.transition.leash_layer==id) {previous=&slot;break;}
         if (adjust && previous && animation_id<=previous->animation_id) return;
         if (!previous) previous=&g_last[g_next++%g_last.size()];
-        if(!request.closing) g_window={request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
-        previous->window=g_window;
+        previous->window=request.closing?cached.window:
+            hha::genie::Rect{request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
         previous->presentation_start=presentation_start;
         previous->adjusting=adjust && cached.valid;
         previous->transition=request;
@@ -389,10 +388,8 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         const size_t small=snapshot.transition.closing?4:0;
         const size_t full=snapshot.transition.closing?0:4;
         const hha::genie::Rect icon{geometry[small],geometry[small+1],geometry[small+2],geometry[small+3]};
-        const hha::genie::Rect window=snapshot.window.width>0?snapshot.window:
+        hha::genie::Rect window=snapshot.window.width>0?snapshot.window:
             hha::genie::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
-        hha::genie::Rect minimized;
-        if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) return;
         if(!is_icon && !snapshot.adjusting && g_name &&
            g_name(control).find("Pre startup opening leash")==0) {
             if(!hha::PrepareOpeningPreview(transaction,const_cast<void*>(control),
@@ -408,16 +405,25 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             hha::QueueTransition(snapshot.transition);
         }
         if(!is_icon && !snapshot.adjusting && snapshot.transition.task_id>=0) {
-            if(!hha::PrepareContentGroup(transaction,const_cast<void*>(control),
-                static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition)) {
+            if(!hha::PrepareContentGroup(transaction,const_cast<void*>(control),&window,snapshot.transition)) {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 for(auto& source:g_last) if(source.valid &&
                     source.transition.event_ns==snapshot.transition.event_ns &&
                     source.transition.leash_layer==snapshot.transition.leash_layer) source.supported=false;
                 return;
             }
+            // The service owns the full buffer domain. Keep it for this stream
+            // and its paired icon, even without an earlier opening submission.
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(auto& source:g_last) if(source.valid &&
+                    source.transition.event_ns==snapshot.transition.event_ns &&
+                    source.transition.leash_layer==snapshot.transition.leash_layer) source.window=window;
+            }
             hha::QueueTransition(snapshot.transition);
         }
+        hha::genie::Rect minimized;
+        if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) return;
         if(is_icon) {
             bool rendering=false;
             std::lock_guard<std::mutex> lock(g_mutex);

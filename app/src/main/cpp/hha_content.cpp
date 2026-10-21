@@ -1043,18 +1043,27 @@ bool PrimeContentPublication(void* transaction,void* surface,void* parent,int wi
     const int64_t now=NowNs();
     const size_t full=request.closing?0:4;
     const size_t small=request.closing?4:0;
+    const bool full_endpoint=std::abs(values[full+2]-width)<2 &&
+                             std::abs(values[full+3]-height)<2;
+    const bool scaled_close=request.closing && values[full+2]>0 && values[full+3]>0 &&
+        values[full+2]<=width+2.0f && values[full+3]<=height+2.0f &&
+        std::abs(values[full+3]-values[full+2]*height/width)<2;
     if(request.event_ns<=0 || request.event_ns>now+100000000LL ||
-       now-request.event_ns>1500000000LL || std::abs(values[full+2]-width)>=2 ||
-       std::abs(values[full+3]-height)>=2) return false;
+       now-request.event_ns>1500000000LL || (!full_endpoint && !scaled_close)) return false;
     const genie::Rect icon{values[small],values[small+1],values[small+2],values[small+3]};
-    const genie::Rect window{values[full],values[full+1],static_cast<double>(width),static_cast<double>(height)};
+    // Match QueueSession: presentation coordinates are not the full buffer's
+    // origin when a gesture has already translated and scaled its parent.
+    const genie::Rect window{full_endpoint?values[full]:0.0,full_endpoint?values[full+1]:0.0,
+        static_cast<double>(width),static_cast<double>(height)};
+    const genie::Rect start{values[0],values[1],values[2],values[3]};
+    const genie::Rect end{values[4],values[5],values[6],values[7]};
     Session publication;
     if(!genie::ParametersForIcon(icon,window,&publication.parameters)) return false;
     publication.parameters.response=request.closing?genie::kClosingResponse:genie::kOpeningResponse;
     if(!publication.animation.Reset(publication.parameters,!request.closing) ||
        !publication.animation.Retarget(request.closing)) return false;
-    publication.corner={genie::CornerRatio(values[10],request.closing?window:icon),0.0,
-        genie::CornerRatio(values[11],request.closing?icon:window),publication.parameters.response};
+    publication.corner={genie::CornerRatio(values[10],start),0.0,
+        genie::CornerRatio(values[11],end),publication.parameters.response};
     const double elapsed=std::max(0.0,static_cast<double>(now-request.event_ns)/1e9);
     publication.animation.Advance(elapsed);
     genie::AdvanceScalar(&publication.corner,elapsed,1.0);

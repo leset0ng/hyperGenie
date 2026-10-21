@@ -145,7 +145,7 @@ void Queue(Command command) {
 }
 }  // namespace
 
-bool PrepareContentGroup(void* transaction,void* parent,int width,int height,const Transition& transition) {
+bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,const Transition& transition) {
     static void* library=dlopen("libbinder_ndk.so",RTLD_NOW|RTLD_LOCAL);
     using CheckService=AIBinder* (*)(const char*);
     static auto check=library?reinterpret_cast<CheckService>(dlsym(library,"AServiceManager_checkService")):nullptr;
@@ -161,7 +161,7 @@ bool PrepareContentGroup(void* transaction,void* parent,int width,int height,con
     static auto release=reinterpret_cast<Release>(symbol("_ZNK7android7RefBase9decStrongEPKv"));
     static auto read_transaction=reinterpret_cast<ReadTransaction>(symbol("_ZN7android21SurfaceComposerClient11Transaction14readFromParcelEPKNS_6ParcelE"));
     static auto merge_transaction=reinterpret_cast<MergeTransaction>(symbol("_ZN7android21SurfaceComposerClient11Transaction5mergeEOS1_"));
-    if(!check || !transaction || !parent || !view || !read || !release || !read_transaction ||
+    if(!check || !transaction || !parent || !window || !view || !read || !release || !read_transaction ||
        !merge_transaction || transition.task_id<0) return false;
     AIBinder* binder=check("window");
     if(!binder) return false;
@@ -183,10 +183,16 @@ bool PrepareContentGroup(void* transaction,void* parent,int width,int height,con
         if(status==STATUS_OK && result && AStatus_isOk(result)) status=AParcel_readInt32(output,&accepted);
         if(result) AStatus_delete(result);
     }
+    int32_t width=0,height=0;
+    if(status==STATUS_OK && accepted==1) {
+        status=AParcel_readInt32(output,&width);
+        if(status==STATUS_OK) status=AParcel_readInt32(output,&height);
+    }
     void* output_surface=nullptr;
     ASurfaceTransaction* visibility=ASurfaceTransaction_create();
     bool primed=false;
-    if(status==STATUS_OK && accepted==1 && visibility) {
+    if(status==STATUS_OK && accepted==1 && visibility &&
+       width>0 && height>width && width<=16384 && height<=16384) {
         const void* parcel=view(output);
         if(parcel && read(parcel,&output_surface)==0 && output_surface &&
            read_transaction(visibility,parcel)==0 &&
@@ -194,6 +200,7 @@ bool PrepareContentGroup(void* transaction,void* parent,int width,int height,con
             // Includes the server's commit listener, so a host publication
             // arriving after cancellation restores the latest owner's state.
             merge_transaction(transaction,visibility);
+            *window={0,0,static_cast<double>(width),static_cast<double>(height)};
             primed=true;
         }
     }
@@ -203,7 +210,7 @@ bool PrepareContentGroup(void* transaction,void* parent,int width,int height,con
     if(output) AParcel_delete(output);
     AIBinder_decStrong(binder);
     __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_DEBUG,"HHA.Bridge",
-        "group before host leash=%d accepted=%d primed=%d status=%d",transition.leash_layer,accepted,primed,status);
+        "group before host leash=%d accepted=%d primed=%d status=%d domain=%dx%d",transition.leash_layer,accepted,primed,status,width,height);
     if(accepted && !primed) QueueCancel(transition.leash_layer,transition.event_ns);
     return primed;
 }
