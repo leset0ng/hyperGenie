@@ -106,9 +106,9 @@ On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
 controller in an isolated executable with fake surface capabilities and empty
 SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
 commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 10,948 checks; `ADB_SERIAL` selects a device. It does not
+The current suite passes 12,776 checks; `ADB_SERIAL` selects a device. It does not
 install the module or touch real App layers. `tests/run-launcher-device-tests.sh`
-adds 111 checks of the actual Launcher hooks with isolated parameter trees and
+adds 127 checks of the actual Launcher hooks with isolated parameter trees and
 fake capabilities, including separate OEM construction transactions, reused
 pre-start closing, exclusive preview/group preparation, admission retries, and
 failure fallbacks.
@@ -159,19 +159,24 @@ app/src/main/
 
 ## Validation status
 
-**Task3 (AVD visual acceptance) is blocked.** Current captures still show square
-plates and small Settings content inside a larger OEM backdrop. The remaining
-`preSplashStarting` route includes unmasked **solid-color layers**; this is not
-evidence that snapshot pixels are poisoned. Nonuniform OEM closing crops also
+**The confirmed square-frame paths and exact startup-preview close continuation
+have been repaired.** Latest AVD cold, held-main and rapid captures do not show the
+earlier square App plates or nested Settings content in the inspected contact
+sheets. All1031 detailed sampled relevant draws retain SELF and159 publication
+diagnostics contain no inherited-contour reset. Held Gallery/Calculator startup
+previews both closed through the new authenticated path. One ordinary cold request
+still exceeded the64ms first-buffer wait and deferred; nonuniform OEM crops also
 retain the stock route until their sampled crop can be converted safely. See
-[current fallback validation](docs/fallback-routing-validation.md) for the
-installed SHA, measured samples and remaining limits.
+[current fallback validation](docs/fallback-routing-validation.md) for the installed
+SHA, recordings, sample limits and remaining boundaries.
 
 The current build passes Android assembly/lint, 775 native geometry/reference
-checks, 10,948 isolated checks of the actual renderer and 111 Launcher-hook
-integration checks. Shared frame regression covers publication order, distinct
-texture domains, source-authenticated rapid reversal and composed-output
-replacement ownership. Earlier installed AVD captures
+checks, 12,776 isolated checks of the actual renderer and 127 Launcher-hook
+integration checks, plus20 actual-compiled-class JVM checks for exact preview-close
+authorization and bridge integration. Shared frame regression covers publication order, distinct
+texture domains, source-authenticated rapid reversal, composed-output replacement,
+preview-mask retirement and worker/icon coalescence of a pending prime. The last
+race has a failing-before/passing-after device regression. Earlier installed AVD captures
 confirm six ordinary App/icon registrations and a close-to-open adjust with
 `accepted=1 primed=1`, stable core processes and no new crash entries. See
 [shared animation frames](docs/animation-frame-sync.md). Retired helper-only

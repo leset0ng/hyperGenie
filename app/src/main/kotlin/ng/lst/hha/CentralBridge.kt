@@ -27,6 +27,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val groupOwners = ConcurrentHashMap<Int, Long>()
     private val groupTasks = ConcurrentHashMap<Int, Int>()
     private val taskEvents = ConcurrentHashMap<Int, Long>()
+    private val taskRequests = ConcurrentHashMap<Int, Request>()
     private val events = SurfaceEvents(module, loader, ::surfaceShowing, ::surfacesChanged, ::bufferCreated, ::sourceRemoved)
     private val snapshotReleases = HashMap<Int, SnapshotRelease>()
     private val wmsClass = Class.forName("com.android.server.wm.WindowManagerService", false, loader)
@@ -55,6 +56,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val requests = ConcurrentHashMap<Int, Envelope>()
     private val owners = ConcurrentHashMap<Long, Owner>()
     private val earlyPublications = ConcurrentHashMap<Int, Long>()
+    private val openingPreviews = ConcurrentHashMap<Int, PreviewCloseIdentity>()
+    private val closingPreviews = ConcurrentHashMap<Long, PreviewCloseIdentity>()
     private val sessions = LinkedHashMap<Int, Active>() // Bridge worker only.
     private val lastEvents = HashMap<Int, Long>()
     private val changeQueued = AtomicBoolean()
@@ -112,8 +115,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 val request = Request.read(input) ?: return@runCatching false
                 if (closed) return@runCatching false
                 if (request.taskId >= 0 && request.operation in arrayOf(TRANSITION, PREPARE_GROUP, PREPARE_PREVIEW)) {
-                    taskEvents.merge(request.taskId, request.eventNs) { old, next -> maxOf(old, next) }
-                    if (taskEvents.size > 64) taskEvents.entries.removeIf { System.nanoTime() - it.value > SESSION_NS }
+                    recordTaskRequest(request)
                     surfacesChanged()
                 }
                 if (request.operation == PREPARE_GROUP) {
@@ -209,13 +211,45 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 "closing=${request.closing} reason=$reason")
             return false
         }
+        fun defer(reason: String = "first-buffer"): Boolean {
+            report(Log.DEBUG, "group deferred leash=${request.leash} task=${request.taskId} reason=$reason")
+            reply.writeNoException()
+            reply.writeInt(2) // Retry is allowed; this reply changes no host geometry.
+            return true
+        }
         if (!rendererReady || nativeWriteSurface == null || !animationsEnabled(context) || request.taskId < 0) {
             return reject("capability-or-task-unavailable")
         }
+        if (!taskCurrent(request)) return reject("superseded-task")
         contentEnabled = true
-        val source = groupTasks[request.taskId] ?: return reject("task-source-unavailable")
-        subtrees.ready(source)?.use { entry ->
-            if (access.field(entry.task, "mTaskId") != request.taskId ||
+        val source = groupTasks[request.taskId] ?: run {
+            // A normal window can appear after the last lifecycle callback.
+            // Resolve it now so its verified subtree can start producing a
+            // first buffer before this host transaction is admitted.
+            try {
+                lookup(service, request)?.close()
+            } catch (_: PreStartingSurfaces.Busy) {
+                return if (taskCurrent(request)) defer("companion-registry-busy") else reject("superseded-task")
+            }
+            groupTasks[request.taskId]
+        } ?: return if (request.closing && preparePreviewClose(service, context, request, reply)) true
+            else reject("task-source-unavailable")
+        // This endpoint holds no WMS/SC locks. Give the already-running VD a
+        // bounded chance to commit its first real buffer while Launcher's
+        // original host transaction is still untouched and owned by its caller.
+        if (!subtrees.awaitReady(source, FIRST_BUFFER_WAIT_MS)) {
+            return if (taskCurrent(request) && groupTasks[request.taskId] == source && subtrees.prepared(source))
+                defer() else reject("source-retired source=$source")
+        }
+        val prepared = try {
+            lookup(service, request)
+        } catch (_: PreStartingSurfaces.Busy) {
+            return if (taskCurrent(request)) defer("companion-registry-busy") else reject("superseded-task")
+        } ?: return reject("task-content-unavailable")
+        prepared.use { match ->
+            val entry = match.group ?: return reject("source-not-ready source=$source")
+            if (entry.sourceLayer != source || entry.task !== match.task ||
+                access.field(entry.task, "mTaskId") != request.taskId ||
                 (request.containerLayer >= 0 && surfaceLayer.invoke(entry.parent) != request.containerLayer)) {
                 return reject("task-parent-mismatch")
             }
@@ -255,11 +289,22 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             val publication = newTransaction.newInstance()
             val encoded = Parcel.obtain()
             try {
-                if (!subtrees.activate(entry, publication)) return reject("activation-unavailable")
-                if (!ContentAnimator.prime(transactionObject.getLong(publication),
+                if (!taskCurrent(request)) return reject("superseded-task")
+                // Companion discovery belongs to the same authenticated Task
+                // and publication as the composed output, before host masking
+                // is removed. In particular, manager color layers have no BBQ.
+                val locks = (listOf(entry.parent, entry.output, entry.source) + match.companions)
+                    .map { checkNotNull(surfaceLock.get(it)) }.distinct()
+                fun prime(index: Int): Boolean {
+                    if (index < locks.size) return synchronized(locks[index]) { prime(index + 1) }
+                    if (!subtrees.activate(entry, publication)) return false
+                    return ContentAnimator.prime(transactionObject.getLong(publication),
                         nativeObject.getLong(entry.output), nativeObject.getLong(entry.parent), entry.width, entry.height,
                         request.geometry, request.closing, request.eventNs,
-                        unwarpedSource = nativeObject.getLong(entry.source))) {
+                        companions = LongArray(match.companions.size) { nativeObject.getLong(match.companions[it]) },
+                        unwarpedSource = nativeObject.getLong(entry.source))
+                }
+                if (!prime(0)) {
                     subtrees.restore(entry, publication)
                     return reject("native-prime-rejected")
                 }
@@ -278,14 +323,73 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 reply.writeInt(entry.height)
                 reply.appendFrom(encoded, 0, encoded.dataSize())
                 report(Log.INFO, "group before host leash=${request.leash} source=$source " +
-                    "output=${surfaceLayer.invoke(entry.output)} closing=${request.closing}")
+                    "output=${surfaceLayer.invoke(entry.output)} companions=${match.companionLayers} closing=${request.closing}")
                 return true
             } finally {
                 closeTransaction.invoke(publication)
                 encoded.recycle()
             }
         }
-        return reject("source-not-ready source=$source")
+    }
+
+    /** Only a previously published, still-live starting WindowState can authorize this path. */
+    private fun preparePreviewClose(service: Any, context: Context, request: Request, reply: Parcel): Boolean {
+        val identity = openingPreviews[request.taskId] ?: return false
+        if (!identity.allowsClose(request.taskId, request.eventNs, request.geometry[2], request.geometry[3]) ||
+            request.containerLayer < 0 || !taskCurrent(request)) return false
+        val match = lookup(service, request, identity) ?: return false
+        match.use {
+            if (!it.starting || !it.identityDomain || it.content == null || it.contentLayer != identity.bufferLayer ||
+                it.group != null || it.previewIdentity !== identity) return false
+            if (!snapshots.block(request.taskId, request.eventNs)) return false
+            handler.post {
+                val cleanup = Active(service, context, request)
+                cleanup.taskId = request.taskId
+                cleanup.snapshotBlocked = true
+                releaseSnapshotAfterDetach(cleanup)
+            }
+            val publication = newTransaction.newInstance()
+            val encoded = Parcel.obtain()
+            try {
+                if (!taskCurrent(request)) return false
+                val locks = (listOf(it.parent, it.content) + it.companions)
+                    .map { surface -> checkNotNull(surfaceLock.get(surface)) }.distinct()
+                fun prime(index: Int): Boolean {
+                    if (index < locks.size) return synchronized(locks[index]) { prime(index + 1) }
+                    return ContentAnimator.prime(transactionObject.getLong(publication),
+                        nativeObject.getLong(it.content), nativeObject.getLong(it.parent), it.width, it.height,
+                        request.geometry, true, request.eventNs,
+                        companions = LongArray(it.companions.size) { index -> nativeObject.getLong(it.companions[index]) },
+                        starting = true)
+                }
+                if (!prime(0)) return false
+                val writer = nativeWriteSurface ?: return false
+                writer.invoke(null, nativeObject.getLong(it.content), encoded)
+                writeTransaction.invoke(null, transactionObject.getLong(publication), encoded)
+                closingPreviews.entries.removeIf { entry ->
+                    System.nanoTime() - entry.key > SESSION_NS
+                }
+                closingPreviews[request.eventNs] = identity
+                val remaining = ((SESSION_NS - (System.nanoTime() - request.eventNs)) / 1_000_000L).coerceAtLeast(1L)
+                handler.postDelayed({ closingPreviews.remove(request.eventNs, identity) }, remaining)
+                earlyPublications[it.contentLayer] = request.eventNs
+                val transition = Request(TRANSITION, request.leash, request.containerLayer, request.taskId,
+                    true, request.eventNs, request.geometry)
+                publish(Envelope(service, context, transition))
+                handler.post { process(service, context, transition) }
+                reply.writeNoException()
+                reply.writeInt(1)
+                reply.writeInt(it.width)
+                reply.writeInt(it.height)
+                reply.appendFrom(encoded, 0, encoded.dataSize())
+                report(Log.INFO, "preview close before host leash=${request.leash} task=${request.taskId} " +
+                    "content=${it.contentLayer} launch=${identity.launchToken} companions=${it.companionLayers}")
+                return true
+            } finally {
+                closeTransaction.invoke(publication)
+                encoded.recycle()
+            }
+        }
     }
 
     /** Capability-only: no WMS lock, worker wait, or publication apply on this Binder thread. */
@@ -405,6 +509,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         if (request.leash == -1) {
             requests.clear()
             earlyPublications.clear()
+            openingPreviews.clear()
+            closingPreviews.clear()
             sessions.values.toList().forEach { stop(it, "disabled") }
             ContentAnimator.stop()
             groupOwners.clear()
@@ -483,6 +589,18 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         }.getOrDefault(false)
     }
 
+    private fun recordTaskRequest(request: Request) {
+        taskRequests.compute(request.taskId) { _, old ->
+            if (old == null || old.eventNs <= request.eventNs) request else old
+        }
+        taskEvents.merge(request.taskId, request.eventNs) { old, next -> maxOf(old, next) }
+        if (taskEvents.size > 64) {
+            val now = System.nanoTime()
+            taskEvents.entries.removeIf { now - it.value > SESSION_NS }
+            taskRequests.entries.removeIf { now - it.value.eventNs > SESSION_NS }
+        }
+    }
+
     private fun taskCurrent(request: Request): Boolean =
         request.taskId < 0 || request.eventNs >= (taskEvents[request.taskId] ?: 0L)
 
@@ -539,7 +657,11 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         if (closed || sessions[current.parentLayer] !== current) return
         val taskId = current.request.taskId.takeIf { it >= 0 } ?: current.taskId
         if (current.request.eventNs < (taskEvents[taskId] ?: 0L)) {
-            stop(current, "superseded-task")
+            // A reversal of this exact host still needs its current native
+            // contour to seed the next prime. End discovery, but revoke only
+            // when a different host or content owner takes over.
+            val successor = taskRequests[taskId]
+            stop(current, if (successor?.leash == current.parentLayer) "superseded-stream" else "superseded-task")
             return
         }
         val updated = requests[current.parentLayer]?.request
@@ -573,6 +695,13 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     stop(current, "owner-changed")
                     return
                 }
+                if (current.request.closing && current.contentLayer >= 0 && it.content != null &&
+                    current.contentLayer != it.contentLayer) {
+                    // A close may keep its original content, but cannot claim a
+                    // replacement window that appeared during a later launch.
+                    stop(current, "owner-changed")
+                    return
+                }
                 if (it.needsGroup && it.group == null) {
                     owners[current.request.eventNs] = Owner(it.task, it.uid, it.width, it.height)
                     current.activityToken = it.activityToken
@@ -600,7 +729,19 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 current.taskId = it.taskId
                 current.task = it.task
                 current.uid = it.uid
-                if (it.content != null) rememberLayers(current, it)
+                if (it.content != null) {
+                    rememberLayers(current, it)
+                    if (!current.request.closing) {
+                        if (it.starting && it.previewIdentity != null) {
+                            openingPreviews.compute(it.taskId) { _, old ->
+                                if (old == null || old.openingNs <= it.previewIdentity.openingNs) it.previewIdentity else old
+                            }
+                            while (openingPreviews.size > MAX_PREVIEW_GRANTS)
+                                openingPreviews.entries.minByOrNull { entry -> entry.value.openingNs }
+                                    ?.let { entry -> openingPreviews.remove(entry.key, entry.value) }
+                        } else openingPreviews.remove(it.taskId)
+                    }
+                }
                 // A newer verified request for the same actual Task supersedes
                 // discovery only; native preserves same-layer state and guards.
                 sessions.values.filter { old -> old !== current && old.task === it.task &&
@@ -680,6 +821,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
 
     private fun sourceRemoved(layer: Int) {
         subtrees.invalidate(layer)
+        openingPreviews.entries.removeIf { it.value.producerLayer == layer || it.value.bufferLayer == layer }
         groupTasks.entries.removeIf { it.value == layer }
         groupOwners.remove(layer)
         surfacesChanged()
@@ -754,7 +896,27 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                             request.geometry[6].toInt(), request.geometry[7].toInt())))
             }.maxByOrNull { it.request.eventNs } ?: return
             val request = envelope.request
-            if (request.closing) return // Newly opening buffers are never attached to an old close.
+            if (request.closing) {
+                // A late main window from this exact launch may feed its
+                // offscreen group, but cannot appear unmasked behind the
+                // closing preview or become the old request's shader target.
+                val preview = closingPreviews[request.eventNs] ?: return
+                val window = show.window ?: return
+                val attrs = access.field(window, "mAttrs") as? WindowManager.LayoutParams ?: return
+                if (!grouped || attrs.type != 1 || taskId != preview.taskId ||
+                    !preview.sameLaunch(activity, task, activity?.let(preStarting::launchToken), uid) ||
+                    !taskCurrent(request)) return
+                val owned = if (show.transaction == null) newTransaction.newInstance() else null
+                try {
+                    val transaction = show.transaction ?: checkNotNull(owned)
+                    val source = surfaceLayer.invoke(show.surface) as Int
+                    if (subtrees.guard(transaction, source)) {
+                        groupOwners.merge(source, request.eventNs) { old, next -> maxOf(old, next) }
+                        if (owned != null) applyTransaction.invoke(owned)
+                    }
+                } finally { if (owned != null) closeTransaction.invoke(owned) }
+                return
+            }
             val full = 4
             val width = request.geometry[full + 2].toInt()
             val height = request.geometry[full + 3].toInt()
@@ -794,7 +956,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                         } else old
                     }
                     if (published) {
-                        taskEvents.merge(taskId, request.eventNs) { old, nextEvent -> maxOf(old, nextEvent) }
+                        recordTaskRequest(bound)
                         handler.post { process(next.service, next.context, bound) }
                     }
                 }
@@ -859,10 +1021,12 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             try {
                 val transaction = transactionObject.getLong(publication)
                 if (transaction == 0L) return
-                val attached = ContentAnimator.attach(transaction, surface, parentPointer, width, height, request.eventNs) ||
+                val starting = show.window == null ||
+                    (access.field(show.window, "mAttrs") as? WindowManager.LayoutParams)?.type == 3
+                val attached = ContentAnimator.attach(transaction, surface, parentPointer, width, height,
+                    request.eventNs, starting = starting) ||
                     ContentAnimator.prime(transaction, surface, parentPointer, width, height,
-                        request.geometry, false, request.eventNs,
-                        starting = show.window == null || (access.field(show.window, "mAttrs") as? WindowManager.LayoutParams)?.type == 3)
+                        request.geometry, false, request.eventNs, starting = starting)
                 if (attached) {
                     if (owned != null) {
                         applyTransaction.invoke(owned)
@@ -891,7 +1055,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     }
 
     /** Copies only while WM's ownership is stable, never returns borrowed surfaces. */
-    private fun lookup(service: Any, request: Request): Snapshot? {
+    private fun lookup(service: Any, request: Request,
+                       preview: PreviewCloseIdentity? = closingPreviews[request.eventNs]): Snapshot? {
         preStarting.prepare()
         val lock = access.field(service, "mGlobalLock") ?: return null
         return synchronized(lock) {
@@ -919,6 +1084,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 val token = access.field(activity, "token") ?: return@mapNotNull null
                 val taskId = access.field(task, "mTaskId") as? Int ?: return@mapNotNull null
                 if (request.taskId >= 0 && taskId != request.taskId) return@mapNotNull null
+                if (preview != null && (request.containerLayer < 0 ||
+                        !isLayer(access.field(task, "mSurfaceControl"), request.containerLayer))) return@mapNotNull null
                 // Both ordinary and starting windows can have real BLAST
                 // buffers. Only the animator's retained SC supplies content;
                 // the WindowContainer SC above remains a parent capability.
@@ -930,10 +1097,17 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             val normals = candidates.filter { it.type != 3 }
             val normalContents = normals.filter { it.content != null }
             val startingContents = candidates.filter { !request.closing && it.type == 3 && it.content != null }
-            val preferred = normalContents.filter { it.type == 1 }.ifEmpty { normalContents }
+            val preferred = if (request.closing && preview != null) candidates.filter { candidate ->
+                val producer = candidate.content
+                val size = contentSize(candidate)
+                candidate.type == 3 && producer != null && size != null && preview.matches(
+                    candidate.window, candidate.activity, candidate.activityToken, candidate.task, producer,
+                    surfaceLayer.invoke(producer) as Int, preStarting.launchToken(candidate.activity),
+                    candidate.taskId, candidate.uid, size.first, size.second)
+            } else normalContents.filter { it.type == 1 }.ifEmpty { normalContents }
                 .ifEmpty { startingContents }
                 .ifEmpty { normals.filter { it.type == 1 } }.ifEmpty { normals }
-                .ifEmpty { candidates.filter { it.type == 3 } }
+                .ifEmpty { candidates.filter { !request.closing && it.type == 3 } }
             // A task-level leash may contain more than one Activity. Do not pick
             // an arbitrary package/window from such an ambiguous subtree.
             if (preferred.isEmpty() || preferred.any {
@@ -982,17 +1156,28 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 val excluded = mutableSetOf(primaryLayer)
                 contentCopy?.let { excluded += surfaceLayer.invoke(it) as Int }
                 companionCopy?.let { excluded += surfaceLayer.invoke(it) as Int }
-                if (size != null && !request.closing) {
+                if (size != null) {
                     oemCopies = preStarting.copy(selected.activity, selected.task, frame,
                         size.first, size.second, request.leash, excluded)
                 }
                 val companions = (listOfNotNull(companionCopy) + oemCopies)
                     .sortedBy { surfaceLayer.invoke(it) as Int }
+                val identity = if (selected.type == 3 && selected.content != null && size != null &&
+                    identityDomain(selected.activity, selected.task, frame, size.first, size.second)) {
+                    if (preview != null) preview.takeIf { contentCopy != null &&
+                        surfaceLayer.invoke(contentCopy) == it.bufferLayer }
+                    else preStarting.launchToken(selected.activity)?.let { launch ->
+                        PreviewCloseIdentity(selected.window, selected.activity, selected.activityToken, selected.task,
+                            selected.content, primaryLayer, contentCopy?.let { surfaceLayer.invoke(it) as Int } ?: -1,
+                            launch, request.eventNs, selected.taskId, selected.uid, size.first, size.second)
+                    }
+                } else null
+                if (preview != null && identity == null) return@synchronized null
                 Snapshot(parentCopy, contentCopy, companions, selected.type == 3,
                     size?.first ?: 0, size?.second ?: 0, selected.activityToken,
                     selected.taskId, selected.uid, selected.task,
                     size != null && identityDomain(selected.activity, selected.task, frame, size.first, size.second),
-                    group, selected.type == 1 && subtrees.prepared(primaryLayer)).also {
+                    group, selected.type == 1 && subtrees.prepared(primaryLayer), identity).also {
                     parentCopy = null; contentCopy = null; companionCopy = null; group = null
                     oemCopies = emptyList()
                 }
@@ -1055,8 +1240,11 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             envelope.takeIf { it.request.eventNs > current.request.eventNs }
         }
         owners.remove(current.request.eventNs)
+        closingPreviews.remove(current.request.eventNs)
         earlyPublications.entries.removeIf { it.value == current.request.eventNs }
-        ContentAnimator.stopRequest(current.nativeParent, current.request.eventNs)
+        if (reason == "superseded-task" || reason == "owner-changed")
+            ContentAnimator.revokeRequest(current.nativeParent, current.request.eventNs)
+        else ContentAnimator.stopRequest(current.nativeParent, current.request.eventNs)
         releaseSnapshotAfterDetach(current)
         report(Log.INFO, "stop parent=${current.parentLayer} reason=$reason")
     }
@@ -1113,11 +1301,14 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         requests.clear()
         owners.clear()
         earlyPublications.clear()
+        openingPreviews.clear()
+        closingPreviews.clear()
         ContentAnimator.stop()
         runCatching { events.close() }
         groupOwners.clear()
         groupTasks.clear()
         taskEvents.clear()
+        taskRequests.clear()
         subtrees.close()
         runCatching { hook?.unhook() }
         hook = null
@@ -1138,6 +1329,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         val width: Int, val height: Int, val activityToken: Any, val taskId: Int, val uid: Int,
         val task: Any, val identityDomain: Boolean,
         val group: LiveSubtrees.Entry?, val needsGroup: Boolean,
+        val previewIdentity: PreviewCloseIdentity?,
     ) : AutoCloseable {
         val parentLayer = surfaceLayer.invoke(parent) as Int
         val contentLayer = content?.let { surfaceLayer.invoke(it) as Int } ?: -1
@@ -1209,6 +1401,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         const val PREPARE_GROUP = 4
         const val PREPARE_ICON = 5
         const val MAX_EXTENT = 16384
+        const val MAX_PREVIEW_GRANTS = 16
+        const val FIRST_BUFFER_WAIT_MS = 64L
         const val CANCEL_GRACE_MS = 48L
         const val CHECK_MS = 50L // Detachment completion cleanup only.
         const val MAX_EVENT_AGE_NS = 1_500_000_000L

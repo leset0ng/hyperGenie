@@ -118,6 +118,16 @@ void DrainCompletions() {
 }
 Controller& Fresh() {
     DrainCompletions();
+    // Mask-only OEM previews intentionally outlive their renderer Session.
+    // Model platform removal between fixtures with the authenticated hidden-
+    // surface cleanup API, which must reject any capability still actively owned.
+    if(g_controller.load()) {
+        auto* removal=ASurfaceTransaction_create();Check(removal,"create fixture preview-removal transaction");
+        for(const auto& entry:border_widths) if(entry.second>0.0f)
+            Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+                reinterpret_cast<jlong>(removal),entry.first),"fixture removal cannot clear a live effect owner");
+        ASurfaceTransaction_apply(removal);ASurfaceTransaction_delete(removal);
+    }
     // Controllers intentionally live until executable exit, as in production.
     auto* controller=new Controller;
     controller->shader=reinterpret_cast<void*>(9000);
@@ -200,9 +210,9 @@ void ReplacementPreservesSharedLayers() {
     Check(Queue(201,2001,1080,2340,{202,204}),"queue actual extent-changing replacement");
     Pump(controller);
     Check(controller.active && controller.active->width==1080,"replacement extent adopted");
-    Check(Cleared()==std::vector<int>{203},"only lost layer cleared, shared primary and companion kept");
-    Check(border_widths[201]>0 && border_widths[202]>0 && border_widths[203]==0 && border_widths[204]>0,
-          "replacement preserves shared CLIENT guards and retires only the lost companion");
+    Check(Cleared().empty(),"extent replacement preserves lost starting preview's final mask");
+    Check(border_widths[201]>0 && border_widths[202]>0 && border_widths[203]>0 && border_widths[204]>0,
+          "replacement keeps shared guards and the still-visible lost starting preview mask");
     Stop(controller);std::puts("PASS extent replacement retains shared layers");
 }
 void ScopedCancellation() {
@@ -299,6 +309,115 @@ void JniStopRequestValidation() {
     DrainCompletions();Check(!Running(),"scoped opening stop becomes idle after its own detach completes");
     std::puts("PASS JNI stop range, identity, and opening retirement");
 }
+void OwnershipRevocation() {
+    auto& controller=Fresh();
+    Check(Queue(321,3201,1120,2436,{322}),"seed closing owner with a retained preview");
+    Pump(controller);
+    const auto request=controller.active->request_ns;
+    for(jlong parent:{jlong{0},jlong{-1},static_cast<jlong>(INT32_MAX)+1,(jlong{1}<<32)+3201})
+        Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,parent,request);
+    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3201,request-1);
+    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3202,request);
+    Check(controller.active && controller.retired_requests.empty(),
+          "revoke validates parent range and exact epoch without poisoning the current request");
+    Check(Queue(323,3203),"seed an independently closing App");Pump(controller);
+    ResetEvents();
+    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3201,request);
+    auto cleared=Cleared();std::sort(cleared.begin(),cleared.end());
+    Check(controller.active && controller.active->layer==323 && controller.overlapping.empty(),
+          "ownership revoke removes an overlapping old close while keeping the independent owner");
+    Check(cleared==std::vector<int>{321} && border_widths[322]>0,
+          "revocation retires ordinary App input but freezes the retained preview's last mask");
+    auto* late=ASurfaceTransaction_create();Check(late,"create a late revoked content transaction");
+    Check(!AttachSession(late,324,3201,1120,2436,request),"revoked owner cannot attach a new visible buffer");
+    Check(!QueueSession(324,3201,1120,2436,Geometry(1120,2436),true,request,{},true,0,0,late),
+          "revoked close cannot return through a delayed primed discovery");
+    ASurfaceTransaction_delete(late);
+    ResetEvents();Frame(NowNs(),&controller);
+    for(const auto& event:events) Check(event.layer==323,"revoked close never writes another frame");
+    Stop(controller);
+
+    auto& canceled=Fresh();Check(Queue(325,3205),"seed ordinary canceled close");Pump(canceled);
+    const auto stopped=canceled.active->request_ns;
+    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3205,stopped);
+    late=ASurfaceTransaction_create();ResetEvents();
+    Check(!AttachSession(late,326,3205,1120,2436,stopped) && events.empty(),
+          "ordinary cancellation also forbids late show attachments during its silhouette grace");
+    ASurfaceTransaction_delete(late);Stop(canceled);
+    std::puts("PASS exact ownership revoke ends closing writers and rejects late discovery");
+}
+void OpeningCancelKeepsPreviewMasks() {
+    for(bool starting_primary:{false,true}) {
+        auto& controller=Fresh();
+        auto geometry=Geometry(1120,2436);
+        for(size_t i=0;i<4;++i) std::swap(geometry[i],geometry[i+4]);
+        std::swap(geometry[10],geometry[11]);
+        const auto request=NowNs();
+        Check(QueueSession(327,3207,1120,2436,geometry,false,request,{328},starting_primary),
+              "seed opening owner with a verified still-visible starting/color companion");
+        Pump(controller);
+        auto* show=ASurfaceTransaction_create();Check(show,"create late OEM color show transaction");
+        Check(Java_ng_lst_hha_ContentAnimator_nativeAttach(nullptr,nullptr,
+            reinterpret_cast<jlong>(show),329,3207,1120,2436,request,JNI_TRUE),
+            "JNI attachment retains authenticated starting/color metadata");
+        ASurfaceTransaction_apply(show);ASurfaceTransaction_delete(show);Commit(0);Pump(controller);
+        const auto preview_uniforms=layer_uniforms[328];
+        const auto late_preview_uniforms=layer_uniforms[329];
+        const auto primary_uniforms=layer_uniforms[327];
+        Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3207,request);
+        controller.active->cancel_ns=NowNs()-1;
+        ResetEvents();Frame(NowNs(),&controller);
+        Check(!controller.active && controller.retiring.empty(),"ordinary opening cancel ends the motion owner");
+        Check(border_widths[328]>0 && layer_uniforms[328]==preview_uniforms &&
+              border_widths[329]>0 && layer_uniforms[329]==late_preview_uniforms,
+              "opening cancel freezes primed and late-attached OEM starting/color masks");
+        if(starting_primary) Check(Cleared().empty() && border_widths[327]>0 && layer_uniforms[327]==primary_uniforms,
+              "starting primary also preserves its last mask after ordinary cancellation");
+        else Check(Cleared()==std::vector<int>{327} && border_widths[327]==0,
+              "ordinary main App input does not retain a shader after cancellation");
+        ResetEvents();Frame(NowNs(),&controller);
+        Check(events.empty(),"mask-only retired previews have no continued old animation writes");
+    }
+    std::puts("PASS ordinary opening cancellation freezes only starting/color masks");
+}
+
+void RevocationCommitOrdering() {
+    for(bool revoke_before_successor:{false,true}) {
+        for(bool successor_first:{false,true}) {
+            auto& controller=Fresh();auto first=Prime(331,3301,{332});
+            const auto request=controller.pending->request_ns;
+            size_t successor;
+            if(revoke_before_successor) {
+                Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3301,request);
+                Check(!controller.pending && controller.retiring.size()==1,
+                      "uncommitted revoked publication is retained solely for retirement");
+                successor=Prime(331,3301);
+                Check(controller.pending && !Owns(*controller.pending,332) && !controller.pending->primed_continuation,
+                      "new owner does not inherit a revoked preview or its motion");
+            } else {
+                successor=Prime(331,3301,{332});
+                Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3301,request);
+            }
+            Check(controller.pending && controller.pending->request_ns!=request,
+                  "revoke preserves the newer pending successor on the same host");
+            Check(std::find(controller.retired_requests.begin(),controller.retired_requests.end(),request)!=
+                      controller.retired_requests.end(),"revoke tombstones an older prime already in retirement");
+            ResetEvents();
+            if(successor_first) {Commit(successor);Pump(controller);Commit(first);}
+            else {Commit(first);Pump(controller);Commit(successor);}
+            Pump(controller);
+            Check(controller.active && controller.active->layer==331 && controller.retiring.empty(),
+                  "successor adopts after every borrowed transaction commits in either order");
+            for(int layer:Cleared()) Check(layer!=331,"old retirement cannot clear the successor's shared App");
+            Check(border_widths[331]>0,"shared App keeps SELF and CLIENT through revocation");
+            if(revoke_before_successor) Check(border_widths[332]>0 && !Owns(*controller.active,332),
+                "revoked preview freezes without joining the successor's motion owner");
+            Stop(controller);
+        }
+    }
+    std::puts("PASS revocation and late publication preserve successor commit ownership");
+}
+
 void IndependentDetachCompletions() {
     for(size_t first:{size_t{0},size_t{1}}) {
         auto& controller=Fresh();auto a=Prime(501,5001);auto b=Prime(502,5002);
@@ -593,7 +712,7 @@ void AtomicCompanionAttachment() {
     auto* transaction=ASurfaceTransaction_create();Check(transaction,"create companion show transaction");
     ResetEvents();
     Check(Java_ng_lst_hha_ContentAnimator_nativeAttach(nullptr,nullptr,
-              reinterpret_cast<jlong>(transaction),932,9301,1120,2436,request)==JNI_TRUE,
+              reinterpret_cast<jlong>(transaction),932,9301,1120,2436,request,JNI_FALSE)==JNI_TRUE,
           "nativeAttach appends new compatible buffer to exact request");
     Check(events.size()==1 && events[0].layer==932 && events[0].transaction==transaction &&
           border_widths[932]>0,"new buffer SELF and border use supplied show transaction only");
@@ -1020,6 +1139,28 @@ void GroupedSourcePublication() {
     std::puts("PASS grouped-source publication and masked retirement");
 }
 
+void RevokedGroupKeepsMask() {
+    auto& controller=Fresh();const auto request=NowNs();
+    auto* publication=ASurfaceTransaction_create();Check(publication,"create composed close publication");
+    Check(QueueSession(1851,1850,1120,2436,Geometry(1120,2436),true,request,{1853},false,
+                       0,0,publication,reinterpret_cast<void*>(1852)),"prime a closing composed output");
+    ASurfaceTransaction_apply(publication);ASurfaceTransaction_delete(publication);Commit(0);Pump(controller);
+    ResetEvents();
+    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,1850,request);
+    Check(!controller.active && controller.retiring.empty(),"revocation immediately ends the composed closing writer");
+    Check(Cleared().empty() && border_widths[1851]>0 && border_widths[1853]>0,
+          "composed output and still-visible OEM color retain their last masks after revoke");
+    ResetEvents();Frame(NowNs(),&controller);
+    Check(events.empty(),"revoked output has no further closing deformation writes");
+    auto* restore=ASurfaceTransaction_create();Check(restore,"create hidden output restoration transaction");
+    Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+        reinterpret_cast<jlong>(restore),1851),"bridge may clear the retired group's mask with its hide/source restoration");
+    Check(Cleared()==std::vector<int>{1851} && events[0].transaction==restore,
+          "revoked composed mask clears only in the supplied visibility transaction");
+    ASurfaceTransaction_delete(restore);
+    std::puts("PASS revoked composed close preserves mask until visibility restoration");
+}
+
 void GroupReplacementDoesNotBecomePreview() {
     auto& controller=Fresh();
     auto opening=Geometry(1120,2436);
@@ -1345,6 +1486,66 @@ void CheckVisibleContour(const VisibleUniforms& visible,int app,int icon) {
     Check(std::equal(a.begin(),a.begin()+36,i.begin()) && a[38]==i[38] && a[39]==i[39],
           "each visible transaction commit keeps App and icon mesh and corner in the same presentation state");
 }
+void WorkerCoalescencePreservesPrimedSnapshot() {
+    for(bool closing:{false,true}) for(bool icon_first:{false,true}) {
+        auto& controller=Fresh();
+        const auto old_geometry=LinkedGeometry(!closing);
+        const auto old_request=NowNs()-100000000LL;
+        Check(QueueSession(2091,2090,1120,2436,old_geometry,!closing,old_request,{},false),
+              "seed a moving App before worker/icon publication race");
+        Pump(controller);Commit(PrimeTestIcon(2092,2094,old_geometry,!closing,old_request));
+        controller.active->animation.Advance(.09);
+        hha::genie::AdvanceScalar(&controller.active->corner,.09,1.0);
+        controller.active->last_ns=NowNs()+10000000LL;
+        const auto request=NowNs();auto geometry=LinkedGeometry(closing);
+        if(closing) geometry[10]=0; // Captured OEM close input has a zero starting corner.
+        auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create primed reversal host transaction");
+        const auto app_commit=commits.size();
+        Check(QueueSession(2091,2090,1120,2436,geometry,closing,request,{},false,0,0,app_transaction),
+              "prime a reversal with inherited live contour and corner");
+        const auto app_snapshot=layer_uniforms[2091];
+        const auto scalars=controller.pending->animation.Scalars();
+        const auto corner=controller.pending->corner;
+        const auto last_ns=controller.pending->last_ns;
+        Check(app_snapshot[38]>0 && std::abs(corner.velocity)>1e-6,
+              "race seed has a rounded inherited silhouette and observable corner velocity");
+        Check(QueueSession(2091,2090,1120,2436,geometry,closing,request,{2093},false),
+              "worker discovery coalesces the same epoch before host adoption");
+        Check(controller.pending && controller.pending->corner.value==corner.value &&
+              controller.pending->corner.velocity==corner.velocity && controller.pending->last_ns==last_ns,
+              "unprimed same-epoch discovery preserves the already-published corner and frozen clock");
+        for(size_t i=0;i<scalars.size();++i)
+            Check(controller.pending->animation.Scalars()[i].value==scalars[i].value &&
+                  controller.pending->animation.Scalars()[i].velocity==scalars[i].velocity,
+                  "unprimed same-epoch discovery preserves every published mesh position and velocity");
+        Check(Owns(*controller.pending,2092) && Owns(*controller.pending,2093),
+              "snapshot inheritance retains linked icon and newly discovered companion ownership");
+        auto* icon_transaction=ASurfaceTransaction_create();Check(icon_transaction,"create racing icon transaction");
+        const auto icon_commit=commits.size();ResetEvents();
+        Check(PrimeLinkedIcon(icon_transaction,2092,2094,171,171,1120,2436,geometry,closing,request),
+              "icon publication joins the coalesced pending owner");
+        Check(layer_uniforms[2091]==app_snapshot,
+              "icon publication cannot overwrite the correct App prime with fresh endpoint geometry");
+        const auto icon_writes=TransactionWrites(icon_transaction);
+        VisibleUniforms visible;PresentWrites(visible,icon_writes);CheckVisibleContour(visible,2091,2092);
+        ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+        ASurfaceTransaction_apply(icon_transaction);ASurfaceTransaction_delete(icon_transaction);
+        ResetEvents();Commit(icon_first?icon_commit:app_commit);Pump(controller);Frame(NowNs(),&controller);
+        Check(controller.active && controller.active->request_ns==old_request && events.empty(),
+              "neither host commit order advances the old or pending writer before both barriers");
+        Commit(icon_first?app_commit:icon_commit);Pump(controller);
+        Check(controller.active && controller.active->request_ns==request &&
+              controller.active->corner.value==corner.value && controller.active->corner.velocity==corner.velocity,
+              "both host commits adopt the exact inherited corner rather than an endpoint reset");
+        for(size_t i=0;i<scalars.size();++i)
+            Check(controller.active->animation.Scalars()[i].value==scalars[i].value &&
+                  controller.active->animation.Scalars()[i].velocity==scalars[i].velocity,
+                  "adoption preserves every primed spring through worker coalescence");
+        Stop(controller);
+    }
+    std::puts("PASS worker discovery cannot reset a primed contour before linked-icon publication");
+}
+
 void LinkedIconWholeOwnerPublication() {
     auto& controller=Fresh();const auto geometry=LinkedGeometry(true);const auto request=NowNs();
     Check(QueueSession(2011,2010,1120,2436,geometry,true,request,{},false),
@@ -1736,18 +1937,20 @@ int main() {
     Check(std::isfinite(kClientBorderWidth) && kClientBorderWidth>0 && kClientBorderWidth<0.001f,
           "CLIENT guard stays finite, strictly positive, and below one thousandth of a pixel");
     FramePrimeOrdering();ReplacementPreservesSharedLayers();ScopedCancellation();PendingRetirement();
-    IndependentDetachCompletions();JniStopRequestValidation();PrimedReversalContinuity();CornerEndpointRadii();
+    IndependentDetachCompletions();JniStopRequestValidation();OwnershipRevocation();OpeningCancelKeepsPreviewMasks();
+    RevocationCommitOrdering();
+    PrimedReversalContinuity();CornerEndpointRadii();
     CornerRetargetAndHandoff();OpeningPreviewLifetime();
     OverlappingRequests();IndependentCommitGates();CrossParentPreviewHandoff();
     AtomicCompanionAttachment();StopDuringCompanionPublication();RepeatedPrimeCommitGates();
     PrimedCrossParentHandoff();DelayedPendingPreviewCoalescence();
     PublicationUnionAfterLateAttachment();OneShotOpeningPublication();ClosingGroupHostPublication();
     GestureClosingSessionPublication();GestureClosingHostPublication();GesturePublicationRejectsIncompatibleGeometry();
-    GroupedSourcePublication();GroupReplacementDoesNotBecomePreview();
+    GroupedSourcePublication();RevokedGroupKeepsMask();GroupReplacementDoesNotBecomePreview();
     LateLinkedIconSharesFrames();LinkedIconBeforeAppHandoff();LinkedIconPublicationCancellation();
     LinkedIconSeedLosesToAppPublication();LinkedIconCannotCrossAppOwnership();
     LinkedIconPendingReversalPublication();LinkedIconSelectsPendingPublication();
-    LinkedIconWholeOwnerPublication();LinkedIconAppCommitOrders();
+    LinkedIconWholeOwnerPublication();LinkedIconAppCommitOrders();WorkerCoalescencePreservesPrimedSnapshot();
     LinkedIconCannotReviveCancelledRequest();LinkedIconReversalEpochIsolation();
     LinkedIconAdjustPrecedesAppDispatch();LinkedIconProductionSourceParentProof();
     LinkedIconRejectsStaleAdjustSource();DrainCompletions();

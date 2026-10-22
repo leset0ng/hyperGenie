@@ -59,8 +59,8 @@ internal object ContentAnimator {
             windowWidth, windowHeight, geometry, closing, eventTimeNanos, sourceEventNanos, sourceParentLayer)
 
     fun attach(transaction: Long, surface: Long, parent: Long, width: Int, height: Int,
-               eventTimeNanos: Long): Boolean = initialized &&
-        nativeAttach(transaction, surface, parent, width, height, eventTimeNanos)
+               eventTimeNanos: Long, starting: Boolean = false): Boolean = initialized &&
+        nativeAttach(transaction, surface, parent, width, height, eventTimeNanos, starting)
 
     /** Clear a retired composition only in the transaction hiding its output. */
     fun clearRetiredGroup(transaction: Long, surface: Long): Boolean = initialized &&
@@ -68,6 +68,12 @@ internal object ContentAnimator {
 
     fun stopRequest(parent: Int, eventTimeNanos: Long) {
         if (initialized && parent >= 0) nativeStopRequest(parent.toLong(), eventTimeNanos)
+    }
+
+    /** End ownership after supersession; visible composed/starting masks survive retirement. */
+    fun revokeRequest(parent: Int, eventTimeNanos: Long) {
+        if (initialized && parent > 0 && eventTimeNanos > 0L)
+            nativeRevokeRequest(parent.toLong(), eventTimeNanos)
     }
 
     fun running(): Boolean = initialized && nativeRunning()
@@ -108,9 +114,11 @@ internal object ContentAnimator {
     ): Boolean
     @JvmStatic external fun nativeAttach(
         transaction: Long, surface: Long, parent: Long, width: Int, height: Int, eventNs: Long,
+        starting: Boolean,
     ): Boolean
     @JvmStatic external fun nativeClearRetiredGroup(transaction: Long, surface: Long): Boolean
     @JvmStatic external fun nativeStopRequest(parent: Long, eventNs: Long)
+    @JvmStatic external fun nativeRevokeRequest(parent: Long, eventNs: Long)
     @JvmStatic external fun nativeRunning(): Boolean
     @JvmStatic external fun nativeStop()
 

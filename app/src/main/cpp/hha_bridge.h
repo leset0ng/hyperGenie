@@ -40,6 +40,11 @@ struct AnimationSource {
     bool adjusting = false;
     bool valid = false;
     bool supported = true;
+    // Only an admitted host may skip first-frame preparation. Deferred groups
+    // remain icon-ineligible and can retry in a later real host transaction.
+    bool admitted = false;
+    bool retry_pending = false;
+    bool preparing = false;
 };
 
 // SF animation IDs are reused on different leashes. Pair an icon only with the
@@ -100,6 +105,12 @@ private:
 
 // Nonblocking, coalesced dispatch. Never make a synchronous WMS call from a
 // launcher animation callback, which can be part of a WMS lock dependency.
+enum class GroupPreparation { Rejected, Deferred, Ready };
+// PREPARE_GROUP accepted=2 means the exact group is awaiting its first buffer.
+// No host transaction is changed until a Ready reply has been merged.
+GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::Rect* window,
+                                          const Transition& transition);
+
 void QueueTransition(const Transition& transition);
 void QueueCancel(int32_t leash_layer, int64_t event_ns);
 bool LauncherAnimationEnabled();

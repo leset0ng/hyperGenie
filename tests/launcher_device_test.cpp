@@ -19,7 +19,7 @@ static void ObserveAlpha(ASurfaceTransaction*,ASurfaceControl* surface,float val
 namespace {
 int assertions=0, prepared=0, retained=0, released=0, queued=0, cancelled=0, local_cancels=0;
 int preview_prepared=0,group_prepared=0;
-bool accept=true,reenter_replace=false,accept_preview=true,accept_group=true;
+bool accept=true,reenter_replace=false,accept_preview=true,accept_group=true,defer_group=false;
 void Check(bool yes,const char* text) {++assertions;if(!yes){std::fprintf(stderr,"FAIL %s\n",text);std::exit(1);}}
 struct Control {int id;std::string name;};
 Control app{11,"Task=7#11"},icon{22,"FloatingIcon_all#22"},child{23,"[BBQ] FloatingIcon_all#22"},new_child{24,"[BBQ] FloatingIcon_all#22"},desktop{25,"DesktopIcon"};
@@ -65,7 +65,7 @@ void Reset() {
     g_layer=Layer;g_name=Name;g_stop=StockStop;g_transaction_id=TransactionId;
     alpha_writes=prepared=retained=released=queued=cancelled=local_cancels=0;
     suppressed=nullptr;accept=true;reenter_replace=false;
-    preview_prepared=group_prepared=0;accept_preview=accept_group=true;
+    preview_prepared=group_prepared=0;accept_preview=accept_group=true;defer_group=false;
 }
 void Seed(Param& source) {
     const void* control=&app;Observe(&control,source.Reference(),false);
@@ -85,6 +85,11 @@ void Reverse(Param& parameters) {
         SetSpring(parameters.Reference(),key,spring.end,spring.start);
     }
 }
+std::vector<std::array<unsigned char,0x30>> Properties(const Param& parameters) {
+    std::vector<std::array<unsigned char,0x30>> result;
+    for(const auto& node:parameters.nodes) result.push_back(node->property);
+    return result;
+}
 void CheckStock(const Param& parameters) {
     const void* reference=&parameters.ref;
     Check(Spring(reference,"ratio").start!=Spring(reference,"ratio").end,"rejected preparation preserves OEM aspect animation");
@@ -102,9 +107,11 @@ bool PrepareOpeningPreview(void*,void*,int,int,const Transition& transition) {
     ++preview_prepared;
     return accept_preview&&!transition.closing;
 }
-bool PrepareContentGroup(void*,void*,genie::Rect*,const Transition& transition) {
+GroupPreparation PrepareContentGroupStatus(void*,void*,genie::Rect*,const Transition& transition) {
     ++group_prepared;
-    return accept_group&&transition.task_id>=0;
+    if(transition.task_id<0) return GroupPreparation::Rejected;
+    if(accept_group) return GroupPreparation::Ready;
+    return defer_group ? GroupPreparation::Deferred : GroupPreparation::Rejected;
 }
 bool PrepareIcon(void*,void* surface,void* parent,int tw,int th,int ww,int wh,const Transition&) {
     ++prepared;Check(surface==&child&&parent==&icon,"central registration uses exact retained capabilities");
@@ -235,5 +242,59 @@ int main(){
     TuneParent(reinterpret_cast<void*>(0x4567),&shell_control,continuing.Reference());
     Check(g_last[0].adjusting&&group_prepared==3&&queued==2&&g_last[0].host_transaction_id==0x4567,
           "already prepared adjust keeps its fast continuation path");
+
+    // A later host transaction can repeat the same SF generation without a
+    // newer adjust. First-buffer admission must retry that exact request.
+    Reset();accept_group=false;defer_group=true;Param pending_group(2);
+    Observe(&shell_control,pending_group.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1111),&shell_control,pending_group.Reference());
+    const auto pending_epoch=g_last[0].transition.event_ns;
+    const auto pending_geometry=g_last[0].transition.geometry;
+    const auto pending_properties=Properties(pending_group);
+    Check(!g_last[0].supported&&g_last[0].retry_pending&&!g_last[0].admitted,
+          "deferred group remains unadmitted and icon-ineligible");
+    Check(!hha::FindIconSource(g_last,77,Now()),"pending group cannot lend custom geometry to the icon");
+    Param stale_host(2,76);const auto stale_properties=Properties(stale_host);
+    TuneParent(reinterpret_cast<void*>(0x1212),&shell_control,stale_host.Reference());
+    Check(group_prepared==1&&Properties(stale_host)==stale_properties,
+          "older host callback cannot retry or mutate the pending generation");
+    Observe(&shell_control,pending_group.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1313),&shell_control,pending_group.Reference());
+    Check(group_prepared==2&&queued==0&&g_last[0].transition.event_ns==pending_epoch,
+          "still-pending same-ID host retry keeps its epoch without dispatch");
+    Check(Properties(pending_group)==pending_properties&&g_last[0].transition.geometry==pending_geometry,
+          "deferred retries preserve every stock spring and original content geometry");
+    accept_group=true;
+    TuneParent(reinterpret_cast<void*>(0x2222),&shell_control,pending_group.Reference());
+    Check(group_prepared==3&&queued==1&&g_last[0].host_transaction_id==0x2222,
+          "same-generation host callback retries ready first-buffer admission");
+    Check(g_last[0].transition.event_ns==pending_epoch&&g_last[0].transition.geometry==pending_geometry,
+          "same-generation admission preserves original epoch and square icon domain");
+    Check(g_last[0].supported&&g_last[0].admitted&&!g_last[0].retry_pending&&!g_last[0].preparing,
+          "successful host merge atomically completes pending admission");
+    Observe(&shell_control,pending_group.Reference(),false);
+    Param repeated_host(2);Observe(&shell_control,repeated_host.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x3333),&shell_control,repeated_host.Reference());
+    Check(group_prepared==3&&queued==1&&g_last[0].host_transaction_id==0x3333,
+          "admitted same-generation callbacks never duplicate preparation or dispatch");
+    Check(g_last[0].transition.event_ns==pending_epoch&&g_last[0].transition.geometry==pending_geometry,
+          "rewritten host springs cannot contaminate the retained content request");
+
+    Reset();accept_group=false;Param terminal_group(2);
+    Observe(&shell_control,terminal_group.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1111),&shell_control,terminal_group.Reference());
+    accept_group=true;
+    TuneParent(reinterpret_cast<void*>(0x2222),&shell_control,terminal_group.Reference());
+    Check(group_prepared==1&&queued==0&&!g_last[0].retry_pending,
+          "terminal domain rejection cannot become a same-generation retry");
+    CheckStock(terminal_group);
+
+    Reset();accept_group=false;defer_group=true;Param expired_group(2);
+    Observe(&shell_control,expired_group.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1111),&shell_control,expired_group.Reference());
+    g_last[0].transition.event_ns=Now()-1600000000LL;accept_group=true;
+    TuneParent(reinterpret_cast<void*>(0x2222),&shell_control,expired_group.Reference());
+    Check(group_prepared==1&&queued==0,"deferred request cannot revive after the render deadline");
+    CheckStock(expired_group);
     std::printf("PASS %d Launcher integration checks\n",assertions);
 }

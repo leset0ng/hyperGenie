@@ -175,7 +175,8 @@ void Queue(Command command) {
 }
 }  // namespace
 
-bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,const Transition& transition) {
+GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::Rect* window,
+                                          const Transition& transition) {
     static void* library=dlopen("libbinder_ndk.so",RTLD_NOW|RTLD_LOCAL);
     using CheckService=AIBinder* (*)(const char*);
     static auto check=library?reinterpret_cast<CheckService>(dlsym(library,"AServiceManager_checkService")):nullptr;
@@ -192,10 +193,13 @@ bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,cons
     static auto read_transaction=reinterpret_cast<ReadTransaction>(symbol("_ZN7android21SurfaceComposerClient11Transaction14readFromParcelEPKNS_6ParcelE"));
     static auto merge_transaction=reinterpret_cast<MergeTransaction>(symbol("_ZN7android21SurfaceComposerClient11Transaction5mergeEOS1_"));
     if(!check || !transaction || !parent || !window || !view || !read || !release || !read_transaction ||
-       !merge_transaction || transition.task_id<0) return false;
+       !merge_transaction || transition.task_id<0) return GroupPreparation::Rejected;
     AIBinder* binder=check("window");
-    if(!binder) return false;
-    if(!AIBinder_associateClass(binder,BridgeClass())) {AIBinder_decStrong(binder);return false;}
+    if(!binder) return GroupPreparation::Rejected;
+    if(!AIBinder_associateClass(binder,BridgeClass())) {
+        AIBinder_decStrong(binder);
+        return GroupPreparation::Rejected;
+    }
     AParcel* output=nullptr;
     int32_t accepted=0;
     binder_status_t status=Send(binder,transition,4,&output,&accepted);
@@ -225,8 +229,13 @@ bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,cons
     AIBinder_decStrong(binder);
     __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_DEBUG,"HHA.Bridge",
         "group before host leash=%d accepted=%d primed=%d status=%d domain=%dx%d",transition.leash_layer,accepted,primed,status,width,height);
-    if(accepted && !primed) QueueCancel(transition.leash_layer,transition.event_ns);
-    return primed;
+    if(accepted==1 && !primed) QueueCancel(transition.leash_layer,transition.event_ns);
+    if(primed) return GroupPreparation::Ready;
+    return status==STATUS_OK && accepted==2 ? GroupPreparation::Deferred : GroupPreparation::Rejected;
+}
+
+bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,const Transition& transition) {
+    return PrepareContentGroupStatus(transaction,parent,window,transition)==GroupPreparation::Ready;
 }
 
 bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,

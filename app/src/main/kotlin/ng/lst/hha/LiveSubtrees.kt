@@ -10,7 +10,9 @@ import android.util.Log
 import android.view.Surface
 import io.github.libxposed.api.XposedModule
 import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.function.Consumer
@@ -173,6 +175,24 @@ internal class LiveSubtrees(
         !closed && record != null && !record.retired
     }
 
+    /** Binder capability endpoint only; never call while holding WMS or SC locks. */
+    fun awaitReady(sourceLayer: Int, timeoutMillis: Long): Boolean {
+        val record = synchronized(lock) {
+            records[sourceLayer]?.takeIf { !closed && !it.retired } ?: return false
+        }
+        // The signal is emitted only after SF commits a real first buffer, or
+        // retirement wakes the waiter. Waiting authorizes no empty publication.
+        try {
+            if (!record.readySignal.await(timeoutMillis, TimeUnit.MILLISECONDS)) return false
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            return false
+        }
+        return synchronized(lock) {
+            !closed && records[sourceLayer] === record && !record.retired && record.bufferReady
+        }
+    }
+
     fun ready(sourceLayer: Int): Entry? = synchronized(lock) {
         val record = records[sourceLayer] ?: return@synchronized null
         if (closed || record.retired || !record.bufferReady) return@synchronized null
@@ -318,6 +338,7 @@ internal class LiveSubtrees(
                         else { record.bufferReady = true; true }
                     }
                     if (ready) {
+                        record.readySignal.countDown()
                         module.log(Log.INFO, TAG, "subtree ready source=${record.sourceLayer} " +
                             "output=${layer(record.output)} generation=${record.generation}")
                         notifyReady()
@@ -420,6 +441,7 @@ internal class LiveSubtrees(
         records.remove(record.sourceLayer, record)
         record.retired = true
         record.bufferReady = false
+        record.readySignal.countDown()
         handler.post { destroy(record); notifyReady() }
     }
 
@@ -516,7 +538,7 @@ internal class LiveSubtrees(
             closed = true
             val retiring = records.values.toList()
             records.clear()
-            retiring.forEach { it.retired = true; it.bufferReady = false }
+            retiring.forEach { it.retired = true; it.bufferReady = false; it.readySignal.countDown() }
             handler.post {
                 retiring.forEach(::destroy)
                 worker.quitSafely()
@@ -537,6 +559,7 @@ internal class LiveSubtrees(
         var display: IBinder? = null
         var retired = false
         var destroyed = false
+        val readySignal = CountDownLatch(1)
         var bufferReady = false
         var active = false
         var activeCommitted = false

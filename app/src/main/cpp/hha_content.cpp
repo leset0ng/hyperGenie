@@ -173,6 +173,7 @@ struct Session {
     bool primed_continuation = false;
     bool closing = false;
     bool starting = false;
+    bool preserve_preview_masks = true; // OEM preview visibility can outlive its motion owner.
     hha::genie::Parameters parameters;
     hha::genie::Animation animation;
     hha::genie::Scalar corner;
@@ -280,8 +281,14 @@ bool Submit(Controller& controller, Session& session, bool detach,
         // Composed outputs can remain visible after worker retirement. Keep
         // their last masked state until the bridge hides them and restores the
         // source in one transaction; clearing SELF alone exposes a rectangle.
-        if(session.unwarped_layer<0) clear(session.surface,session.layer);
-        for(const auto& companion:session.companions) clear(companion.surface,companion.layer);
+        if(session.unwarped_layer<0 && !(session.preserve_preview_masks && session.starting))
+            clear(session.surface,session.layer);
+        // Retiring motion ownership does not end an OEM preview/color's
+        // visibility under its mask-free host. Freeze its last mask until an
+        // authenticated successor overwrites it or platform removal ends it.
+        for(const auto& companion:session.companions)
+            if(!(session.preserve_preview_masks && companion.starting))
+                clear(companion.surface,companion.layer);
         if(!cleared) {
             if(!supplied) ASurfaceTransaction_delete(transaction);
             return true;
@@ -317,6 +324,23 @@ bool Submit(Controller& controller, Session& session, bool detach,
         // the independent spring preserves its value and velocity on reversal.
         values[38]=static_cast<float>(std::clamp(session.corner.value,0.0,
             0.5*std::min(1.0,visible_height/visible_width)));
+        if(supplied) {
+            double left=vertices[0].x,top=vertices[0].y,right=left,bottom=top;
+            for(const auto& vertex:vertices) {
+                left=std::min(left,vertex.x);top=std::min(top,vertex.y);
+                right=std::max(right,vertex.x);bottom=std::max(bottom,vertex.y);
+            }
+            __android_log_print(ANDROID_LOG_INFO,kTag,
+                "publication layer=%d parent=%d epoch=%lld closing=%d continuation=%d txn=%p domain=%dx%d "
+                "corner=%.6f appliedCorner=%.6f cornerVelocity=%.6f target=%.6f "
+                "bounds=(%.6f,%.6f)-(%.6f,%.6f) tl=(%.6f,%.6f) br=(%.6f,%.6f) "
+                "rowSpans=%.6f/%.6f/%.6f",
+                session.layer,session.parent_layer,static_cast<long long>(session.request_ns),
+                session.closing,session.primed_continuation,static_cast<void*>(supplied),session.width,session.height,
+                session.corner.value,static_cast<double>(values[38]),session.corner.velocity,session.corner.target,
+                left,top,right,bottom,vertices[0].x,vertices[0].y,vertices[8].x,vertices[8].y,
+                vertices[2].x-vertices[0].x,vertices[5].x-vertices[3].x,vertices[8].x-vertices[6].x);
+        }
         std::vector<Companion> surfaces{{session.surface,session.layer,session.texture_width,session.texture_height}};
         surfaces.insert(surfaces.end(),session.companions.begin(),session.companions.end());
         for(const auto& item:surfaces) {
@@ -378,10 +402,12 @@ void DetachLostSurfaces(Controller& controller,const Session& previous,const Ses
     if(!previous.attached) return;
     ASurfaceTransaction* transaction=ASurfaceTransaction_create();
     if(!transaction) return;
-    std::vector<Companion> surfaces{{previous.surface,previous.layer}};
+    std::vector<Companion> surfaces{{previous.surface,previous.layer,0,0,previous.starting}};
     surfaces.insert(surfaces.end(),previous.companions.begin(),previous.companions.end());
     for(const auto& item:surfaces) {
-        if(item.layer==previous.layer && previous.unwarped_layer>=0) continue;
+        if(item.layer==previous.layer && (previous.unwarped_layer>=0 ||
+           (previous.preserve_preview_masks && previous.starting))) continue;
+        if(previous.preserve_preview_masks && item.starting) continue;
         if(item.layer>=0 && !LiveOwner(controller,previous,item.layer,&next))
             ClearSurface(transaction,item.surface);
     }
@@ -420,6 +446,34 @@ void RetireCommitted(Controller& controller) {
             retired.layer,static_cast<long long>(retired.request_ns));
         it=controller.retiring.erase(it);
     }
+}
+
+// Revocation ends ownership, unlike an OEM cancel that can leave its closing
+// silhouette visible. Remove every matching writer before retiring any surfaces:
+// independently live/primed successors keep their capabilities, and composed
+// outputs keep their last mask until the bridge hides/restores them atomically.
+void RevokeRequest(Controller& controller, hha::RenderIdentity identity) {
+    auto revoke=[&](std::unique_ptr<Session>& session) {
+        if(!session || !hha::SameRender(identity,{session->parent_layer,session->request_ns})) return false;
+        RememberRetired(controller,session->request_ns);
+        session->preserve_preview_masks=true;
+        if(session->attached) controller.retiring.push_back(std::move(session));
+        else session.reset();
+        return true;
+    };
+    revoke(controller.active);revoke(controller.pending);
+    auto remove=[&](std::vector<std::unique_ptr<Session>>& sessions) {
+        sessions.erase(std::remove_if(sessions.begin(),sessions.end(),revoke),sessions.end());
+    };
+    remove(controller.overlapping);remove(controller.queued);
+    // A superseded borrowed publication may already be waiting in retirement.
+    // Tombstone it too, so it cannot be rediscovered after its successor ends.
+    for(const auto& session:controller.retiring)
+        if(hha::SameRender(identity,{session->parent_layer,session->request_ns})) {
+            RememberRetired(controller,session->request_ns);
+            session->preserve_preview_masks=true;
+        }
+    RetireCommitted(controller);
 }
 
 // Keep icon capabilities on the same motion owner through starting/App handoff,
@@ -604,8 +658,12 @@ void ConsumeCommand(Controller& controller) {
     if(controller.stop_requested) {
         controller.stop_requested=false;
         auto remember=[&](const std::unique_ptr<Session>& session) {
-            if(session) RememberRetired(controller,session->request_ns);
+            if(session) {
+                RememberRetired(controller,session->request_ns);
+                session->preserve_preview_masks=false; // Explicit disable may release previews too.
+            }
         };
+        for(const auto& session:controller.retiring) remember(session);
         remember(controller.active);remember(controller.pending);
         for(const auto& session:controller.queued) remember(session);
         for(const auto& session:controller.overlapping) remember(session);
@@ -911,20 +969,44 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     // Motion comes from the newest compatible state, but ownership must be the
     // union of every same-request live/pending publication. Multiple show paths
     // can publish different buffers before the worker adopts any one of them.
+    auto dependency=[&](const std::shared_ptr<std::atomic<bool>>& ready) {
+        if(ready && !ready->load(std::memory_order_acquire) &&
+           std::find(next->commit_dependencies.begin(),next->commit_dependencies.end(),ready)==next->commit_dependencies.end())
+            next->commit_dependencies.push_back(ready);
+    };
+    auto await_publication=[&](const Session& session) {
+        for(const auto& ready:session.commit_dependencies) dependency(ready);
+        dependency(session.committed);
+    };
     auto preserve=[&](const std::unique_ptr<Session>& session) {
         if(!session || !Related(*session,*next)) return;
         PreserveOpeningPreviews(*next,*session);
-        auto dependency=[&](const std::shared_ptr<std::atomic<bool>>& ready) {
-            if(ready && !ready->load(std::memory_order_acquire) &&
-               std::find(next->commit_dependencies.begin(),next->commit_dependencies.end(),ready)==next->commit_dependencies.end())
-                next->commit_dependencies.push_back(ready);
-        };
-        for(const auto& ready:session->commit_dependencies) dependency(ready);
-        dependency(session->committed);
+        await_publication(*session);
     };
     preserve(controller->active);preserve(controller->pending);
     for(const auto& session:controller->overlapping) preserve(session);
     for(const auto& session:controller->queued) preserve(session);
+    // Revocation cannot retract a borrowed host transaction that SF has not
+    // committed yet. Wait for its possible late write without inheriting its
+    // revoked geometry or previews into the successor.
+    for(const auto& session:controller->retiring)
+        if(Related(*session,*next)) await_publication(*session);
+    if(!initial_transaction && previous && previous->attached &&
+       SameRequestDomain(*previous,*next) && previous->closing==next->closing) {
+        // A worker discovery can replace a correctly primed pending command
+        // before either host commits. Icon publication may read that command
+        // immediately, so preserve its published snapshot now, not at adoption.
+        next->animation=previous->animation;
+        next->parameters=previous->parameters;
+        next->corner=previous->corner;
+        next->started_ns=previous->started_ns;
+        next->last_ns=previous->last_ns;
+        next->elapsed=previous->elapsed;
+        next->frames=previous->frames;
+        next->generation=previous->generation;
+        next->primed_continuation=true;
+        next->attached=true;
+    }
     if(initial_transaction) {
         // Queue the first SELF state in the exact transaction that installs the
         // virtual icon host. No frame may expose the unwarped tall backing plate.
@@ -978,10 +1060,14 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     return JNI_TRUE;
 }
 
-static bool AttachSession(void* transaction,jlong surface,jlong parent,int width,int height,int64_t event_ns) {
+static bool AttachSession(void* transaction,jlong surface,jlong parent,int width,int height,int64_t event_ns,
+                          bool starting=false) {
     auto* controller=g_controller.load(std::memory_order_acquire);
     if(!controller || !transaction || !surface || !parent || width<=0 || height<=0) return false;
     std::lock_guard<std::mutex> lock(controller->mutex);
+    if(controller->stop_requested ||
+       std::find(controller->retired_requests.begin(),controller->retired_requests.end(),event_ns)!=
+           controller->retired_requests.end()) return false;
     const int32_t parent_layer=g_layer_id(reinterpret_cast<void*>(static_cast<uintptr_t>(parent)));
     Session* current=nullptr;
     auto find=[&](const std::unique_ptr<Session>& session) {
@@ -1005,10 +1091,14 @@ static bool AttachSession(void* transaction,jlong surface,jlong parent,int width
        std::any_of(controller->overlapping.begin(),controller->overlapping.end(),conflicting) ||
        std::any_of(controller->queued.begin(),controller->queued.end(),conflicting)) return false;
     if(!Owns(*current,layer)) {
-        current->companions.push_back({control,layer});
+        current->companions.push_back({control,layer,0,0,starting});
         g_inc_strong(control,current);
         std::sort(current->companions.begin(),current->companions.end(),
             [](const Companion& a,const Companion& b) {return a.layer<b.layer;});
+    } else if(starting) {
+        if(current->layer==layer) current->starting=true;
+        for(auto& companion:current->companions)
+            if(companion.layer==layer) companion.starting=true;
     }
     // Publish only this buffer into its real show transaction; do not replace
     // the request, reset springs, or apply/close the OEM-owned transaction.
@@ -1189,9 +1279,9 @@ Java_ng_lst_hha_ContentAnimator_nativePrime(JNIEnv* env,jclass,jlong transaction
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_ng_lst_hha_ContentAnimator_nativeAttach(JNIEnv*,jclass,jlong transaction,jlong surface,
-    jlong parent,jint width,jint height,jlong event_ns) {
+    jlong parent,jint width,jint height,jlong event_ns,jboolean starting) {
     return AttachSession(reinterpret_cast<void*>(static_cast<uintptr_t>(transaction)),surface,
-        parent,width,height,event_ns)?JNI_TRUE:JNI_FALSE;
+        parent,width,height,event_ns,starting)?JNI_TRUE:JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -1214,6 +1304,16 @@ extern "C" JNIEXPORT void JNICALL
 Java_ng_lst_hha_ContentAnimator_nativeStopRequest(JNIEnv*,jclass,jlong parent,jlong event_ns) {
     if(parent<=0 || parent>INT32_MAX) return;
     hha::CancelIconRenderer({static_cast<int32_t>(parent),event_ns});
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(JNIEnv*,jclass,jlong parent,jlong event_ns) {
+    if(parent<=0 || parent>INT32_MAX || event_ns<=0) return;
+    auto* controller=g_controller.load(std::memory_order_acquire);
+    if(!controller) return;
+    std::lock_guard<std::mutex> lock(controller->mutex);
+    RevokeRequest(*controller,{static_cast<int32_t>(parent),event_ns});
+    if(controller->looper) ALooper_wake(controller->looper);
 }
 
 namespace hha {

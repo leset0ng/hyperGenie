@@ -223,7 +223,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     if (type!=2 && !(adjust && type==-1 && adjust_type==1 && cached.valid)) return;
     if(Fixed(parameters,"isNoSourceAnim")!=0 || Fixed(parameters,"bigIcon")!=0) return;
     // Match SF's target-ID ordering before assigning a new local timestamp.
-    const bool continuing=adjust && cached.valid && cached.supported;
+    const bool continuing=adjust && cached.valid && cached.supported && cached.admitted;
     if (adjust && cached.valid && animation_id<=cached.animation_id) return;
     const Config config = ReadConfig();
     if (!config.enabled || !config.content) {
@@ -243,6 +243,10 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     const auto [start_width,start_height]=FitSize(w.start,h.start,ratio.start);
     const auto [end_width,end_height]=FitSize(w.end,h.end,ratio.end);
     const float start_area=start_width*start_height, end_area=end_width*end_height;
+    // The OEM can start a reversal with the same ID. A same-direction repeat,
+    // however, must preserve its epoch and never reread our rewritten springs.
+    if(!adjust && cached.valid && (animation_id<cached.animation_id ||
+       (animation_id==cached.animation_id && (end_area<start_area)==cached.transition.closing))) return;
     const float small_width=start_area<end_area?start_width:end_width;
     const float small_height=start_area<end_area?start_height:end_height;
     if(!(adjust && cached.valid) &&
@@ -302,7 +306,8 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         std::lock_guard<std::mutex> lock(g_mutex);
         Last* previous=nullptr;
         for(auto& slot:g_last) if(slot.valid && slot.transition.leash_layer==id) {previous=&slot;break;}
-        if (adjust && previous && animation_id<=previous->animation_id) return;
+        if (previous && (animation_id<previous->animation_id ||
+            (animation_id==previous->animation_id && (adjust || request.closing==previous->transition.closing)))) return;
         if (!previous) previous=&g_last[g_next++%g_last.size()];
         previous->window=request.closing?cached.window:
             hha::genie::Rect{request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
@@ -315,6 +320,9 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         previous->animation_id=animation_id;
         previous->valid=true;
         previous->supported=true;
+        previous->admitted=continuing;
+        previous->retry_pending=false;
+        previous->preparing=false;
     }
     if (config.verbose) {
         __android_log_print(ANDROID_LOG_INFO,kTag,
@@ -416,7 +424,12 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 }
             }
         }
-        if(!snapshot.valid || !snapshot.supported) return;
+        if(!snapshot.valid || snapshot.preparing ||
+           (!snapshot.supported && !snapshot.retry_pending) ||
+           (!is_icon && snapshot.animation_id!=animation_id)) return;
+        // A deferred publication has no renderer session to keep alive. Do not
+        // revive its original motion after the renderer's ordinary deadline.
+        if(snapshot.retry_pending && Now()-snapshot.transition.event_ns>=1500000000LL) return;
         const auto& geometry=snapshot.transition.geometry;
         const size_t small=snapshot.transition.closing?4:0;
         const size_t full=snapshot.transition.closing?0:4;
@@ -424,41 +437,60 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         hha::genie::Rect window=snapshot.window.width>0?snapshot.window:
             hha::genie::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
         const bool prestart=g_name && g_name(control).find("Pre startup opening leash")==0;
-        if(!is_icon && !snapshot.adjusting && !snapshot.transition.closing && prestart) {
-            if(!hha::PrepareOpeningPreview(transaction,const_cast<void*>(control),
-                static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition)) {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                for(auto& source:g_last) if(source.valid &&
-                    source.transition.event_ns==snapshot.transition.event_ns &&
-                    source.transition.leash_layer==snapshot.transition.leash_layer) source.supported=false;
-                return;
-            }
-            // Also arm the launcher's existing runtime-disable watchdog. The
-            // server retains any stronger Task anchor established meanwhile.
-            hha::QueueTransition(snapshot.transition);
-        } else if(!is_icon && !snapshot.adjusting && (snapshot.transition.task_id>=0 || prestart)) {
-            // Pre-start closes require a verified Task group too. An absent
-            // anchor must reject preparation before any host viewport changes.
-            if(!hha::PrepareContentGroup(transaction,const_cast<void*>(control),&window,snapshot.transition)) {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                for(auto& source:g_last) if(source.valid &&
-                    source.transition.event_ns==snapshot.transition.event_ns &&
-                    source.transition.leash_layer==snapshot.transition.leash_layer) source.supported=false;
-                return;
-            }
-            // The service owns the full buffer domain. Keep it for this stream
-            // and its paired icon, even without an earlier opening submission.
+        bool prepared_now=false;
+        if(!is_icon && !snapshot.admitted && (snapshot.transition.task_id>=0 || prestart)) {
+            // Reserve this generation across the synchronous Binder call. An
+            // icon or nested host callback must not publish unprepared geometry.
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
+                bool reserved=false;
                 for(auto& source:g_last) if(source.valid &&
                     source.transition.event_ns==snapshot.transition.event_ns &&
-                    source.transition.leash_layer==snapshot.transition.leash_layer) source.window=window;
+                    source.transition.leash_layer==layer && source.animation_id==animation_id &&
+                    !source.preparing && !source.admitted &&
+                    (source.supported || source.retry_pending)) {
+                    source.preparing=true;
+                    source.supported=false;
+                    reserved=true;
+                    break;
+                }
+                if(!reserved) return;
             }
-            hha::QueueTransition(snapshot.transition);
+            const auto result=!snapshot.transition.closing && prestart ?
+                (hha::PrepareOpeningPreview(transaction,const_cast<void*>(control),
+                    static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition) ?
+                    hha::GroupPreparation::Ready : hha::GroupPreparation::Rejected) :
+                hha::PrepareContentGroupStatus(transaction,const_cast<void*>(control),&window,snapshot.transition);
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                bool current=false;
+                for(auto& source:g_last) if(source.valid &&
+                    source.transition.event_ns==snapshot.transition.event_ns &&
+                    source.transition.leash_layer==layer && source.animation_id==animation_id) {
+                    if(result!=hha::GroupPreparation::Ready) {
+                        source.preparing=false;
+                        source.retry_pending=result==hha::GroupPreparation::Deferred;
+                    }
+                    current=true;
+                    break;
+                }
+                // A nested newer generation owns the host now. Its publication
+                // guards also reject the obsolete transaction merged by Binder.
+                if(!current || result!=hha::GroupPreparation::Ready) return;
+            }
+            prepared_now=true;
         }
         const uint64_t transaction_id=transaction && g_transaction_id?g_transaction_id(transaction):0;
         hha::genie::Rect minimized;
-        if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) return;
+        if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) {
+            if(prepared_now) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(auto& source:g_last) if(source.valid &&
+                    source.transition.event_ns==snapshot.transition.event_ns &&
+                    source.transition.leash_layer==layer) source.preparing=false;
+            }
+            return;
+        }
         if(is_icon) {
             // OEM can build App and icon in separate transactions and merge
             // them before presentation. Construction IDs are diagnostic only;
@@ -525,13 +557,19 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         }
         if(!is_icon) {
             std::lock_guard<std::mutex> lock(g_mutex);
-            for(auto& source:g_last) if(source.valid && source.supported &&
+            for(auto& source:g_last) if(source.valid &&
                 source.transition.event_ns==snapshot.transition.event_ns &&
                 source.transition.leash_layer==snapshot.transition.leash_layer) {
                 source.host_transaction_id=transaction_id;
+                source.window=window;
+                source.admitted=true;
+                source.retry_pending=false;
+                source.preparing=false;
+                source.supported=true;
                 break;
             }
         }
+        if(prepared_now) hha::QueueTransition(snapshot.transition);
         __android_log_print(ANDROID_LOG_INFO,kTag,"mesh viewport layer=%d animation=%d source=%d epoch=%lld hostTxn=%llu start=%.1fx%.1f end=%.1fx%.1f",layer,
             animation_id,snapshot.transition.leash_layer,static_cast<long long>(snapshot.transition.event_ns),
             static_cast<unsigned long long>(transaction_id),start.width,start.height,end.width,end.height);

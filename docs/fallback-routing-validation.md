@@ -1,94 +1,111 @@
-# Current AVD fallback validation
+# Fallback routing repair validation
 
-**Task3: BLOCKED — visual acceptance has not passed.** Square application plates,
-small Settings content inside a large light backdrop, and some OEM fallback
-remain reproducible. Assertion counts and `accepted=1` do not establish a visual
-fix. No claim of universal elimination is supported.
+## Current result
 
-The tested and currently installed debug APK on **emulator-5580** has SHA256:
+The confirmed square-frame mechanisms and exact startup-preview close handoff have been repaired. Final `fixed17-cold`, `fixed17-hold` and `fixed17-rapid` captures do not show the earlier sharp App plates or nested Settings content in the inspected contact sheets. This is bounded visual evidence, not an every-frame or every-ROM guarantee.
+
+The startup-preview close path was exercised twice with the Gallery/Calculator main processes deliberately paused and then resumed. Both exact preview closes were accepted in their host transactions. Across the three latest runs there were no terminal group rejection replies; one ordinary cold-start request exceeded the64ms real-first-buffer wait and returned Deferred. Deferred recovery still needs a subsequent real host callback. Nonuniform OEM crops remain unsupported; no domain tolerance was relaxed.
+
+The installed debug APK on **emulator-5580** has SHA256:
 
 ```text
-82fc2e7ccf63ee4d4a9651704df0514e65c94c9c327b33b681ee88fba91fdda5
+9815fccd6d0156576fea7cad81f5078009289ba3544f7f50cf6c0e2ada91b234
 ```
 
-Before recording, installed/build hashes matched, Launcher native hooks and three
-OEM capture hooks installed, and Launcher/system_server mapped the current APK.
-LSPosed retained the old package path after installation; its module APK path
-was repaired with backups while preserving scope/enablement. Final runtime
-checks found Launcher30179, system_server29365 and SurfaceFlinger29264, current
-APK mappings, display1 ON and diagnostic trace byte restored0. Neither recorded
-run changed core PIDs, the crash buffer, or module configuration. No phone was
-used; changes remain uncommitted.
+Launcher PID16412 and system_server PID14263 both map the exact installed APK. Native Launcher hooks were verified before the first latest recording; subsequent recordings revalidated the unchanged PIDs, current APK hash and maps. No phone was accessed. The source, regression tests and this validation report are committed together; local recordings remain under the ignored `temp/` directory.
 
-## Supported implementation changes
+## Repairs
 
-A recreated WindowState can create a second group for the same Task. The old
-group could remain visible while its SELF was cleared after being inherited as
-an ordinary preview. `LiveSubtrees.activate` now retires predecessor visibility
-in the new group's publication transaction. Native preview preservation excludes
-the previous composed output while preserving real OEM previews and linked
-icons. An actual-renderer regression verifies this ownership and masked
-retirement behavior.
+- Closing worker lookup cannot select an arbitrary newly appearing starting window through its final fallback. An established close also rejects content replacement.
+- Ownership supersession uses exact parent+epoch revocation, stopping old closing writers. A new epoch on the same host ends old discovery without prematurely discarding the native contour; actual owner changes still revoke.
+- Starting/color masks outlive motion cancellation, deadlines and supersession until another authenticated publication overwrites them or the platform removes the layer. Ordinary main-window inputs still detach. Explicit disable can clear live previews. Late attachments carry the starting flag through JNI.
+- Exact OEM StartingData ownership is observed through creation, reset and transfer. Current, pending-remove and older registry-backed keys can coexist. `isCleared` is not used as proof that a fading color disappeared. Solid-color layers use plain SC copies rather than BBQ resolution.
+- Synchronous group preparation resolves the exact Task and includes companions in the same shader/visibility transaction returned to Launcher. A missing source mapping triggers a verified lookup/preparation attempt.
+- The Binder capability endpoint can wait up to64ms for an independently committed real first buffer without holding WMS, registry, SC or renderer locks. It revalidates ownership before publication. A timeout preserves stock geometry and reports Deferred; a later real host callback can retry the same epoch. This does not manufacture another callback or admit an empty output.
+- Exact previously authenticated starting WindowState grants can authorize a preview close when no normal source is available. Revalidation checks original producer SC, resolved BBQ identity, Activity/Task objects, latest launch token, current Task ancestry and uniform domain; the preview and companions join the actual closing host transaction. Generic closing-to-starting discovery remains excluded. Tokenless/zero-token option assignments revoke the cached current generation. Late same-launch normal content is guarded without inheriting the old closing writer.
+- Same-epoch worker discovery immediately inherits the already-published mesh, corners, spring velocities, clock and generation. Previously, it replaced the pending command with endpoint state; linked-icon publication then wrote an identity mesh and zero corner over the correct prime.
 
-SnapshotGuard now covers the ROM's three direct OEM capture entry points:
-`captureSplashLayer`, `getBuffer`, and `captureActivity`. These bypass the regular
-TaskSnapshotController capture hook. Installation was verified, but the bounded
-captures did not exercise the blocked OEM branch, so prevention/concurrency is
-not runtime-validated. These hooks do not fix the demonstrated color backdrop.
+## Direct reproduction and regression
 
-Existing source identity/capability checks, first-buffer readiness and crop
-admission checks remain enforced.
+`fixed15/native.log` records the last failure precisely. At2239.727 the correct pending close publishes `continuation=1 appliedCorner=0.169854` and a deformed mesh. At2239.728 a second publication for the **same layer, epoch and transaction** writes `continuation=0 appliedCorner=0` and identity bounds. Nine such resets were detected in that run.
 
-## Commands and observations
+The new regression exercises both directions, a zero-corner close input, worker insertion between App/icon publications, extra companion ownership, and both host commit orders:
+
+| Executable on AVD | Result |
+| --- | --- |
+| Before state-copy fix, with new regression | Exit1; regression fails |
+| After state-copy fix | Exit0;12,776 renderer checks pass |
+
+The earlier SELF-presence checks could not detect this failure because the shader remained attached with wrong uniforms. Final captures include actual publication-state diagnostics in addition to SF draw records.
+
+## Latest preview-close verification
+
+| Evidence | fixed17-cold | fixed17-hold | fixed17-rapid |
+| --- | --- | --- | --- |
+| Scenario |Cold App opens, close after250/650ms |Pause Gallery/Calculator main process, close preview, resume |52 ordinary/gesture/rapid/cross-App actions |
+| Requested logged actions |20 |4 |52 |
+| Stable core PIDs/crash baseline/config |Yes |Yes |Yes |
+| Detailed relevant physical draws with SELF |501/501 |83/83 |447/447 |
+| Publication diagnostics |57 |12 |90 |
+| Detected inherited-contour resets |0 |0 |0 |
+| Ready group replies |6 |2 |21 |
+| Terminal group rejections |0 |0 |0 |
+| Deferred replies |1 |0 |0 |
+| Explicit preview-close route hit |Not observed |2 |Not observed |
+
+The held-main test is intentional fault injection, not ordinary App startup performance. The App processes were resumed in cleanup, both displays restored and trace gate reset. Its blank starting previews are expected because the App processes are paused; closing retains the contour instead of exposing an unmasked rectangular backing layer.
+
+All1031 detailed relevant draws retain SELF across these latest three trace windows, with159 publication diagnostics and no detected contour reset. Latest identity/bridge JVM suite passes20 checks against actual compiled classes; it covers exact identity/producer/buffer/launch/domain rejection, current token invalidation, grant integration, restoration and publication encoding. The reviewer-confirmed stale token issue was corrected before installation.
+
+Artifacts are `fixed17-cold`, `fixed17-hold`, and `fixed17-rapid` under the existing validation directory. Each includes deployment hashes/maps, results, native/module logs, video, trace, parsed draw records and `measured.json`. The earlier final renderer build (`fixed16`, SHA80923ccb) and its timings remain useful comparison evidence below.
+
+## Earlier renderer-fix captures (fixed16)
+
+Each run requests52 actions including ordinary opens, gestures,10 rapid open/home/reopen/close cycles, and cross-App actions. Swallowed taps mean these are requested actions, not52 distinct transitions or a statistical failure rate.
+
+| Evidence | fixed16 | fixed16-alt |
+| --- | --- | --- |
+| Rapid opening delays |80/180/300/500ms |120/240/420/650ms |
+| Stable core PIDs, crash log, module config |Yes |Yes |
+| Detailed physical composed-output draws with SELF |239/239 |357/357 |
+| Detailed physical manager-color draws with SELF |43/43 |58/58 |
+| Detailed physical starting-window draws with SELF |43/43 |7/7 |
+| Detailed physical controller-preview draws with SELF |49/49 |21/21 |
+| Publication diagnostics inspected |79 |97 |
+| Detected inherited-contour resets |0 |0 |
+| Successful synchronous group replies |15 |21 |
+| Rejected synchronous group replies |1 |0 |
+| Deferred synchronous group replies |0 |0 |
+
+Across the two detailed trace windows, all817 sampled draws in these four content categories retain SELF. The trace detail gate is active for approximately12 seconds per run and restored afterward; records without detailed corner fields are excluded. The videos cover each full action sequence, while contact sheets sample at10/15fps. No claim of exhaustive frame inspection is made.
+
+Artifacts under `temp/fallback-routing-validation/`:
+
+- `fixed16/physical.webm`, `fixed16-alt/physical.webm`: final recordings.
+- Each final directory: `deployment.json`, `results.json`, `native.log`, `modules.log`, `trace.txt`, `trace-state.json`, `draw-records.json`, `measured.json`, and contact sheets.
+- `fixed15`: last reproduction with9 diagnosed contour resets.
+- `fixed11`: before general preview-mask retention; color511 lost SELF after an opening cancel.
+- `fixed14/INVALID.md`: excludes the recording made without loaded native hooks. `fixed14-valid` is a separate authenticated intermediate run.
+
+`modules.log` is cumulative for a daemon session. `measure-repair.py` filters the current system_server and matches failure leashes against actual `accepted=0/2` replies in that run's native log; historical module lines are not counted as current rejections.
+
+## Checks
 
 - `./gradlew :app:assembleDebug :app:lintDebug --offline`: passed.
 - `tests/run-native-tests.sh`:775 checks passed.
-- `tests/run-launcher-device-tests.sh`:111 checks passed.
-- `tests/run-renderer-device-tests.sh`:10,948 checks passed. Uses actual renderer
-  code with fake surfaces/transactions; does not validate pixels or Kotlin order.
+- `tests/run-launcher-device-tests.sh`:127 checks passed.
+- `tests/run-renderer-device-tests.sh`:12,776 checks passed using actual `hha_content.cpp`.
+- `tests/run-preview-close-jvm-tests.py`:20 exact-preview identity and bridge checks passed against actual compiled classes.
+- Earlier actual compiled PreStartingSurfaces JVM harness:12 lifecycle checks passed; temporary harness at `/tmp/hha-prestarting-lifetime-check`.
+- Targeted nonmutating reviews found no additional demonstrable medium/high defect in final synchronous coverage, bounded waiting, deferred admission or the new state-copy branch. The earlier preview-retirement finding was corrected and retested.
 - `git diff --check`: passed.
 
-Both current-artifact runs requested52 actions, including ten rapid cycles,
-normal/gesture closes and cross-app taps. Some taps may be swallowed; command
-counts are not transition counts or failure rates. Contact sheets rendered with
-ffmpeg at0,5,10,15s were inspected; an additional30fps sheet examined the fixed9
-square interval. Inspection was sampled, not exhaustive.
+These checks establish modeled lifecycle/geometry behavior and build health; actual visual evidence is reported separately above.
 
-| Run | Duration | Rapid open delays | Detailed physical group draws with SELF | Group admission rejects |
-| --- | --- | --- | --- | --- |
-| fixed9 |20.835s |80/180/300/500ms |347/347 |0 |
-| fixed10-alt |21.320s |120/240/420/650ms |375/375 |2 |
+## Remaining scope
 
-Detailed counts exclude records after the diagnostic gate closes. Before this
-iteration, fixed8-diagnostic showed12 detailed draws of obsolete output411 with
-no SELF/zero radii while output507 also drew. An earlier49-count included37
-incomplete records and is invalid. The current samples did not reproduce that
-old-output path, but both recordings still contain visual failures.
+A closing request can arrive before a normal App producer exists. The new exact-preview continuation covers the previously authenticated, still-live WindowState path and was observed twice in `fixed17-hold`. Unauthenticated/controller-only previews, changed launch identity, invalid ancestry or unsupported domains still reject; the general closing worker fallback remains excluded. This does not claim that every possible OEM prestart representation is covered.
 
-## Concrete unresolved route
+A first buffer taking longer than64ms can still defer. Recovery afterward requires another real Launcher callback; no asynchronous rewrite of an expired host transaction is performed. Full crop/texture conversion for nonuniform stock starts is not implemented. Other ROMs and physical-phone behavior have not been validated.
 
-In fixed10-alt, `preSplashStarting#499` has32 detailed physical draws with no
-SELF and zero corner radii. `preSplashStarting#539` has55 with no SELF;8 have
-zero radii, others retain OEM crop/radius. Both trace sources are **solidColor**,
-not screenshot buffers. A large unmasked OEM backdrop can therefore surround
-small, already-deformed App content. This is not proof of poisoned snapshot
-pixels or a mirror cycle. The current-artifact samples include131 Settings
-mirror input draws without SELF; other caches/paths remain unproven.
-
-The two admission rejects on leash554 are a source not yet first-buffer ready,
-and closing presentation1098.0137x2358.5083 against1120x2436. Uniform scaling
-would require height2388.1798, a29.6715px mismatch. The latter needs a conversion
-that carries the real sampled crop/initial contour. Removing the aspect check
-or accepting an empty group would not be a supported correction.
-
-Task3 remains blocked on exact authenticated protection of the OEM preSplash
-solid-color companion route and safe nonuniform crop conversion. Other ROM
-signatures, OEM capture blocked-path concurrency, every-frame correctness and
-phone behavior were not validated.
-
-Local ignored evidence is under `temp/fallback-routing-validation/`: the full
-`FINAL-REPORT.md`, `STATUS.md`, `measured-final.json`, deployment/runtime JSON,
-build/test logs, fixed9 and fixed10-alt physical.webm/native.log/modules.log,
-contact sheets and detailed trace/draw records. The final report includes exact
-trace line references. No additional experiment was started after bounded
-validation completed.
+The earlier root-cause investigation is retained in `fallback-root-cause.md`; its observations describe the pre-repair implementation.
