@@ -7,6 +7,23 @@
 
 namespace hha::genie {
 
+// This integration is verified only on portrait fullscreen transitions. A
+// landscape or unusually wide presentation keeps the complete stock animation.
+// The eased motion has two endpoints; the expanded one is the App window and
+// the shrunken one is the icon, which may legitimately be square. Only the
+// expanded endpoint must be strictly taller than wide, so a landscape window,
+// a square window, a rotation artefact or a degenerate FitSize result is never
+// admitted by rounding.
+inline bool PortraitWindow(double start_width,double start_height,
+                           double end_width,double end_height) {
+    for(double value:{start_width,start_height,end_width,end_height}) {
+        if(!std::isfinite(value) || value<=0) return false;
+    }
+    const double start_area=start_width*start_height, end_area=end_width*end_height;
+    if(!std::isfinite(start_area) || !std::isfinite(end_area)) return false;
+    return start_area<=end_area ? end_height>end_width : start_height>start_width;
+}
+
 // The shader's round-rect metric measures both axes in visible-width units.
 // Convert each physical endpoint independently: icon and window widths differ,
 // and a gesture release can begin from a partially scaled presentation.

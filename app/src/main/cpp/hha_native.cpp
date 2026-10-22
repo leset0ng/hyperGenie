@@ -242,15 +242,18 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         w.start<=0 || w.end<=0 || h.start<=0 || h.end<=0) return;
     const auto [start_width,start_height]=FitSize(w.start,h.start,ratio.start);
     const auto [end_width,end_height]=FitSize(w.end,h.end,ratio.end);
+    // Portrait-only admission: a landscape host keeps its complete OEM motion.
+    if(!hha::genie::PortraitWindow(start_width,start_height,end_width,end_height)) {
+        if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
+            "portrait guard keeps stock animation start=%.1fx%.1f end=%.1fx%.1f",
+            start_width,start_height,end_width,end_height);
+        return;
+    }
     const float start_area=start_width*start_height, end_area=end_width*end_height;
     // The OEM can start a reversal with the same ID. A same-direction repeat,
     // however, must preserve its epoch and never reread our rewritten springs.
     if(!adjust && cached.valid && (animation_id<cached.animation_id ||
        (animation_id==cached.animation_id && (end_area<start_area)==cached.transition.closing))) return;
-    const float small_width=start_area<end_area?start_width:end_width;
-    const float small_height=start_area<end_area?start_height:end_height;
-    if(!(adjust && cached.valid) &&
-       (small_width/small_height<0.8f || small_width/small_height>1.25f)) return;
     if (!std::isfinite(start_area) || !std::isfinite(end_area) ||
         (!(adjust && cached.valid) && std::max(start_area,end_area)<4*std::min(start_area,end_area))) return;
     hha::Transition request;
@@ -404,9 +407,15 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         w.start<=0 || h.start<=0 || w.end<=0 || h.end<=0) return;
     const auto [start_width,start_height]=FitSize(w.start,h.start,ratio.start);
     const auto [end_width,end_height]=FitSize(w.end,h.end,ratio.end);
+    // Portrait-only admission: a landscape host keeps its complete OEM motion.
+    if(!hha::genie::PortraitWindow(start_width,start_height,end_width,end_height)) {
+        if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
+            "portrait guard keeps stock host animation start=%.1fx%.1f end=%.1fx%.1f type=%d",
+            start_width,start_height,end_width,end_height,type);
+        return;
+    }
     const bool closing=end_width*end_height<start_width*start_height;
-    const float small_aspect=closing?end_width/end_height:start_width/start_height;
-    if(type!=-1 && (small_aspect<0.8f || small_aspect>1.25f)) return;
+    // Replaces the former 0.8/1.25 aspect window: endpoints must be portrait.
     // Preserve native listeners/IDs while replacing the app's crop viewport.
     // The visible contour is produced by the same mesh as the content.
     if(surface && g_layer) {

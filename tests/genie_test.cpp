@@ -484,6 +484,27 @@ void HostContourEndpoints() {
     }
 }
 
+void PortraitWindowAdmission() {
+    using hha::genie::PortraitWindow;
+    Check(PortraitWindow(171,171,1120,2436),"portrait open admits a square icon endpoint");
+    Check(PortraitWindow(1120,2436,171,171),"portrait close admits a square icon endpoint");
+    Check(!PortraitWindow(171,171,2436,1120),"landscape device open keeps stock motion");
+    Check(!PortraitWindow(2436,1120,171,171),"landscape device close keeps stock motion");
+    Check(PortraitWindow(171,171,1200,1920),"tablet portrait open is admitted");
+    Check(!PortraitWindow(171,171,1000,1000),"square window endpoint rejects");
+    Check(PortraitWindow(171,171,1120,1120.5),"strict portrait bound near square admits");
+    Check(PortraitWindow(300,200,1120,2436),"wide icon endpoint does not veto a portrait window");
+    Check(!PortraitWindow(100,200,2436,1120),"tall icon endpoint cannot admit a landscape window");
+    Check(!PortraitWindow(0,171,1120,2436),"degenerate start width rejects");
+    Check(!PortraitWindow(171,171,1120,0),"degenerate window height rejects");
+    Check(!PortraitWindow(171,-171,1120,2436),"negative endpoint rejects");
+    Check(!PortraitWindow(std::numeric_limits<double>::quiet_NaN(),171,1120,2436),
+          "nonfinite endpoint rejects");
+    Check(!PortraitWindow(171,171,std::numeric_limits<double>::infinity(),2436),
+          "infinite endpoint rejects");
+    Check(!PortraitWindow(1e200,2e200,1120,2436),"overflowing area rejects instead of trusting sign");
+}
+
 void IconPairingAfterRepeatedLaunches() {
     std::array<hha::AnimationSource,4> sources{};
     // Replay a reused ID after a cold open, a key-driven close and then a
@@ -586,6 +607,7 @@ int main() {
     IconPairingAfterRepeatedLaunches();
     CornerEndpointMetrics();
     HostContourEndpoints();
+    PortraitWindowAdmission();
     std::printf("Genie kernel: %d checks passed\n", checks);
     return 0;
 }

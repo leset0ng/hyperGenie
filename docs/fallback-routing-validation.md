@@ -22,6 +22,7 @@ Launcher PID16412 and system_server PID14263 both map the exact installed APK. N
 - Exact OEM StartingData ownership is observed through creation, reset and transfer. Current, pending-remove and older registry-backed keys can coexist. `isCleared` is not used as proof that a fading color disappeared. Solid-color layers use plain SC copies rather than BBQ resolution.
 - Synchronous group preparation resolves the exact Task and includes companions in the same shader/visibility transaction returned to Launcher. A missing source mapping triggers a verified lookup/preparation attempt.
 - The Binder capability endpoint can wait up to64ms for an independently committed real first buffer without holding WMS, registry, SC or renderer locks. It revalidates ownership before publication. A timeout preserves stock geometry and reports Deferred; a later real host callback can retry the same epoch. This does not manufacture another callback or admit an empty output.
+- Portrait-only admission is enforced in the native path rather than inferred from an aspect window. Both `Observe` and `TuneParent` call `hha::genie::PortraitWindow`, which requires the expanded endpoint of the eased motion to be strictly taller than wide and rejects nonfinite, zero or overflowing inputs. The previous `0.8`/`1.25` ratio band is gone, so a square or landscape window can never be admitted by rounding, and a landscape host keeps its complete OEM animation. The shrunken icon endpoint is exempt because it is legitimately square.
 - Exact previously authenticated starting WindowState grants can authorize a preview close when no normal source is available. Revalidation checks original producer SC, resolved BBQ identity, Activity/Task objects, latest launch token, current Task ancestry and uniform domain; the preview and companions join the actual closing host transaction. Generic closing-to-starting discovery remains excluded. Tokenless/zero-token option assignments revoke the cached current generation. Late same-launch normal content is guarded without inheriting the old closing writer.
 - Same-epoch worker discovery immediately inherits the already-published mesh, corners, spring velocities, clock and generation. Previously, it replaced the pending command with endpoint state; linked-icon publication then wrote an identity mesh and zero corner over the correct prime.
 
@@ -92,7 +93,7 @@ Artifacts under `temp/fallback-routing-validation/`:
 ## Checks
 
 - `./gradlew :app:assembleDebug :app:lintDebug --offline`: passed.
-- `tests/run-native-tests.sh`:775 checks passed.
+- `tests/run-native-tests.sh`:790 checks passed, including14 new portrait-admission cases (square, landscape, tablet-portrait, wide-icon, degenerate, nonfinite and overflowing endpoints).
 - `tests/run-launcher-device-tests.sh`:127 checks passed.
 - `tests/run-renderer-device-tests.sh`:12,776 checks passed using actual `hha_content.cpp`.
 - `tests/run-preview-close-jvm-tests.py`:20 exact-preview identity and bridge checks passed against actual compiled classes.
@@ -107,5 +108,9 @@ These checks establish modeled lifecycle/geometry behavior and build health; act
 A closing request can arrive before a normal App producer exists. The new exact-preview continuation covers the previously authenticated, still-live WindowState path and was observed twice in `fixed17-hold`. Unauthenticated/controller-only previews, changed launch identity, invalid ancestry or unsupported domains still reject; the general closing worker fallback remains excluded. This does not claim that every possible OEM prestart representation is covered.
 
 A first buffer taking longer than64ms can still defer. Recovery afterward requires another real Launcher callback; no asynchronous rewrite of an expired host transaction is performed. Full crop/texture conversion for nonuniform stock starts is not implemented. Other ROMs and physical-phone behavior have not been validated.
+
+Landscape hosts are now excluded by construction rather than by a ratio band. The portrait rule is a native gate; the Java bridge additionally rejects any Activity, preview or subtree domain where `height <= width`, requires fullscreen windowing mode, no letterboxing and no fixed-rotation transform. A landscape transition therefore keeps its complete OEM animation. This could not be exercised end to end on the validation AVD: both of its displays report a locked `mCurrentOrientation=0` and `wm size`, emulator rotation and `settings put user_rotation` all left the logical frame at1120x2436 or912x596. The rule is covered by the host kernel suite and by a positive portrait control, not by a recorded landscape transition.
+
+Artifacts for the portrait control are `fixed18-landscape/probe.json` and `fixed18-landscape/portrait-control.json`. The control ran against APK `b580b8574cf22f59876045f38e4203d9ce09366f208bd9f3c2836086d3724791` on `emulator-5580` and recorded four `mesh viewport` publications with `start=329.3x716.2 end=1120.0x2436.0`, no `portrait guard keeps stock` lines and no group domain rejections. Launcher hooks were verified loaded in PID6288; system_server was PID3948.
 
 The earlier root-cause investigation is retained in `fallback-root-cause.md`; its observations describe the pre-repair implementation.
