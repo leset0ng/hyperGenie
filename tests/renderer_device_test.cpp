@@ -8,7 +8,7 @@ static void ObserveRendererApply(ASurfaceTransaction* transaction) {
     ASurfaceTransaction_apply(transaction);
 }
 #define ASurfaceTransaction_apply ObserveRendererApply
-#include "../app/src/main/cpp/hha_content.cpp"
+#include "../app/src/main/cpp/genie_content.cpp"
 #undef ASurfaceTransaction_apply
 #include <chrono>
 #include <condition_variable>
@@ -124,7 +124,7 @@ Controller& Fresh() {
     if(g_controller.load()) {
         auto* removal=ASurfaceTransaction_create();Check(removal,"create fixture preview-removal transaction");
         for(const auto& entry:border_widths) if(entry.second>0.0f)
-            Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+            Check(Java_ng_lst_genie_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
                 reinterpret_cast<jlong>(removal),entry.first),"fixture removal cannot clear a live effect owner");
         ASurfaceTransaction_apply(removal);ASurfaceTransaction_delete(removal);
     }
@@ -174,7 +174,7 @@ std::vector<int> Cleared() {
 }
 void ResetEvents() {std::lock_guard<std::mutex> lock(test_mutex);events.clear();}
 void Stop(Controller& controller) {
-    Java_ng_lst_hha_ContentAnimator_nativeStop(nullptr,nullptr);Pump(controller);
+    Java_ng_lst_genie_ContentAnimator_nativeStop(nullptr,nullptr);Pump(controller);
 }
 void FramePrimeOrdering() {
     auto& controller=Fresh();Check(Queue(101,1001),"seed old session");Pump(controller);
@@ -217,13 +217,13 @@ void ReplacementPreservesSharedLayers() {
 }
 void ScopedCancellation() {
     auto& controller=Fresh();Check(Queue(301,3001),"seed current B");Pump(controller);
-    hha::RenderIdentity b{controller.active->parent_layer,controller.active->request_ns};
-    hha::CancelIconRenderer({3000,b.request_ns-1});
-    hha::CancelIconRenderer({b.parent,b.request_ns-1});
+    genie::RenderIdentity b{controller.active->parent_layer,controller.active->request_ns};
+    genie::CancelIconRenderer({3000,b.request_ns-1});
+    genie::CancelIconRenderer({b.parent,b.request_ns-1});
     std::this_thread::sleep_for(60ms);Frame(NowNs(),&controller);
     Check(controller.active && controller.active->layer==301,"old parent and epoch cannot cancel B");
     const int64_t requested=NowNs();
-    hha::CancelIconRenderer(b);
+    genie::CancelIconRenderer(b);
     {std::lock_guard<std::mutex> lock(controller.mutex);
      Check(controller.active && controller.active->cancel_ns>=requested+47000000LL,
            "matching B records a scoped cancellation without changing its watchdog");}
@@ -236,8 +236,8 @@ void ScopedCancellation() {
           "stopped closing B retires at its existing deadline");
     // Pending replacement also wins over an old active stop.
     Check(Queue(302,3002),"seed another active session");Pump(controller);
-    hha::RenderIdentity old{controller.active->parent_layer,controller.active->request_ns};
-    auto next=Prime(303,3003);hha::CancelIconRenderer(old);Commit(next);Pump(controller);
+    genie::RenderIdentity old{controller.active->parent_layer,controller.active->request_ns};
+    auto next=Prime(303,3003);genie::CancelIconRenderer(old);Commit(next);Pump(controller);
     std::this_thread::sleep_for(60ms);Frame(NowNs(),&controller);
     Check(controller.active && controller.active->layer==303,"pending successor survives old active stop");
     Stop(controller);std::puts("PASS scoped cancellation and grace");
@@ -268,7 +268,7 @@ void PendingRetirement() {
           "canceled pending prime cleared after eventual commit");
     std::puts("PASS superseded and canceled pending-prime retirement");
 }
-bool Running() {return Java_ng_lst_hha_ContentAnimator_nativeRunning(nullptr,nullptr)==JNI_TRUE;}
+bool Running() {return Java_ng_lst_genie_ContentAnimator_nativeRunning(nullptr,nullptr)==JNI_TRUE;}
 void JniStopRequestValidation() {
     auto& controller=Fresh();
     auto opening=Geometry(1120,2436);
@@ -281,14 +281,14 @@ void JniStopRequestValidation() {
     // The last value would alias the live parent if JNI truncated before checking.
     const jlong invalid_parents[]={0,-1,static_cast<jlong>(INT32_MAX)+1,(jlong{1}<<32)+3101};
     for(jlong parent:invalid_parents) {
-        Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,parent,request);
+        Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,parent,request);
         Check(controller.active->cancel_ns==0,"JNI rejects invalid or overflowing parent without canceling the live request");
     }
-    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3101,request-1);
-    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3102,request);
+    Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,3101,request-1);
+    Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,3102,request);
     Check(controller.active->cancel_ns==0,"JNI stop requires both current parent and immutable request epoch");
     const auto before=NowNs();
-    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3101,request);
+    Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,3101,request);
     const auto after=NowNs();
     Check(controller.active->cancel_ns>=before+48000000LL &&
           controller.active->cancel_ns<=after+48000000LL,
@@ -315,14 +315,14 @@ void OwnershipRevocation() {
     Pump(controller);
     const auto request=controller.active->request_ns;
     for(jlong parent:{jlong{0},jlong{-1},static_cast<jlong>(INT32_MAX)+1,(jlong{1}<<32)+3201})
-        Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,parent,request);
-    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3201,request-1);
-    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3202,request);
+        Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,parent,request);
+    Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3201,request-1);
+    Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3202,request);
     Check(controller.active && controller.retired_requests.empty(),
           "revoke validates parent range and exact epoch without poisoning the current request");
     Check(Queue(323,3203),"seed an independently closing App");Pump(controller);
     ResetEvents();
-    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3201,request);
+    Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3201,request);
     auto cleared=Cleared();std::sort(cleared.begin(),cleared.end());
     Check(controller.active && controller.active->layer==323 && controller.overlapping.empty(),
           "ownership revoke removes an overlapping old close while keeping the independent owner");
@@ -339,7 +339,7 @@ void OwnershipRevocation() {
 
     auto& canceled=Fresh();Check(Queue(325,3205),"seed ordinary canceled close");Pump(canceled);
     const auto stopped=canceled.active->request_ns;
-    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3205,stopped);
+    Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,3205,stopped);
     late=ASurfaceTransaction_create();ResetEvents();
     Check(!AttachSession(late,326,3205,1120,2436,stopped) && events.empty(),
           "ordinary cancellation also forbids late show attachments during its silhouette grace");
@@ -357,14 +357,14 @@ void OpeningCancelKeepsPreviewMasks() {
               "seed opening owner with a verified still-visible starting/color companion");
         Pump(controller);
         auto* show=ASurfaceTransaction_create();Check(show,"create late OEM color show transaction");
-        Check(Java_ng_lst_hha_ContentAnimator_nativeAttach(nullptr,nullptr,
+        Check(Java_ng_lst_genie_ContentAnimator_nativeAttach(nullptr,nullptr,
             reinterpret_cast<jlong>(show),329,3207,1120,2436,request,JNI_TRUE),
             "JNI attachment retains authenticated starting/color metadata");
         ASurfaceTransaction_apply(show);ASurfaceTransaction_delete(show);Commit(0);Pump(controller);
         const auto preview_uniforms=layer_uniforms[328];
         const auto late_preview_uniforms=layer_uniforms[329];
         const auto primary_uniforms=layer_uniforms[327];
-        Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,3207,request);
+        Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,3207,request);
         controller.active->cancel_ns=NowNs()-1;
         ResetEvents();Frame(NowNs(),&controller);
         Check(!controller.active && controller.retiring.empty(),"ordinary opening cancel ends the motion owner");
@@ -388,7 +388,7 @@ void RevocationCommitOrdering() {
             const auto request=controller.pending->request_ns;
             size_t successor;
             if(revoke_before_successor) {
-                Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3301,request);
+                Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3301,request);
                 Check(!controller.pending && controller.retiring.size()==1,
                       "uncommitted revoked publication is retained solely for retirement");
                 successor=Prime(331,3301);
@@ -396,7 +396,7 @@ void RevocationCommitOrdering() {
                       "new owner does not inherit a revoked preview or its motion");
             } else {
                 successor=Prime(331,3301,{332});
-                Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3301,request);
+                Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,3301,request);
             }
             Check(controller.pending && controller.pending->request_ns!=request,
                   "revoke preserves the newer pending successor on the same host");
@@ -522,7 +522,7 @@ void CornerEndpointRadii() {
         Pump(controller);
         auto& current=*controller.active;
         current.animation.Advance(5);
-        hha::genie::AdvanceScalar(&current.corner,5,1.0);
+        genie::model::AdvanceScalar(&current.corner,5,1.0);
         Check(Submit(controller,current,false),"submit converged endpoint corner");
         Check(std::abs(layer_uniforms[layer][38]*geometry[6]-geometry[11])<1e-4,
               "final shader corner reconstructs physical icon/device endpoint");
@@ -539,7 +539,7 @@ void CornerRetargetAndHandoff() {
     Pump(controller);
     auto& current=*controller.active;
     current.animation.Advance(.12);
-    hha::genie::AdvanceScalar(&current.corner,.12,1.0);
+    genie::model::AdvanceScalar(&current.corner,.12,1.0);
     current.last_ns=NowNs()+10000000LL;
     const auto corner=current.corner;
     auto opening=closing;
@@ -553,7 +553,7 @@ void CornerRetargetAndHandoff() {
           "unprimed reversal preserves corner position and velocity");
     Check(std::abs(controller.active->corner.target-180.0/1120)<1e-12,
           "unprimed reversal targets the supplied device corner");
-    Check(controller.active->corner.response==hha::genie::kOpeningResponse,
+    Check(controller.active->corner.response==genie::model::kOpeningResponse,
           "unprimed reversal updates corner response");
     Check(QueueSession(712,7101,1120,2436,opening,false,NowNs(),{},false),
           "queue real-content handoff");
@@ -570,11 +570,11 @@ void PrimedReversalContinuity() {
     auto& controller=Fresh();Check(Queue(601,6001),"seed closing icon state");Pump(controller);
     auto& current=*controller.active;
     current.animation.Advance(.18);
-    hha::genie::AdvanceScalar(&current.corner,.18,1.0);
+    genie::model::AdvanceScalar(&current.corner,.18,1.0);
     // Model a vsync timestamp slightly ahead of the submission clock, so a
     // retarget must preserve the already-published state without extra advance.
     current.last_ns=NowNs()+10000000LL;
-    const auto mesh=hha::genie::ContourMesh(current.animation,current.parameters);
+    const auto mesh=genie::model::ContourMesh(current.animation,current.parameters);
     const double corner=current.corner.value;
     auto* transaction=ASurfaceTransaction_create();Check(transaction,"create reversal transaction");
     auto opening=Geometry(1120,2436);
@@ -616,7 +616,7 @@ void OverlappingRequests() {
           "queue closing App A");
     Pump(controller);
     auto* a=controller.active.get();
-    a->animation.Advance(.12);hha::genie::AdvanceScalar(&a->corner,.12,1.0);
+    a->animation.Advance(.12);genie::model::AdvanceScalar(&a->corner,.12,1.0);
     const int64_t b_request=a_request-1000;
     ResetEvents();
     Check(QueueSession(902,9002,1120,2436,Geometry(1120,2436),true,b_request,{},false),
@@ -631,7 +631,7 @@ void OverlappingRequests() {
     Frame(NowNs(),&controller);
     Check(a->frames>a_frames && controller.active->frames>b_frames,
           "both independent sessions receive display-event updates");
-    Java_ng_lst_hha_ContentAnimator_nativeStopRequest(nullptr,nullptr,9001,a_request);
+    Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,9001,a_request);
     a->cancel_ns=NowNs()-1;
     ResetEvents();Frame(NowNs(),&controller);
     Check(Cleared().empty() && a->cancel_ns && controller.active->cancel_ns==0,
@@ -682,7 +682,7 @@ void CrossParentPreviewHandoff() {
           "seed early preview before actual Task anchor");
     Pump(controller);
     controller.active->animation.Advance(.14);
-    hha::genie::AdvanceScalar(&controller.active->corner,.14,1.0);
+    genie::model::AdvanceScalar(&controller.active->corner,.14,1.0);
     controller.active->last_ns=NowNs()+10000000LL;
     const auto scalars=controller.active->animation.Scalars();
     const auto corner=controller.active->corner;
@@ -711,7 +711,7 @@ void AtomicCompanionAttachment() {
     const auto request=controller.active->request_ns;
     auto* transaction=ASurfaceTransaction_create();Check(transaction,"create companion show transaction");
     ResetEvents();
-    Check(Java_ng_lst_hha_ContentAnimator_nativeAttach(nullptr,nullptr,
+    Check(Java_ng_lst_genie_ContentAnimator_nativeAttach(nullptr,nullptr,
               reinterpret_cast<jlong>(transaction),932,9301,1120,2436,request,JNI_FALSE)==JNI_TRUE,
           "nativeAttach appends new compatible buffer to exact request");
     Check(events.size()==1 && events[0].layer==932 && events[0].transaction==transaction &&
@@ -779,9 +779,9 @@ void PrimedCrossParentHandoff() {
           "seed early preview for atomic cross-parent handoff");
     Pump(controller);
     controller.active->animation.Advance(.1);
-    hha::genie::AdvanceScalar(&controller.active->corner,.1,1.0);
+    genie::model::AdvanceScalar(&controller.active->corner,.1,1.0);
     controller.active->last_ns=NowNs()+10000000LL;
-    const auto mesh=hha::genie::ContourMesh(controller.active->animation,controller.active->parameters);
+    const auto mesh=genie::model::ContourMesh(controller.active->animation,controller.active->parameters);
     auto* transaction=ASurfaceTransaction_create();Check(transaction,"create actual Task show transaction");
     Check(QueueSession(962,9602,1120,2436,opening,false,request,{},false,0,0,transaction),
           "prime actual Task in its own show transaction using trusted original request");
@@ -873,7 +873,7 @@ void PublicationUnionAfterLateAttachment() {
 }
 void OneShotOpeningPublication() {
     auto& controller=Fresh();
-    hha::Transition request;
+    genie::Transition request;
     request.geometry=Geometry(1120,2436);
     for(size_t i=0;i<4;++i) std::swap(request.geometry[i],request.geometry[i+4]);
     std::swap(request.geometry[10],request.geometry[11]);
@@ -881,7 +881,7 @@ void OneShotOpeningPublication() {
     request.leash_layer=9950;
     auto* transaction=ASurfaceTransaction_create();Check(transaction,"create first preview transaction");
     const auto applications=renderer_applies.load();
-    Check(hha::PrimeOpeningPreview(transaction,reinterpret_cast<void*>(995),
+    Check(genie::PrimeOpeningPreview(transaction,reinterpret_cast<void*>(995),
         reinterpret_cast<void*>(9950),1120,2436,request),"verified preview receives one-shot opening shader");
     Check(events.size()==1 && events[0].layer==995 && !events[0].clear && events[0].transaction==transaction,
           "preview shader is already in the actual first-show transaction before its caller applies");
@@ -896,7 +896,7 @@ void OneShotOpeningPublication() {
     ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
     request.closing=true;
     transaction=ASurfaceTransaction_create();
-    Check(!hha::PrimeOpeningPreview(transaction,reinterpret_cast<void*>(995),
+    Check(!genie::PrimeOpeningPreview(transaction,reinterpret_cast<void*>(995),
         reinterpret_cast<void*>(9950),1120,2436,request),"closing request cannot use opening capability priming");
     // The central renderer owns real preview retirement, represented here by
     // its same-transaction SELF/guard clear after the one-shot was delivered.
@@ -906,12 +906,12 @@ void OneShotOpeningPublication() {
 }
 void ClosingGroupHostPublication() {
     auto& controller=Fresh();
-    hha::Transition request;
+    genie::Transition request;
     request.geometry=Geometry(1120,2436);
     request.closing=true;request.event_ns=NowNs()-16000000LL;
     auto* transaction=ASurfaceTransaction_create();
     const auto applies=renderer_applies.load();
-    Check(hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1799),
+    Check(genie::PrimeContentPublication(transaction,reinterpret_cast<void*>(1799),
         reinterpret_cast<void*>(1790),1120,2436,request),"closing live group primes its host transaction");
     Check(events.size()==1 && !events[0].clear && events[0].layer==1799 &&
           events[0].transaction==transaction,"closing output protection joins the caller's first host transaction");
@@ -925,10 +925,10 @@ void GestureClosingSessionPublication() {
     auto& controller=Fresh();
     const std::array<float,12> release={456.9f,289.9f,663,1442.1f,80,2117,171,171,
                                         458,-335,106.56f,45.61f};
-    const hha::genie::Rect icon{80,2117,171,171},window{0,0,1120,2436};
-    hha::genie::Parameters expected;
-    Check(hha::genie::ParametersForIcon(icon,window,&expected),"gesture reference uses the authoritative content domain");
-    expected.response=hha::genie::kClosingResponse;
+    const genie::model::Rect icon{80,2117,171,171},window{0,0,1120,2436};
+    genie::model::Parameters expected;
+    Check(genie::model::ParametersForIcon(icon,window,&expected),"gesture reference uses the authoritative content domain");
+    expected.response=genie::model::kClosingResponse;
     // The bridge accepts small future clock skew. Keep the initial publication
     // exactly at release time so elapsed scheduling cannot hide a wrong seed.
     const auto request=NowNs()+50000000LL;
@@ -951,7 +951,7 @@ void GestureClosingSessionPublication() {
     Check(std::abs(pending.corner.value-start_corner)<1e-12 &&
           std::abs(pending.corner.target-end_corner)<1e-12,
           "gesture corners use released visible width and destination icon width");
-    Check(pending.corner.response==hha::genie::kClosingResponse,
+    Check(pending.corner.response==genie::model::kClosingResponse,
           "gesture close preserves ordinary closing corner dynamics");
     Check(events.size()==2 && events[0].clear && events[0].layer==1812 &&
           !events[1].clear && events[1].layer==1811 &&
@@ -972,10 +972,10 @@ void GestureClosingSessionPublication() {
     Check(controller.active && controller.active->layer==1811 && !controller.pending,
           "gesture closing session adopts after its reveal commit");
     ResetEvents();Frame(request+120000000LL,&controller);
-    hha::genie::Animation reference;
+    genie::model::Animation reference;
     Check(reference.Reset(expected,false) && reference.Retarget(true),"initialize independently based gesture closing reference");
     reference.Advance(.12);
-    const auto mesh=hha::genie::ContourMesh(reference,expected);
+    const auto mesh=genie::model::ContourMesh(reference,expected);
     for(size_t i=0;i<mesh.size();++i) {
         Check(std::abs(layer_uniforms[1811][i*4]-mesh[i].x)<1e-6 &&
               std::abs(layer_uniforms[1811][i*4+1]-mesh[i].y)<1e-6,
@@ -987,7 +987,7 @@ void GestureClosingSessionPublication() {
     Check(Cleared().empty() && border_widths[1811]>0,
           "gesture worker retirement preserves the visible composed silhouette");
     auto* restore=ASurfaceTransaction_create();
-    Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+    Check(Java_ng_lst_genie_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
               reinterpret_cast<jlong>(restore),1811),"gesture source restoration owns the final effect cleanup");
     Check(Cleared()==std::vector<int>{1811} && border_widths[1811]==0,
           "gesture restoration clears its shader and CLIENT guard together");
@@ -997,12 +997,12 @@ void GestureClosingSessionPublication() {
 }
 void GestureClosingHostPublication() {
     auto& controller=Fresh();
-    hha::Transition request;
+    genie::Transition request;
     request.geometry={456.9f,289.9f,663,1442.1f,80,2117,171,171,458,-335,106.56f,45.61f};
     request.closing=true;request.event_ns=NowNs()+50000000LL;
     auto* transaction=ASurfaceTransaction_create();Check(transaction,"create gesture first host transaction");
     const auto applies=renderer_applies.load();
-    Check(hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1821),
+    Check(genie::PrimeContentPublication(transaction,reinterpret_cast<void*>(1821),
         reinterpret_cast<void*>(1820),1120,2436,request),
         "gesture host publication accepts actual full dimensions with a scaled translated release");
     Check(events.size()==1 && !events[0].clear && events[0].layer==1821 && events[0].transaction==transaction,
@@ -1022,20 +1022,20 @@ void GestureClosingHostPublication() {
     ResetEvents();transaction=ASurfaceTransaction_create();Check(transaction,"create elapsed gesture host transaction");
     request.event_ns=NowNs()-120000000LL;
     const auto before=NowNs();
-    Check(hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1821),
+    Check(genie::PrimeContentPublication(transaction,reinterpret_cast<void*>(1821),
         reinterpret_cast<void*>(1820),1120,2436,request),"elapsed gesture host publication retains the full content domain");
     const auto after=NowNs();
-    hha::genie::Parameters expected;
-    Check(hha::genie::ParametersForIcon({80,2117,171,171},{0,0,1120,2436},&expected),
+    genie::model::Parameters expected;
+    Check(genie::model::ParametersForIcon({80,2117,171,171},{0,0,1120,2436},&expected),
           "elapsed gesture reference uses full-screen origin instead of release translation");
-    expected.response=hha::genie::kClosingResponse;
-    hha::genie::Animation first,last;
+    expected.response=genie::model::kClosingResponse;
+    genie::model::Animation first,last;
     Check(first.Reset(expected,false) && first.Retarget(true) && last.Reset(expected,false) && last.Retarget(true),
           "initialize elapsed gesture reference at both observed publication times");
     first.Advance(static_cast<double>(before-request.event_ns)/1e9);
     last.Advance(static_cast<double>(after-request.event_ns)/1e9);
-    const auto first_mesh=hha::genie::ContourMesh(first,expected);
-    const auto last_mesh=hha::genie::ContourMesh(last,expected);
+    const auto first_mesh=genie::model::ContourMesh(first,expected);
+    const auto last_mesh=genie::model::ContourMesh(last,expected);
     for(size_t i=0;i<first_mesh.size();++i) {
         const double x=layer_uniforms[1821][i*4],y=layer_uniforms[1821][i*4+1];
         Check(x>=std::min(first_mesh[i].x,last_mesh[i].x)-1e-6 &&
@@ -1055,7 +1055,7 @@ void GestureClosingHostPublication() {
 }
 void GesturePublicationRejectsIncompatibleGeometry() {
     auto& controller=Fresh();
-    hha::Transition release;
+    genie::Transition release;
     release.geometry={456.9f,289.9f,663,1442.1f,80,2117,171,171,458,-335,106.56f,45.61f};
     release.closing=true;
     auto distorted=release;distorted.geometry[3]=1500;
@@ -1063,7 +1063,7 @@ void GesturePublicationRejectsIncompatibleGeometry() {
     auto opening=release;opening.closing=false;
     for(size_t i=0;i<4;++i) std::swap(opening.geometry[i],opening.geometry[i+4]);
     std::swap(opening.geometry[10],opening.geometry[11]);
-    const std::array<std::pair<hha::Transition,const char*>,3> cases{{
+    const std::array<std::pair<genie::Transition,const char*>,3> cases{{
         {distorted,"distorted gesture close cannot publish a mismatched buffer aspect"},
         {oversized,"uniformly scaled close larger than the authoritative domain is rejected"},
         {opening,"partial opening cannot borrow the scaled-close publication exception"},
@@ -1073,7 +1073,7 @@ void GesturePublicationRejectsIncompatibleGeometry() {
         auto* transaction=ASurfaceTransaction_create();Check(transaction,"create rejected gesture publication transaction");
         const auto applies=renderer_applies.load();
         const auto retained=references;
-        Check(!hha::PrimeContentPublication(transaction,reinterpret_cast<void*>(1831),
+        Check(!genie::PrimeContentPublication(transaction,reinterpret_cast<void*>(1831),
             reinterpret_cast<void*>(1830),1120,2436,request),item.second);
         Check(events.empty() && border_widths.empty() && commits.empty() && completions.empty() &&
               !controller.active && !controller.pending && !Running() && controller.detaches_pending.load()==0,
@@ -1122,16 +1122,16 @@ void GroupedSourcePublication() {
     Check(controller.active && controller.active->unwarped_layer==1801,
           "unprimed worker updates preserve the group's source identity");
     controller.active->animation.Advance(1.0);
-    hha::genie::AdvanceScalar(&controller.active->corner,1.0,1.0);
+    genie::model::AdvanceScalar(&controller.active->corner,1.0,1.0);
     ResetEvents();Frame(NowNs(),&controller);
     Check(controller.active && controller.active->layer==1803 && border_widths[1803]>0,
           "settled opening retains SELF while the composed output remains visible");
     auto* restore=ASurfaceTransaction_create();
-    Check(!Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+    Check(!Java_ng_lst_genie_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
               reinterpret_cast<jlong>(restore),1803),"restore cannot clear a group still owned by an animation");
     Stop(controller);ResetEvents();
     Check(border_widths[1803]>0,"worker retirement leaves the last masked group state until source restoration");
-    Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+    Check(Java_ng_lst_genie_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
               reinterpret_cast<jlong>(restore),1803),"retired output clears in the caller's visibility restoration transaction");
     Check(Cleared()==std::vector<int>{1803}&&events[0].transaction==restore&&border_widths[1803]==0,
           "group restoration atomically clears SELF and CLIENT border on the hidden output");
@@ -1146,14 +1146,14 @@ void RevokedGroupKeepsMask() {
                        0,0,publication,reinterpret_cast<void*>(1852)),"prime a closing composed output");
     ASurfaceTransaction_apply(publication);ASurfaceTransaction_delete(publication);Commit(0);Pump(controller);
     ResetEvents();
-    Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,1850,request);
+    Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(nullptr,nullptr,1850,request);
     Check(!controller.active && controller.retiring.empty(),"revocation immediately ends the composed closing writer");
     Check(Cleared().empty() && border_widths[1851]>0 && border_widths[1853]>0,
           "composed output and still-visible OEM color retain their last masks after revoke");
     ResetEvents();Frame(NowNs(),&controller);
     Check(events.empty(),"revoked output has no further closing deformation writes");
     auto* restore=ASurfaceTransaction_create();Check(restore,"create hidden output restoration transaction");
-    Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
+    Check(Java_ng_lst_genie_ContentAnimator_nativeClearRetiredGroup(nullptr,nullptr,
         reinterpret_cast<jlong>(restore),1851),"bridge may clear the retired group's mask with its hide/source restoration");
     Check(Cleared()==std::vector<int>{1851} && events[0].transaction==restore,
           "revoked composed mask clears only in the supplied visibility transaction");
@@ -1183,7 +1183,7 @@ void GroupReplacementDoesNotBecomePreview() {
     Check(border_widths[1841]>0,"old group keeps its mask until bridge visibility restoration");
     Stop(controller);
     auto* restore=ASurfaceTransaction_create();
-    for(int layer:{1841,1844}) Check(Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(
+    for(int layer:{1841,1844}) Check(Java_ng_lst_genie_ContentAnimator_nativeClearRetiredGroup(
         nullptr,nullptr,reinterpret_cast<jlong>(restore),layer),"hidden retired group releases its effect");
     ASurfaceTransaction_delete(restore);
     std::puts("PASS composed output replacement preserves visibility ownership");
@@ -1294,7 +1294,7 @@ void LinkedIconBeforeAppHandoff() {
               controller.active->texture_width==171 && controller.active->texture_height==171,
               "icon-first publication seeds one provisional owner with its actual texture dimensions");
         controller.active->animation.Advance(.11);
-        hha::genie::AdvanceScalar(&controller.active->corner,.11,1.0);
+        genie::model::AdvanceScalar(&controller.active->corner,.11,1.0);
         controller.active->last_ns=NowNs()+10000000LL;
         const auto scalars=controller.active->animation.Scalars();
         const auto corner=controller.active->corner;
@@ -1435,7 +1435,7 @@ void LinkedIconPendingReversalPublication() {
           "seed closing App and linked icon before an uncommitted reversal");
     Pump(controller);Commit(PrimeTestIcon(1982,1983,closing,true,old_request));
     controller.active->animation.Advance(.09);
-    hha::genie::AdvanceScalar(&controller.active->corner,.09,1.0);
+    genie::model::AdvanceScalar(&controller.active->corner,.09,1.0);
     controller.active->last_ns=NowNs()+10000000LL;
     const auto old_frames=controller.active->frames;
     const auto opening=LinkedGeometry(false);
@@ -1495,7 +1495,7 @@ void WorkerCoalescencePreservesPrimedSnapshot() {
               "seed a moving App before worker/icon publication race");
         Pump(controller);Commit(PrimeTestIcon(2092,2094,old_geometry,!closing,old_request));
         controller.active->animation.Advance(.09);
-        hha::genie::AdvanceScalar(&controller.active->corner,.09,1.0);
+        genie::model::AdvanceScalar(&controller.active->corner,.09,1.0);
         controller.active->last_ns=NowNs()+10000000LL;
         const auto request=NowNs();auto geometry=LinkedGeometry(closing);
         if(closing) geometry[10]=0; // Captured OEM close input has a zero starting corner.
@@ -1554,7 +1554,7 @@ void LinkedIconWholeOwnerPublication() {
     VisibleUniforms visible;
     for(const auto& write:events) if(!write.clear) visible[write.layer]=write.uniforms;
     controller.active->animation.Advance(.08);
-    hha::genie::AdvanceScalar(&controller.active->corner,.08,1.0);
+    genie::model::AdvanceScalar(&controller.active->corner,.08,1.0);
     controller.active->last_ns=NowNs()+10000000LL;
     const auto old_app=visible.at(2011);
     auto* transaction=ASurfaceTransaction_create();Check(transaction,"create whole-owner icon publication");
@@ -1643,7 +1643,7 @@ void LinkedIconCannotReviveCancelledRequest() {
         Pump(controller);
         const auto commit=PrimeTestIcon(1992,1993,geometry,true,request);
         if(published) Commit(commit);
-        hha::CancelIconRenderer();
+        genie::CancelIconRenderer();
         Check(controller.stop_requested,"global cancellation is pending before its worker consumes it");
         RejectedLateIcon(1994,1995,geometry,request);
         Pump(controller);
@@ -1675,11 +1675,11 @@ void LinkedIconSelectsPendingPublication() {
     // owner carries a newer callback timestamp. Selection must follow the
     // uncommitted publication, rather than choosing the largest last_ns.
     controller.pending->animation.Advance(.04);
-    hha::genie::AdvanceScalar(&controller.pending->corner,.04,1.0);
+    genie::model::AdvanceScalar(&controller.pending->corner,.04,1.0);
     controller.active->last_ns=controller.pending->last_ns+10000000LL;
     Check(Submit(controller,*controller.pending,false,transaction),"publish a distinct pending contour in its borrowed transaction");
     const auto pending=layer_uniforms[2001];
-    const auto old_mesh=hha::genie::ContourMesh(controller.active->animation,controller.active->parameters);
+    const auto old_mesh=genie::model::ContourMesh(controller.active->animation,controller.active->parameters);
     Check(std::abs(pending[0]-old_mesh[0].x)>1e-6 || std::abs(pending[1]-old_mesh[0].y)>1e-6,
           "pending and active contours differ so owner-selection regression is observable");
     ASurfaceTransaction_apply(transaction);ASurfaceTransaction_delete(transaction);
@@ -1710,7 +1710,7 @@ void LinkedIconAdjustPrecedesAppDispatch() {
         if(!pending_source) Pump(controller);
         Session* source=pending_source?controller.pending.get():controller.active.get();
         Check(source && source->request_ns==source_request,"predecessor is in the requested pending or committed state");
-        source->animation.Advance(.07);hha::genie::AdvanceScalar(&source->corner,.07,1.0);
+        source->animation.Advance(.07);genie::model::AdvanceScalar(&source->corner,.07,1.0);
         source->last_ns=NowNs()+10000000LL;
         if(pending_source) Check(Submit(controller,*source,false,source_transaction),
                                 "predecessor App transaction records its current model state before icon attachment");
@@ -1724,7 +1724,7 @@ void LinkedIconAdjustPrecedesAppDispatch() {
         const auto last_ns=source->last_ns;
         const auto frames=source->frames;
         const auto generation=source->generation;
-        Check(std::any_of(scalars.begin(),scalars.end(),[](const hha::genie::Scalar& scalar) {
+        Check(std::any_of(scalars.begin(),scalars.end(),[](const genie::model::Scalar& scalar) {
                   return std::abs(scalar.velocity)>1e-6;
               }) && std::abs(corner.velocity)>1e-6,
               "adjust continuity seed has observable coordinate and corner velocities");
@@ -1754,7 +1754,7 @@ void LinkedIconAdjustPrecedesAppDispatch() {
             Check(source->animation.Scalars()[i].value==scalars[i].value &&
                   source->animation.Scalars()[i].velocity==scalars[i].velocity,
                   "source-based reversal preserves every spring position and velocity before asynchronous App dispatch");
-        Check(source->parameters.response==(!was_closing?hha::genie::kClosingResponse:hha::genie::kOpeningResponse) &&
+        Check(source->parameters.response==(!was_closing?genie::model::kClosingResponse:genie::model::kOpeningResponse) &&
               source->corner.response==source->parameters.response,
               "source-based reversal applies the new opening or closing response to shared motion and corner");
         ASurfaceTransaction_apply(adjust_transaction);ASurfaceTransaction_delete(adjust_transaction);
@@ -1864,7 +1864,7 @@ void LinkedIconRejectsStaleAdjustSource() {
     reject(2044,source_request,"exact source timestamp cannot authorize an icon capability it does not already own");
     Check(controller.active->request_ns==source_request && controller.active->closing,
           "invalid predecessor proofs leave live App direction and identity unchanged");
-    hha::CancelIconRenderer();
+    genie::CancelIconRenderer();
     reject(2042,source_request,"a queued global cancellation rejects source-based adjust before worker processing");
     Pump(controller);DrainCompletions();
     reject(2042,source_request,"a retired source cannot be revived by presenting a newer adjust epoch");
@@ -1895,7 +1895,7 @@ void LinkedIconReversalEpochIsolation() {
           "seed closing App for linked icon reversal");
     Pump(controller);Commit(PrimeTestIcon(1952,1953,closing,true,old_request));
     controller.active->animation.Advance(.09);
-    hha::genie::AdvanceScalar(&controller.active->corner,.09,1.0);
+    genie::model::AdvanceScalar(&controller.active->corner,.09,1.0);
     controller.active->last_ns=NowNs()+10000000LL;
     const auto scalars=controller.active->animation.Scalars();
     const auto corner=controller.active->corner;
@@ -1959,6 +1959,6 @@ int main() {
      for(const auto& entry:references) Check(entry.second==0,"all fake capabilities released");
      for(const auto& commit:commits) Check(!commit.callback,"all fake commit callbacks consumed");
      for(const auto& completion:completions) Check(!completion.callback,"all fake completions consumed");}
-    std::printf("Renderer device regression: %d checks passed (actual hha_content.cpp)\n",checks);
+    std::printf("Renderer device regression: %d checks passed (actual genie_content.cpp)\n",checks);
     return 0;
 }

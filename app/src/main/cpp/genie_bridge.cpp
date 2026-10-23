@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "hha_bridge.h"
-#include "hha_renderer.h"
+#include "genie_bridge.h"
+#include "genie_renderer.h"
 
 #include <android/binder_ibinder.h>
 #include <android/binder_parcel.h>
@@ -15,7 +15,7 @@
 #include <mutex>
 #include <thread>
 
-namespace hha {
+namespace genie {
 namespace {
 using Command=BridgeCommand;
 struct Dispatcher {
@@ -99,7 +99,7 @@ void Run(Dispatcher* dispatcher) {
     auto check = library ? reinterpret_cast<CheckService>(
         dlsym(library, "AServiceManager_checkService")) : nullptr;
     if (!check) {
-        __android_log_print(ANDROID_LOG_WARN, "HHA.Bridge", "NDK service lookup unavailable");
+        __android_log_print(ANDROID_LOG_WARN, "Genie.Bridge", "NDK service lookup unavailable");
         return;
     }
     AIBinder_Class* type = BridgeClass();
@@ -150,7 +150,7 @@ void Run(Dispatcher* dispatcher) {
             AIBinder_decStrong(binder);
             binder = nullptr;
         }
-        __android_log_print(accepted ? ANDROID_LOG_INFO : ANDROID_LOG_DEBUG, "HHA.Bridge",
+        __android_log_print(accepted ? ANDROID_LOG_INFO : ANDROID_LOG_DEBUG, "Genie.Bridge",
             "dispatch layer=%d direction=%s status=%d accepted=%d",
             command.transition.leash_layer, command.cancel ? "cancel" :
                 command.transition.closing ? "close" : "open", status, accepted);
@@ -175,7 +175,7 @@ void Queue(Command command) {
 }
 }  // namespace
 
-GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::Rect* window,
+GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::model::Rect* window,
                                           const Transition& transition) {
     static void* library=dlopen("libbinder_ndk.so",RTLD_NOW|RTLD_LOCAL);
     using CheckService=AIBinder* (*)(const char*);
@@ -227,14 +227,14 @@ GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie:
     if(visibility) ASurfaceTransaction_delete(visibility);
     if(output) AParcel_delete(output);
     AIBinder_decStrong(binder);
-    __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_DEBUG,"HHA.Bridge",
+    __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_DEBUG,"Genie.Bridge",
         "group before host leash=%d accepted=%d primed=%d status=%d domain=%dx%d",transition.leash_layer,accepted,primed,status,width,height);
     if(accepted==1 && !primed) QueueCancel(transition.leash_layer,transition.event_ns);
     if(primed) return GroupPreparation::Ready;
     return status==STATUS_OK && accepted==2 ? GroupPreparation::Deferred : GroupPreparation::Rejected;
 }
 
-bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,const Transition& transition) {
+bool PrepareContentGroup(void* transaction,void* parent,genie::model::Rect* window,const Transition& transition) {
     return PrepareContentGroupStatus(transaction,parent,window,transition)==GroupPreparation::Ready;
 }
 
@@ -292,7 +292,7 @@ bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,
         timespec timestamp{};clock_gettime(CLOCK_MONOTONIC,&timestamp);
         QueueCancel(transition.leash_layer,static_cast<int64_t>(timestamp.tv_sec)*1000000000LL+timestamp.tv_nsec);
     }
-    __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_WARN,"HHA.Bridge",
+    __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_WARN,"Genie.Bridge",
         "preview first transaction leash=%d accepted=%d primed=%d status=%d",transition.leash_layer,accepted,primed,status);
     return primed;
 }
@@ -349,7 +349,7 @@ bool PrepareIcon(void* host_transaction,void* icon_surface,void* icon_parent,
     if(publication) ASurfaceTransaction_delete(publication);
     if(output) AParcel_delete(output);
     AIBinder_decStrong(binder);
-    __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_WARN,"HHA.Bridge",
+    __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_WARN,"Genie.Bridge",
         "icon before host leash=%d accepted=%d primed=%d status=%d texture=%dx%d domain=%dx%d",
         transition.leash_layer,accepted,primed,status,texture_width,texture_height,window_width,window_height);
     return primed;
@@ -363,4 +363,4 @@ void QueueCancel(int32_t layer, int64_t event_ns) {
     command.transition.event_ns = event_ns;
     Queue(command);
 }
-}  // namespace hha
+}  // namespace genie

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
-#include "hha_bridge.h"
+#include "genie_bridge.h"
 
-namespace hha {
+namespace genie {
 
 struct RenderIdentity {
     int32_t parent = -1;
@@ -26,7 +26,7 @@ bool PrimeOpeningPreview(void* transaction,void* surface,void* parent,int width,
                          const Transition& transition);
 // Return the server-verified full content domain independently of a gesture's
 // current presentation. No cached opening is required for a closing request.
-bool PrepareContentGroup(void* transaction,void* parent,genie::Rect* window,const Transition& transition);
+bool PrepareContentGroup(void* transaction,void* parent,genie::model::Rect* window,const Transition& transition);
 bool PrimeContentPublication(void* transaction,void* surface,void* parent,int width,int height,
                              const Transition& transition);
 bool PrepareOpeningPreview(void* transaction,void* parent,int width,int height,

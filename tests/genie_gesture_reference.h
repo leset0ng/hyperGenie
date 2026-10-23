@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "hha_genie.h"
+#include "genie_model.h"
 
 #include <algorithm>
 #include <cmath>
 
 // Recovered gesture configuration retained for numerical reference tests only.
 // Production SF velocities have not been mapped to these UIKit units.
-namespace hha::genie::reference {
+namespace genie::model::reference {
 
 struct SpringSettings {
     double response;
@@ -45,4 +45,4 @@ inline bool SettingsForGesture(double weight, Point velocity, GestureSettings* r
     return true;
 }
 
-}  // namespace hha::genie::reference
+}  // namespace genie::model::reference

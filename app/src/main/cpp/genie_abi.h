@@ -9,7 +9,7 @@
 #include <cstring>
 #include <vector>
 
-namespace hha::abi {
+namespace genie::abi {
 namespace detail {
 // Probe only library-owned local objects. A different layout must fail without
 // following an unchecked map pointer. Ignore Android's top-byte pointer tags
@@ -123,4 +123,4 @@ inline bool ProbeAnimation(void* gui, void* utils, const char** reason) {
     if (reason) *reason=nullptr;
     return true;
 }
-} // namespace hha::abi
+} // namespace genie::abi

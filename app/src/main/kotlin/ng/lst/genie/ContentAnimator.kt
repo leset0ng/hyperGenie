@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 import android.util.Log
 
@@ -12,7 +12,7 @@ internal object ContentAnimator {
         if (initialized) return true
         return runCatching {
             if (!loaded) {
-                System.loadLibrary("hha_content")
+                System.loadLibrary("genie_content")
                 loaded = true
             }
             nativeInitialize().also { initialized = it }
@@ -122,5 +122,5 @@ internal object ContentAnimator {
     @JvmStatic external fun nativeRunning(): Boolean
     @JvmStatic external fun nativeStop()
 
-    private const val TAG = "HHA"
+    private const val TAG = "Genie"
 }

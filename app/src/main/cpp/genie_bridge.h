@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "hha_genie.h"
+#include "genie_model.h"
 
 #include <array>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <deque>
 #include <algorithm>
 
-namespace hha {
+namespace genie {
 
 // IWindowManager private extension; mirrored by CentralBridge.kt. Ordinary App
 // capabilities stay in system_server. The restricted prepare operation returns
@@ -31,8 +31,8 @@ struct Transition {
 struct AnimationSource {
     Transition transition;
     int32_t animation_id = -1;
-    genie::Rect window{0,0,0,0};
-    genie::Rect presentation_start{0,0,0,0};
+    genie::model::Rect window{0,0,0,0};
+    genie::model::Rect presentation_start{0,0,0,0};
     // Source centerX/centerY/width dynamics, shared with the paired icon host.
     std::array<float,3> host_velocity{};
     std::array<float,3> host_delay{};
@@ -108,11 +108,11 @@ private:
 enum class GroupPreparation { Rejected, Deferred, Ready };
 // PREPARE_GROUP accepted=2 means the exact group is awaiting its first buffer.
 // No host transaction is changed until a Ready reply has been merged.
-GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::Rect* window,
+GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::model::Rect* window,
                                           const Transition& transition);
 
 void QueueTransition(const Transition& transition);
 void QueueCancel(int32_t leash_layer, int64_t event_ns);
 bool LauncherAnimationEnabled();
 
-}  // namespace hha
+}  // namespace genie

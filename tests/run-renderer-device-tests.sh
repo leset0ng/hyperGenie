@@ -18,20 +18,20 @@ if ! test -x "$compiler"; then
     exit 2
 fi
 
-test_dir=$(mktemp -d "${TMPDIR:-/tmp}/hha-renderer-device-tests.XXXXXX")
+test_dir=$(mktemp -d "${TMPDIR:-/tmp}/genie-renderer-device-tests.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
-binary="$test_dir/hha-renderer-device-tests"
+binary="$test_dir/genie-renderer-device-tests"
 
 "$compiler" -std=c++17 -O1 -g -Wall -Wextra -Werror \
     -fno-exceptions -fno-rtti -static-libstdc++ \
     -I "$project_dir/app/src/main/cpp" \
     "$project_dir/tests/renderer_device_test.cpp" \
-    "$project_dir/app/src/main/cpp/hha_genie.cpp" \
+    "$project_dir/app/src/main/cpp/genie_model.cpp" \
     -landroid -llog -ldl -pthread -o "$binary"
 
 if test "$("$adb_bin" -s "$serial" shell id -u | tr -d '\r')" != 0; then
     echo 'This isolated device test requires an existing root ADB shell.' >&2
     exit 2
 fi
-"$adb_bin" -s "$serial" push "$binary" /data/local/tmp/hha-renderer-device-tests
-"$adb_bin" -s "$serial" shell 'chmod 755 /data/local/tmp/hha-renderer-device-tests && timeout 30 /data/local/tmp/hha-renderer-device-tests'
+"$adb_bin" -s "$serial" push "$binary" /data/local/tmp/genie-renderer-device-tests
+"$adb_bin" -s "$serial" shell 'chmod 755 /data/local/tmp/genie-renderer-device-tests && timeout 30 /data/local/tmp/genie-renderer-device-tests'

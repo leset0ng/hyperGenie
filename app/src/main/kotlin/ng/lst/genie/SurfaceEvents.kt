@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 import android.annotation.SuppressLint
 import android.graphics.Rect
@@ -402,5 +402,5 @@ internal class SurfaceEvents(
         localProducers.clear()
     }
 
-    private companion object { const val TAG = "HHA.SurfaceEvents" }
+    private companion object { const val TAG = "Genie.SurfaceEvents" }
 }

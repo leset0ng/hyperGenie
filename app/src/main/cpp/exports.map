@@ -1,4 +1,4 @@
-HHA_NATIVE_1.0 {
+GENIE_NATIVE_1.0 {
     global:
         native_init;
     local:

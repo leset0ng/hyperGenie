@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "hha_genie.h"
+#include "genie_model.h"
 
 #include <algorithm>
 #include <cmath>
 
-namespace hha::genie {
+namespace genie::model {
 namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kPositionTolerance = 1e-4;
@@ -288,4 +288,4 @@ bool Animation::Settled() const {
     return true;
 }
 
-}  // namespace hha::genie
+}  // namespace genie::model

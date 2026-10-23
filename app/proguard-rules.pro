@@ -1,6 +1,6 @@
 # Keep module entry classes and hookers reachable: the framework instantiates them
 # reflectively from META-INF/xposed/java_init.list.
--keep class ng.lst.hha.HookEntry { *; }
+-keep class ng.lst.genie.HookEntry { *; }
 -keepclasseswithmembers class * implements io.github.libxposed.api.XposedModuleInterface$* {
     <methods>;
 }

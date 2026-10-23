@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 /** A live WindowState capability, never a permission to discover another starting window. */
 internal class PreviewCloseIdentity(

@@ -20,5 +20,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "HyperHomeAnimation"
+rootProject.name = "hyperGenie"
 include(":app")

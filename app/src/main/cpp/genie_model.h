@@ -4,7 +4,7 @@
 #include <array>
 #include <cstddef>
 
-namespace hha::genie {
+namespace genie::model {
 
 struct Point {
     double x;
@@ -99,4 +99,4 @@ private:
     bool initialized_ = false;
 };
 
-}  // namespace hha::genie
+}  // namespace genie::model

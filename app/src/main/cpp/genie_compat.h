@@ -5,7 +5,7 @@
 #include <sys/system_properties.h>
 #include <cstdio>
 
-namespace hha {
+namespace genie {
 // Device, fingerprint, launcher release and OS minor version are not ABI gates.
 // Required native interfaces and layouts are checked separately before use.
 inline bool CheckHyperOS(const char* tag) {
@@ -19,4 +19,4 @@ inline bool CheckHyperOS(const char* tag) {
     }
     return true;
 }
-}  // namespace hha
+}  // namespace genie

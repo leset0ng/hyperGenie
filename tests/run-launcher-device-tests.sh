@@ -18,14 +18,14 @@ if ! test -x "$compiler"; then
     exit 2
 fi
 
-test_dir=$(mktemp -d "${TMPDIR:-/tmp}/hha-launcher-device-tests.XXXXXX")
+test_dir=$(mktemp -d "${TMPDIR:-/tmp}/genie-launcher-device-tests.XXXXXX")
 trap 'rm -rf "$test_dir"' EXIT HUP INT TERM
-binary="$test_dir/hha-launcher-device-tests"
+binary="$test_dir/genie-launcher-device-tests"
 "$compiler" -std=c++17 -O1 -g -Wall -Wextra -Werror \
     -fno-exceptions -fno-rtti -static-libstdc++ \
     -I "$project_dir/app/src/main/cpp" \
     "$project_dir/tests/launcher_device_test.cpp" \
-    "$project_dir/app/src/main/cpp/hha_genie.cpp" \
+    "$project_dir/app/src/main/cpp/genie_model.cpp" \
     -landroid -llog -ldl -pthread -o "$binary"
-"$adb_bin" -s "$serial" push "$binary" /data/local/tmp/hha-launcher-device-tests
-"$adb_bin" -s "$serial" shell 'chmod 755 /data/local/tmp/hha-launcher-device-tests && timeout 15 /data/local/tmp/hha-launcher-device-tests'
+"$adb_bin" -s "$serial" push "$binary" /data/local/tmp/genie-launcher-device-tests
+"$adb_bin" -s "$serial" shell 'chmod 755 /data/local/tmp/genie-launcher-device-tests && timeout 15 /data/local/tmp/genie-launcher-device-tests'

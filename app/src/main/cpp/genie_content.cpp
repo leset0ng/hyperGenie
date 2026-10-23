@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Real content-layer renderer owned by system_server on compatible HyperOS.
-#include "hha_compat.h"
-#include "hha_genie.h"
-#include "hha_viewport.h"
-#include "hha_renderer.h"
+#include "genie_compat.h"
+#include "genie_model.h"
+#include "genie_viewport.h"
+#include "genie_renderer.h"
 
 #include <android/choreographer.h>
 #include <android/log.h>
@@ -29,7 +29,7 @@
 #include <vector>
 
 namespace {
-constexpr char kTag[] = "HHA.Content";
+constexpr char kTag[] = "Genie.Content";
 constexpr char kRegister[] =
     "_ZN7android21SurfaceComposerClient14registerShaderERKNSt3__112basic_stringIcNS1_11char_traitsIcEENS1_9allocatorIcEEEES9_";
 constexpr char kPost[] =
@@ -174,9 +174,9 @@ struct Session {
     bool closing = false;
     bool starting = false;
     bool preserve_preview_masks = true; // OEM preview visibility can outlive its motion owner.
-    hha::genie::Parameters parameters;
-    hha::genie::Animation animation;
-    hha::genie::Scalar corner;
+    genie::model::Parameters parameters;
+    genie::model::Animation animation;
+    genie::model::Scalar corner;
     std::shared_ptr<std::atomic<bool>> committed;
     std::vector<std::shared_ptr<std::atomic<bool>>> commit_dependencies;
 
@@ -301,7 +301,7 @@ bool Submit(Controller& controller, Session& session, bool detach,
                 static_cast<Controller*>(context)->detaches_pending.fetch_sub(1,std::memory_order_release);
             });
     } else {
-        const auto vertices=hha::genie::ContourMesh(session.animation,session.parameters);
+        const auto vertices=genie::model::ContourMesh(session.animation,session.parameters);
         std::array<float, 44> values{};
         for (size_t i = 0; i < vertices.size(); ++i) {
             values[i*4] = static_cast<float>(vertices[i].x);
@@ -452,9 +452,9 @@ void RetireCommitted(Controller& controller) {
 // silhouette visible. Remove every matching writer before retiring any surfaces:
 // independently live/primed successors keep their capabilities, and composed
 // outputs keep their last mask until the bridge hides/restores them atomically.
-void RevokeRequest(Controller& controller, hha::RenderIdentity identity) {
+void RevokeRequest(Controller& controller, genie::RenderIdentity identity) {
     auto revoke=[&](std::unique_ptr<Session>& session) {
-        if(!session || !hha::SameRender(identity,{session->parent_layer,session->request_ns})) return false;
+        if(!session || !genie::SameRender(identity,{session->parent_layer,session->request_ns})) return false;
         RememberRetired(controller,session->request_ns);
         session->preserve_preview_masks=true;
         if(session->attached) controller.retiring.push_back(std::move(session));
@@ -469,7 +469,7 @@ void RevokeRequest(Controller& controller, hha::RenderIdentity identity) {
     // A superseded borrowed publication may already be waiting in retirement.
     // Tombstone it too, so it cannot be rediscovered after its successor ends.
     for(const auto& session:controller.retiring)
-        if(hha::SameRender(identity,{session->parent_layer,session->request_ns})) {
+        if(genie::SameRender(identity,{session->parent_layer,session->request_ns})) {
             RememberRetired(controller,session->request_ns);
             session->preserve_preview_masks=true;
         }
@@ -575,7 +575,7 @@ void AdoptCommand(Controller& controller) {
             if (next->started_ns>current.last_ns) {
                 const double delta=static_cast<double>(next->started_ns-current.last_ns)/1e9;
                 current.animation.Advance(delta);
-                hha::genie::AdvanceScalar(&current.corner,delta,1.0);
+                genie::model::AdvanceScalar(&current.corner,delta,1.0);
                 current.last_ns=next->started_ns;
             }
             // Reuse the same geometry basis on a reversal. Only dynamics and
@@ -642,7 +642,7 @@ void AdoptCommand(Controller& controller) {
         if(now>current.last_ns) {
             const double delta=static_cast<double>(now-current.last_ns)/1e9;
             current.animation.Advance(delta);
-            hha::genie::AdvanceScalar(&current.corner,delta,1.0);
+            genie::model::AdvanceScalar(&current.corner,delta,1.0);
             current.last_ns=now;
             current.elapsed=static_cast<double>(now-current.started_ns)/1e9;
         }
@@ -734,7 +734,7 @@ void FrameCurrent(Controller& controller,int64_t frame_time) {
     const int64_t timestamp=std::max(frame_time,session.last_ns);
     const double delta=static_cast<double>(timestamp-session.last_ns)/1e9;
     session.animation.Advance(delta);
-    hha::genie::AdvanceScalar(&session.corner,delta,1.0);
+    genie::model::AdvanceScalar(&session.corner,delta,1.0);
     session.last_ns=timestamp;
     const double elapsed=std::max(0.0,static_cast<double>(timestamp-session.started_ns)/1e9);
     session.elapsed = elapsed;
@@ -802,7 +802,7 @@ void Worker(Controller* controller) {
 bool Initialize() {
     std::lock_guard<std::mutex> lock(g_initialize_mutex);
     if (g_controller.load(std::memory_order_acquire) != nullptr) return true;
-    if (!hha::CheckHyperOS(kTag)) return false;
+    if (!genie::CheckHyperOS(kTag)) return false;
     void* gui = dlopen("libgui.so", RTLD_NOW | RTLD_LOCAL);
     void* utils = dlopen("libutils.so", RTLD_NOW | RTLD_LOCAL);
     // A module ClassLoader has an isolated linker namespace. The public NDK
@@ -827,7 +827,7 @@ bool Initialize() {
         __android_log_print(ANDROID_LOG_WARN, kTag, "required SELF interfaces missing; content animation disabled");
         return false;
     }
-    BinderResult token = reg(std::string("hha_genie_")+std::to_string(getpid()), std::string(kShader));
+    BinderResult token = reg(std::string("genie_model_")+std::to_string(getpid()), std::string(kShader));
     if (token.ptr == nullptr) {
         __android_log_print(ANDROID_LOG_WARN, kTag, "SELF shader registration rejected");
         return false;
@@ -851,7 +851,7 @@ bool Initialize() {
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeBufferSurfaceCopy(JNIEnv* env, jclass, jlong source) {
+Java_ng_lst_genie_ContentAnimator_nativeBufferSurfaceCopy(JNIEnv* env, jclass, jlong source) {
     if (!source || !g_parenting || !g_controller.load(std::memory_order_acquire)) return 0;
     void* original = reinterpret_cast<void*>(static_cast<uintptr_t>(source));
     // The caller holds the original Java SC lock. Its local +0x58 owner is lost
@@ -868,7 +868,7 @@ Java_ng_lst_hha_ContentAnimator_nativeBufferSurfaceCopy(JNIEnv* env, jclass, jlo
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeInitialize(JNIEnv*, jclass) {
+Java_ng_lst_genie_ContentAnimator_nativeInitialize(JNIEnv*, jclass) {
     return Initialize() ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -888,27 +888,27 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
     if (event_ns<=0 || event_ns>now+100000000LL || now-event_ns>1500000000LL) return JNI_FALSE;
     const size_t icon=closing?4:0;
     const size_t full=closing?0:4;
-    const hha::genie::Rect icon_rect{values[icon],values[icon+1],values[icon+2],values[icon+3]};
+    const genie::model::Rect icon_rect{values[icon],values[icon+1],values[icon+2],values[icon+3]};
     // Current WindowState dimensions define the full content domain even when
     // a close request starts from a gesture's partially scaled presentation.
     const bool full_endpoint=std::abs(values[full+2]-width)<2 &&
                              std::abs(values[full+3]-height)<2;
-    const hha::genie::Rect window_rect{
+    const genie::model::Rect window_rect{
         full_endpoint?values[full]:0.0,full_endpoint?values[full+1]:0.0,
         static_cast<double>(width),static_cast<double>(height)};
-    hha::genie::Parameters parameters;
+    genie::model::Parameters parameters;
     // SF SpringProperty.velocity units have not been equated to the source
     // UIKit gesture units. Do not inject an assumed velocity into the mesh.
-    if(!hha::genie::ParametersForIcon(icon_rect,window_rect,&parameters)) return JNI_FALSE;
-    parameters.response=closing?hha::genie::kClosingResponse:hha::genie::kOpeningResponse;
+    if(!genie::model::ParametersForIcon(icon_rect,window_rect,&parameters)) return JNI_FALSE;
+    parameters.response=closing?genie::model::kClosingResponse:genie::model::kOpeningResponse;
     auto next=std::make_unique<Session>();
     next->parameters=parameters;
     next->closing=closing;
     next->starting=starting;
-    const hha::genie::Rect start_rect{values[0],values[1],values[2],values[3]};
-    const hha::genie::Rect end_rect{values[4],values[5],values[6],values[7]};
-    next->corner={hha::genie::CornerRatio(values[10],start_rect),0.0,
-        hha::genie::CornerRatio(values[11],end_rect),parameters.response};
+    const genie::model::Rect start_rect{values[0],values[1],values[2],values[3]};
+    const genie::model::Rect end_rect{values[4],values[5],values[6],values[7]};
+    next->corner={genie::model::CornerRatio(values[10],start_rect),0.0,
+        genie::model::CornerRatio(values[11],end_rect),parameters.response};
     if(!next->animation.Reset(parameters,!closing)||!next->animation.Retarget(closing)) return JNI_FALSE;
     next->surface=reinterpret_cast<void*>(static_cast<uintptr_t>(surface));
     next->parent=reinterpret_cast<void*>(static_cast<uintptr_t>(parent));
@@ -1025,11 +1025,11 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
             const bool frozen=PublicationPending(*controller,current);
             const double advance=frozen?0.0:std::max(0.0,static_cast<double>(now-current.last_ns)/1e9);
             next->animation.Advance(advance);
-            hha::genie::AdvanceScalar(&next->corner,advance,1.0);
+            genie::model::AdvanceScalar(&next->corner,advance,1.0);
             next->corner.target=requested_corner.target;
             next->corner.response=requested_corner.response;
             if(current.closing!=next->closing) {
-                next->parameters.response=closing?hha::genie::kClosingResponse:hha::genie::kOpeningResponse;
+                next->parameters.response=closing?genie::model::kClosingResponse:genie::model::kOpeningResponse;
                 next->animation.Retarget(next->parameters,next->closing);
                 next->started_ns=event_ns;
                 ++next->generation;
@@ -1037,7 +1037,7 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
             next->primed_continuation=true;
         } else {
             next->animation.Advance(std::max(0.0,delta));
-            hha::genie::AdvanceScalar(&next->corner,std::max(0.0,delta),1.0);
+            genie::model::AdvanceScalar(&next->corner,std::max(0.0,delta),1.0);
         }
         // An older borrowed publication can commit after this transaction.
         // Keep their common snapshot frozen until every dependency is ready.
@@ -1203,7 +1203,7 @@ static bool PrimeLinkedIcon(void* transaction,jlong surface,jlong parent,int tex
                 // the asynchronous App lookup subsequently joins this state.
                 if(current->closing!=closing) {
                     auto parameters=current->parameters;
-                    parameters.response=closing?hha::genie::kClosingResponse:hha::genie::kOpeningResponse;
+                    parameters.response=closing?genie::model::kClosingResponse:genie::model::kOpeningResponse;
                     if(!current->animation.Retarget(parameters,closing)) return false;
                     current->parameters=parameters;
                     current->closing=closing;
@@ -1211,8 +1211,8 @@ static bool PrimeLinkedIcon(void* transaction,jlong surface,jlong parent,int tex
                     ++current->generation;
                 }
                 const size_t end=4;
-                const hha::genie::Rect target{geometry[end],geometry[end+1],geometry[end+2],geometry[end+3]};
-                current->corner.target=hha::genie::CornerRatio(geometry[11],target);
+                const genie::model::Rect target{geometry[end],geometry[end+1],geometry[end+2],geometry[end+3]};
+                current->corner.target=genie::model::CornerRatio(geometry[11],target);
                 current->corner.response=current->parameters.response;
                 current->request_ns=event_ns;
                 current->cancel_ns=0;
@@ -1235,7 +1235,7 @@ static bool PrimeLinkedIcon(void* transaction,jlong surface,jlong parent,int tex
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_ng_lst_hha_ContentAnimator_nativePrimeIcon(JNIEnv* env,jclass,jlong transaction,jlong surface,
+Java_ng_lst_genie_ContentAnimator_nativePrimeIcon(JNIEnv* env,jclass,jlong transaction,jlong surface,
     jlong parent,jint texture_width,jint texture_height,jint width,jint height,
     jfloatArray geometry,jboolean closing,jlong event_ns,jlong source_request_ns,jint source_parent_layer) {
     if(!geometry || env->GetArrayLength(geometry)!=12) return JNI_FALSE;
@@ -1262,14 +1262,14 @@ static jboolean TransitionJni(JNIEnv* env,jlong transaction,jlong surface,jlong 
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeTransition(JNIEnv* env,jclass,jlong surface,
+Java_ng_lst_genie_ContentAnimator_nativeTransition(JNIEnv* env,jclass,jlong surface,
     jlong parent,jint width,jint height,jfloatArray geometry,jboolean closing,
     jlong event_ns,jlongArray companion_array,jboolean starting) {
     return TransitionJni(env,0,surface,parent,width,height,geometry,closing,event_ns,companion_array,starting);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_ng_lst_hha_ContentAnimator_nativePrime(JNIEnv* env,jclass,jlong transaction,jlong surface,
+Java_ng_lst_genie_ContentAnimator_nativePrime(JNIEnv* env,jclass,jlong transaction,jlong surface,
     jlong parent,jint width,jint height,jfloatArray geometry,jboolean closing,
     jlong event_ns,jlongArray companion_array,jboolean starting,jlong unwarped_source) {
     if(!transaction) return JNI_FALSE;
@@ -1278,14 +1278,14 @@ Java_ng_lst_hha_ContentAnimator_nativePrime(JNIEnv* env,jclass,jlong transaction
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeAttach(JNIEnv*,jclass,jlong transaction,jlong surface,
+Java_ng_lst_genie_ContentAnimator_nativeAttach(JNIEnv*,jclass,jlong transaction,jlong surface,
     jlong parent,jint width,jint height,jlong event_ns,jboolean starting) {
     return AttachSession(reinterpret_cast<void*>(static_cast<uintptr_t>(transaction)),surface,
         parent,width,height,event_ns,starting)?JNI_TRUE:JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(JNIEnv*,jclass,jlong transaction,jlong surface) {
+Java_ng_lst_genie_ContentAnimator_nativeClearRetiredGroup(JNIEnv*,jclass,jlong transaction,jlong surface) {
     auto* controller=g_controller.load(std::memory_order_acquire);
     if(!controller || !transaction || !surface) return JNI_FALSE;
     std::lock_guard<std::mutex> lock(controller->mutex);
@@ -1301,13 +1301,13 @@ Java_ng_lst_hha_ContentAnimator_nativeClearRetiredGroup(JNIEnv*,jclass,jlong tra
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeStopRequest(JNIEnv*,jclass,jlong parent,jlong event_ns) {
+Java_ng_lst_genie_ContentAnimator_nativeStopRequest(JNIEnv*,jclass,jlong parent,jlong event_ns) {
     if(parent<=0 || parent>INT32_MAX) return;
-    hha::CancelIconRenderer({static_cast<int32_t>(parent),event_ns});
+    genie::CancelIconRenderer({static_cast<int32_t>(parent),event_ns});
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(JNIEnv*,jclass,jlong parent,jlong event_ns) {
+Java_ng_lst_genie_ContentAnimator_nativeRevokeRequest(JNIEnv*,jclass,jlong parent,jlong event_ns) {
     if(parent<=0 || parent>INT32_MAX || event_ns<=0) return;
     auto* controller=g_controller.load(std::memory_order_acquire);
     if(!controller) return;
@@ -1316,7 +1316,7 @@ Java_ng_lst_hha_ContentAnimator_nativeRevokeRequest(JNIEnv*,jclass,jlong parent,
     if(controller->looper) ALooper_wake(controller->looper);
 }
 
-namespace hha {
+namespace genie {
 bool WarmIconRenderer() {return Initialize();}
 void RetainIconSurface(void* surface,const void* owner) {if(surface && g_inc_strong) g_inc_strong(surface,owner);}
 void ReleaseIconSurface(void* surface,const void* owner) {if(surface && g_dec_strong) g_dec_strong(surface,owner);}
@@ -1337,23 +1337,23 @@ bool PrimeContentPublication(void* transaction,void* surface,void* parent,int wi
         std::abs(values[full+3]-values[full+2]*height/width)<2;
     if(request.event_ns<=0 || request.event_ns>now+100000000LL ||
        now-request.event_ns>1500000000LL || (!full_endpoint && !scaled_close)) return false;
-    const genie::Rect icon{values[small],values[small+1],values[small+2],values[small+3]};
+    const genie::model::Rect icon{values[small],values[small+1],values[small+2],values[small+3]};
     // Match QueueSession: presentation coordinates are not the full buffer's
     // origin when a gesture has already translated and scaled its parent.
-    const genie::Rect window{full_endpoint?values[full]:0.0,full_endpoint?values[full+1]:0.0,
+    const genie::model::Rect window{full_endpoint?values[full]:0.0,full_endpoint?values[full+1]:0.0,
         static_cast<double>(width),static_cast<double>(height)};
-    const genie::Rect start{values[0],values[1],values[2],values[3]};
-    const genie::Rect end{values[4],values[5],values[6],values[7]};
+    const genie::model::Rect start{values[0],values[1],values[2],values[3]};
+    const genie::model::Rect end{values[4],values[5],values[6],values[7]};
     Session publication;
-    if(!genie::ParametersForIcon(icon,window,&publication.parameters)) return false;
-    publication.parameters.response=request.closing?genie::kClosingResponse:genie::kOpeningResponse;
+    if(!genie::model::ParametersForIcon(icon,window,&publication.parameters)) return false;
+    publication.parameters.response=request.closing?genie::model::kClosingResponse:genie::model::kOpeningResponse;
     if(!publication.animation.Reset(publication.parameters,!request.closing) ||
        !publication.animation.Retarget(request.closing)) return false;
-    publication.corner={genie::CornerRatio(values[10],start),0.0,
-        genie::CornerRatio(values[11],end),publication.parameters.response};
+    publication.corner={genie::model::CornerRatio(values[10],start),0.0,
+        genie::model::CornerRatio(values[11],end),publication.parameters.response};
     const double elapsed=std::max(0.0,static_cast<double>(now-request.event_ns)/1e9);
     publication.animation.Advance(elapsed);
-    genie::AdvanceScalar(&publication.corner,elapsed,1.0);
+    genie::model::AdvanceScalar(&publication.corner,elapsed,1.0);
     publication.width=width;publication.height=height;
     publication.surface=surface;publication.parent=parent;
     g_inc_strong(surface,&publication);g_inc_strong(parent,&publication);
@@ -1400,7 +1400,7 @@ void CancelIconRenderer(RenderIdentity identity) {
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeRunning(JNIEnv*,jclass) {
+Java_ng_lst_genie_ContentAnimator_nativeRunning(JNIEnv*,jclass) {
     auto* controller=g_controller.load(std::memory_order_acquire);
     if(!controller) return JNI_FALSE;
     std::lock_guard<std::mutex> lock(controller->mutex);
@@ -1410,6 +1410,6 @@ Java_ng_lst_hha_ContentAnimator_nativeRunning(JNIEnv*,jclass) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_ng_lst_hha_ContentAnimator_nativeStop(JNIEnv*, jclass) {
-    hha::CancelIconRenderer();
+Java_ng_lst_genie_ContentAnimator_nativeStop(JNIEnv*, jclass) {
+    genie::CancelIconRenderer();
 }

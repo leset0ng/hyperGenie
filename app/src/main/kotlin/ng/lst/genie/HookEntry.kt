@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 import android.util.Log
 import io.github.libxposed.api.XposedModule
@@ -54,6 +54,6 @@ class HookEntry : XposedModule() {
     }
 
     private companion object {
-        const val TAG = "HyperHomeAnimation"
+        const val TAG = "hyperGenie"
     }
 }

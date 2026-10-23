@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "hha_genie.h"
+#include "genie_model.h"
 #include <algorithm>
 #include <cmath>
 
-namespace hha::genie {
+namespace genie::model {
 
 // This integration is verified only on portrait fullscreen transitions. A
 // landscape or unusually wide presentation keeps the complete stock animation.
@@ -69,4 +69,4 @@ inline bool HostViewportForIcon(const Rect& icon,const Rect& window,Rect* host) 
     return true;
 }
 
-}  // namespace hha::genie
+}  // namespace genie::model

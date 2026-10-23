@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Native-only HyperOS launcher integration. Target Apps install no hooks.
-#include "hha_bridge.h"
-#include "hha_viewport.h"
-#include "hha_renderer.h"
-#include "hha_compat.h"
-#include "hha_abi.h"
+#include "genie_bridge.h"
+#include "genie_viewport.h"
+#include "genie_renderer.h"
+#include "genie_compat.h"
+#include "genie_abi.h"
 
 #include <android/log.h>
 #include <android/surface_control.h>
@@ -23,7 +23,7 @@
 #include <thread>
 
 namespace {
-constexpr char kTag[] = "HHA";
+constexpr char kTag[] = "Genie";
 constexpr char kStart[] =
     "_ZN7android21SurfaceComposerClient11Transaction16startSFAnimationERKNS_2spINS_14SurfaceControlEEERKNS2_INS_3gui17SfAnimationParamsEEE";
 constexpr char kAdjust[] =
@@ -74,8 +74,8 @@ Config ReadConfig() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (Now() < g_next_config) return g_config;
     g_next_config = Now()+250000000;
-    FILE* file = std::fopen("/data/local/tmp/hha.conf", "re");
-    if (!file) file = std::fopen("/data/adb/hha.conf", "re");
+    FILE* file = std::fopen("/data/local/tmp/genie.conf", "re");
+    if (!file) file = std::fopen("/data/adb/genie.conf", "re");
     if (!file) return g_config;
     Config next;
     char line[256], key[64], value[32];
@@ -148,7 +148,7 @@ std::array<float, 2> FitSize(float width, float height, float ratio) {
     return {std::min(width, height / ratio), std::min(height, width * ratio)};
 }
 
-using Last = hha::AnimationSource;
+using Last = genie::AnimationSource;
 std::array<Last,32> g_last{};
 size_t g_next = 0;
 
@@ -174,11 +174,11 @@ void* BlastUpdate(void* queue,const void* reference,uint32_t width,uint32_t heig
             for(auto& icon:g_icons) if(icon.parent==parent) {entry=&icon;break;}
             if(!entry) entry=&g_icons[g_next_icon++%g_icons.size()];
             if(entry->surface!=surface) {
-                hha::ReleaseIconSurface(entry->surface,entry);
+                genie::ReleaseIconSurface(entry->surface,entry);
                 entry->surface=const_cast<void*>(surface);
                 entry->animation_id=-1;
                 entry->request_ns=0;
-                hha::RetainIconSurface(entry->surface,entry);
+                genie::RetainIconSurface(entry->surface,entry);
             }
             entry->parent=parent;entry->width=width;entry->height=height;
             __android_log_print(ANDROID_LOG_INFO,kTag,"icon BBQ parent=%d layer=%d extent=%ux%u",parent,
@@ -227,8 +227,8 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     if (adjust && cached.valid && animation_id<=cached.animation_id) return;
     const Config config = ReadConfig();
     if (!config.enabled || !config.content) {
-        hha::QueueCancel(-1,Now());
-        hha::CancelIconRenderer();
+        genie::QueueCancel(-1,Now());
+        genie::CancelIconRenderer();
         return;
     }
     const auto x=Spring(parameters,"centerX"), y=Spring(parameters,"centerY");
@@ -243,7 +243,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     const auto [start_width,start_height]=FitSize(w.start,h.start,ratio.start);
     const auto [end_width,end_height]=FitSize(w.end,h.end,ratio.end);
     // Portrait-only admission: a landscape host keeps its complete OEM motion.
-    if(!hha::genie::PortraitWindow(start_width,start_height,end_width,end_height)) {
+    if(!genie::model::PortraitWindow(start_width,start_height,end_width,end_height)) {
         if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
             "portrait guard keeps stock animation start=%.1fx%.1f end=%.1fx%.1f",
             start_width,start_height,end_width,end_height);
@@ -256,7 +256,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
        (animation_id==cached.animation_id && (end_area<start_area)==cached.transition.closing))) return;
     if (!std::isfinite(start_area) || !std::isfinite(end_area) ||
         (!(adjust && cached.valid) && std::max(start_area,end_area)<4*std::min(start_area,end_area))) return;
-    hha::Transition request;
+    genie::Transition request;
     request.leash_layer=id;
     request.container_layer=id;
     if (g_name) {
@@ -292,7 +292,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
         "corner layer=%d radius=%.2f->%.2f corner=%.2f->%.2f ratio=%.3f->%.3f",
         id,radius.start,radius.end,corner.start,corner.end,radius_ratio.start,radius_ratio.end);
-    const hha::genie::Rect presentation_start{request.geometry[0],request.geometry[1],
+    const genie::model::Rect presentation_start{request.geometry[0],request.geometry[1],
         request.geometry[2],request.geometry[3]};
     if (adjust && cached.valid) {
         // A live host is already expanded to the window aspect. Keep the true
@@ -313,7 +313,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
             (animation_id==previous->animation_id && (adjust || request.closing==previous->transition.closing)))) return;
         if (!previous) previous=&g_last[g_next++%g_last.size()];
         previous->window=request.closing?cached.window:
-            hha::genie::Rect{request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
+            genie::model::Rect{request.geometry[4],request.geometry[5],request.geometry[6],request.geometry[7]};
         previous->presentation_start=presentation_start;
         previous->host_velocity={x.velocity,y.velocity,w.velocity};
         previous->host_delay={x.delay,y.delay,w.delay};
@@ -341,7 +341,7 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     // Retry its first-frame proof instead of permanently leaving it on stock.
     if(!continuing && (request.task_id>=0 ||
        (g_name && g_name(control).find("Pre startup opening leash")==0))) return;
-    hha::QueueTransition(request);
+    genie::QueueTransition(request);
 }
 void SetSpring(const void* parameters,const char* key,float start,float end) {
     const auto* value=Find(parameters,0x18,key);
@@ -408,7 +408,7 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
     const auto [start_width,start_height]=FitSize(w.start,h.start,ratio.start);
     const auto [end_width,end_height]=FitSize(w.end,h.end,ratio.end);
     // Portrait-only admission: a landscape host keeps its complete OEM motion.
-    if(!hha::genie::PortraitWindow(start_width,start_height,end_width,end_height)) {
+    if(!genie::model::PortraitWindow(start_width,start_height,end_width,end_height)) {
         if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
             "portrait guard keeps stock host animation start=%.1fx%.1f end=%.1fx%.1f type=%d",
             start_width,start_height,end_width,end_height,type);
@@ -426,7 +426,7 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             if(is_icon) {
-                if(const auto* source=hha::FindIconSource(g_last,animation_id,Now())) snapshot=*source;
+                if(const auto* source=genie::FindIconSource(g_last,animation_id,Now())) snapshot=*source;
             } else {
                 for(const auto& entry:g_last) if(entry.valid && entry.transition.leash_layer==layer) {
                     snapshot=entry;break;
@@ -442,9 +442,9 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         const auto& geometry=snapshot.transition.geometry;
         const size_t small=snapshot.transition.closing?4:0;
         const size_t full=snapshot.transition.closing?0:4;
-        const hha::genie::Rect icon{geometry[small],geometry[small+1],geometry[small+2],geometry[small+3]};
-        hha::genie::Rect window=snapshot.window.width>0?snapshot.window:
-            hha::genie::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
+        const genie::model::Rect icon{geometry[small],geometry[small+1],geometry[small+2],geometry[small+3]};
+        genie::model::Rect window=snapshot.window.width>0?snapshot.window:
+            genie::model::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
         const bool prestart=g_name && g_name(control).find("Pre startup opening leash")==0;
         bool prepared_now=false;
         if(!is_icon && !snapshot.admitted && (snapshot.transition.task_id>=0 || prestart)) {
@@ -466,32 +466,32 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 if(!reserved) return;
             }
             const auto result=!snapshot.transition.closing && prestart ?
-                (hha::PrepareOpeningPreview(transaction,const_cast<void*>(control),
+                (genie::PrepareOpeningPreview(transaction,const_cast<void*>(control),
                     static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition) ?
-                    hha::GroupPreparation::Ready : hha::GroupPreparation::Rejected) :
-                hha::PrepareContentGroupStatus(transaction,const_cast<void*>(control),&window,snapshot.transition);
+                    genie::GroupPreparation::Ready : genie::GroupPreparation::Rejected) :
+                genie::PrepareContentGroupStatus(transaction,const_cast<void*>(control),&window,snapshot.transition);
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 bool current=false;
                 for(auto& source:g_last) if(source.valid &&
                     source.transition.event_ns==snapshot.transition.event_ns &&
                     source.transition.leash_layer==layer && source.animation_id==animation_id) {
-                    if(result!=hha::GroupPreparation::Ready) {
+                    if(result!=genie::GroupPreparation::Ready) {
                         source.preparing=false;
-                        source.retry_pending=result==hha::GroupPreparation::Deferred;
+                        source.retry_pending=result==genie::GroupPreparation::Deferred;
                     }
                     current=true;
                     break;
                 }
                 // A nested newer generation owns the host now. Its publication
                 // guards also reject the obsolete transaction merged by Binder.
-                if(!current || result!=hha::GroupPreparation::Ready) return;
+                if(!current || result!=genie::GroupPreparation::Ready) return;
             }
             prepared_now=true;
         }
         const uint64_t transaction_id=transaction && g_transaction_id?g_transaction_id(transaction):0;
-        hha::genie::Rect minimized;
-        if(!hha::genie::HostViewportForIcon(icon,window,&minimized)) {
+        genie::model::Rect minimized;
+        if(!genie::model::HostViewportForIcon(icon,window,&minimized)) {
             if(prepared_now) {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 for(auto& source:g_last) if(source.valid &&
@@ -511,11 +511,11 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 for(const auto& source:g_icons) if(source.surface && source.parent==layer) {
                     lease=source;
-                    hha::RetainIconSurface(lease.surface,&lease);
+                    genie::RetainIconSurface(lease.surface,&lease);
                     break;
                 }
             }
-            const bool rendering=lease.surface && hha::PrepareIcon(transaction,lease.surface,
+            const bool rendering=lease.surface && genie::PrepareIcon(transaction,lease.surface,
                 const_cast<void*>(control),lease.width,lease.height,
                 static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition);
             if(rendering) {
@@ -530,14 +530,14 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                     break;
                 }
             }
-            hha::ReleaseIconSurface(lease.surface,&lease);
+            genie::ReleaseIconSurface(lease.surface,&lease);
             if(!rendering) {
                 SuppressFloatingIcon(transaction,control,parameters,layer,snapshot,
                     lease.surface?"registration-rejected":"missing-child",transaction_id);
                 return;
             }
         }
-        const hha::genie::Rect original_start{geometry[0],geometry[1],geometry[2],geometry[3]};
+        const genie::model::Rect original_start{geometry[0],geometry[1],geometry[2],geometry[3]};
         const auto start=snapshot.adjusting?snapshot.presentation_start:
             (snapshot.transition.closing?original_start:minimized);
         const auto end=snapshot.transition.closing?minimized:window;
@@ -578,7 +578,7 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 break;
             }
         }
-        if(prepared_now) hha::QueueTransition(snapshot.transition);
+        if(prepared_now) genie::QueueTransition(snapshot.transition);
         __android_log_print(ANDROID_LOG_INFO,kTag,"mesh viewport layer=%d animation=%d source=%d epoch=%lld hostTxn=%llu start=%.1fx%.1f end=%.1fx%.1f",layer,
             animation_id,snapshot.transition.leash_layer,static_cast<long long>(snapshot.transition.event_ns),
             static_cast<unsigned long long>(transaction_id),start.width,start.height,end.width,end.height);
@@ -614,7 +614,7 @@ void* Reparent(void* transaction,const void* child,const void* parent) {
             const Anchor anchor=ReadAnchor(child_control);
             if(anchor.task>=0 && ReadConfig().enabled && ReadConfig().content) {
                 const int32_t parent_id=g_layer(parent_control);
-                hha::Transition updated;
+                genie::Transition updated;
                 bool dispatch=false;
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
@@ -633,7 +633,7 @@ void* Reparent(void* transaction,const void* child,const void* parent) {
                 __android_log_print(ANDROID_LOG_INFO,kTag,
                     "prestart anchor leash=%d task=%d container=%d dispatch=%d",
                     parent_id,anchor.task,anchor.container,dispatch);
-                if(dispatch) hha::QueueTransition(updated);
+                if(dispatch) genie::QueueTransition(updated);
             }
         }
     }
@@ -656,7 +656,7 @@ void* Stop(void* transaction,const void* surface,int32_t animation_id) {
                 }
             }
         }
-        if(cancel) hha::QueueCancel(id,Now());
+        if(cancel) genie::QueueCancel(id,Now());
     }
     return g_stop(transaction,surface,animation_id);
 }
@@ -677,7 +677,7 @@ void Install(void* handle) {
     }
     void* utils=dlopen("libutils.so",RTLD_NOW|RTLD_NOLOAD);
     const char* reason=nullptr;
-    const bool compatible=hha::abi::ProbeAnimation(handle,utils?utils:handle,&reason);
+    const bool compatible=genie::abi::ProbeAnimation(handle,utils?utils:handle,&reason);
     if(utils) dlclose(utils);
     if(!compatible) {
         __android_log_print(ANDROID_LOG_WARN,kTag,"%s; keeping stock",reason);
@@ -721,7 +721,7 @@ void Install(void* handle) {
     // Warm only after all launcher capabilities have been accepted. native_init
     // must return before shader Binder registration and the renderer's self-load.
     std::thread([] {
-        g_icon_ready.store(hha::WarmIconRenderer(),std::memory_order_release);
+        g_icon_ready.store(genie::WarmIconRenderer(),std::memory_order_release);
     }).detach();
     __android_log_print(ANDROID_LOG_INFO,kTag,"central Genie launcher hooks installed pid=%d uid=%d",getpid(),getuid());
 }
@@ -730,7 +730,7 @@ void OnLoaded(const char* name,void* handle) {
 }
 }  // namespace
 
-bool hha::LauncherAnimationEnabled() {
+bool genie::LauncherAnimationEnabled() {
     const auto config=ReadConfig();
     return config.enabled && config.content;
 }
@@ -744,7 +744,7 @@ Loaded native_init(const NativeAPIEntries* entries) {
     // Native init also runs for a module scoped to system_server. The Java
     // central entry owns that process; never intercept its libgui transactions.
     if (getuid()<10000) return nullptr;
-    if (!hha::CheckHyperOS(kTag)) return nullptr;
+    if (!genie::CheckHyperOS(kTag)) return nullptr;
     g_api=entries;
     void* handle=dlopen("libgui.so",RTLD_NOW|RTLD_NOLOAD);
     if (handle) {Install(handle);dlclose(handle);}

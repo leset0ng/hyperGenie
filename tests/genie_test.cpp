@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "hha_genie.h"
-#include "hha_bridge.h"
-#include "hha_viewport.h"
+#include "genie_model.h"
+#include "genie_bridge.h"
+#include "genie_viewport.h"
 #include "genie_gesture_reference.h"
 
 #include <cmath>
@@ -10,11 +10,11 @@
 #include <limits>
 
 namespace {
-using hha::genie::Animation;
-using hha::genie::Parameters;
-using hha::genie::Point;
-using hha::genie::Rect;
-using hha::genie::Scalar;
+using genie::model::Animation;
+using genie::model::Parameters;
+using genie::model::Point;
+using genie::model::Rect;
+using genie::model::Scalar;
 int checks = 0;
 
 void Check(bool condition, const char* description) {
@@ -270,7 +270,7 @@ void IconParameterFactory() {
     const Rect icon{130.0, 800.0, 60.0, 60.0};
     const Rect window{100.0, 200.0, 400.0, 800.0};
     Parameters p;
-    Check(hha::genie::ParametersForIcon(icon, window, &p), "ordinary icon factory");
+    Check(genie::model::ParametersForIcon(icon, window, &p), "ordinary icon factory");
     Near(p.width, 400.0, 0.0, "factory content width");
     Near(p.height, 800.0, 0.0, "factory content height");
     Near(p.minimized_width, 400.0, 0.0, "square d uses window reference, not icon pixels");
@@ -283,41 +283,41 @@ void IconParameterFactory() {
     Near(p.window_y, 400.0, 0.0, "window center in local coordinates");
     Near(p.genie_amount_x, 0.0, 0.0, "ordinary phone has no horizontal G");
     Near(p.genie_amount_y, -0.575, 1e-15, "G follows icon position, not fixed amount");
-    Near(p.response, hha::genie::kOpeningResponse, 0.0, "factory uses recovered opening response");
+    Near(p.response, genie::model::kOpeningResponse, 0.0, "factory uses recovered opening response");
 
     Parameters translated;
-    Check(hha::genie::ParametersForIcon({1130.0, 300.0, 60.0, 60.0},
+    Check(genie::model::ParametersForIcon({1130.0, 300.0, 60.0, 60.0},
         {1100.0, -300.0, 400.0, 800.0}, &translated), "translated screen rectangles");
     Near(translated.icon_x, p.icon_x, 0.0, "shared screen translation leaves I unchanged");
     Near(translated.icon_y, p.icon_y, 0.0, "shared screen translation leaves I unchanged");
     Near(translated.genie_amount_y, p.genie_amount_y, 0.0, "shared translation leaves G unchanged");
 
     Parameters fraction;
-    Check(hha::genie::ParametersForIcon({130.25, 800.25, 60.0, 60.0}, window,
+    Check(genie::model::ParametersForIcon({130.25, 800.25, 60.0, 60.0}, window,
         &fraction, {0.0, 0.0}, 2.0), "screen scale accepted");
     Near(fraction.icon_x, 30.5, 0.0, "Ix rounds to a physical pixel");
     Near(fraction.icon_y, 630.5, 0.0, "Iy rounds to a physical pixel");
 
     Parameters rectangle;
-    Check(hha::genie::ParametersForIcon({130.0, 800.0, 40.0, 60.0}, window,
+    Check(genie::model::ParametersForIcon({130.0, 800.0, 40.0, 60.0}, window,
         &rectangle), "portrait icon geometry");
     Near(rectangle.minimized_width, 400.0 * 2.0 / 3.0, 1e-12,
          "minimized frame retains portrait icon aspect");
     Near(rectangle.minimized_height, 400.0, 1e-12, "minimized reference chooses longer icon edge");
-    Check(hha::genie::ParametersForIcon({130.0, 800.0, 120.0, 30.0},
+    Check(genie::model::ParametersForIcon({130.0, 800.0, 120.0, 30.0},
         {100.0, 200.0, 800.0, 400.0}, &rectangle), "wide icon source branch");
     Near(rectangle.minimized_width, 800.0, 1e-12,
          "icon aspect above window reference selects Dw");
     Near(rectangle.minimized_height, 200.0, 1e-12, "wide icon aspect retained");
 
-    Check(hha::genie::ParametersForIcon(icon, window, &rectangle, {500.0, 1000.0}),
+    Check(genie::model::ParametersForIcon(icon, window, &rectangle, {500.0, 1000.0}),
           "velocity prediction accepted");
     Near(rectangle.genie_amount_x, 0.0, 0.0, "horizontal speed does not enable phone Gx");
     Near(rectangle.genie_amount_y, -0.2, 1e-15, "Vy predicts window center by .15 seconds");
-    Check(hha::genie::ParametersForIcon({130.0, 300.0, 60.0, 60.0}, window,
+    Check(genie::model::ParametersForIcon({130.0, 300.0, 60.0, 60.0}, window,
         &rectangle), "upper icon direction");
     Near(rectangle.genie_amount_y, 0.50625, 1e-15, "upper direction has .75 attenuation");
-    Check(hha::genie::ParametersForIcon({130.0, -2000.0, 60.0, 60.0}, window,
+    Check(genie::model::ParametersForIcon({130.0, -2000.0, 60.0, 60.0}, window,
         &rectangle), "offscreen icon retains clamped direction");
     Near(rectangle.genie_amount_y, 0.75, 0.0, "upper G clamp before attenuation");
 
@@ -353,15 +353,15 @@ void IconParameterFactory() {
     for (const Rect& invalid : {Rect{0, 0, 0, 60}, Rect{0, 0, -1, 60},
                               Rect{0, 0, 400, 800},
                               Rect{0, std::numeric_limits<double>::infinity(), 60, 60}}) {
-        Check(!hha::genie::ParametersForIcon(invalid, window, &unchanged),
+        Check(!genie::model::ParametersForIcon(invalid, window, &unchanged),
               "invalid or oversized ordinary icon rejected");
         Near(unchanged.icon_x, p.icon_x, 0.0, "rejected factory preserves output");
         Near(unchanged.minimized_scale, p.minimized_scale, 0.0, "rejected factory preserves scale");
     }
-    Check(!hha::genie::ParametersForIcon(icon, window, nullptr), "null factory output rejected");
-    Check(!hha::genie::ParametersForIcon(icon, window, &unchanged, {0, 0}, 0.0),
+    Check(!genie::model::ParametersForIcon(icon, window, nullptr), "null factory output rejected");
+    Check(!genie::model::ParametersForIcon(icon, window, &unchanged, {0, 0}, 0.0),
           "zero pixel scale rejected");
-    Check(!hha::genie::ParametersForIcon(icon, {0, 0, 0, 800}, &unchanged),
+    Check(!genie::model::ParametersForIcon(icon, {0, 0, 0, 800}, &unchanged),
           "zero window extent rejected");
 }
 
@@ -373,7 +373,7 @@ void UpdatedParametersAndCancel() {
     animation.Advance(0.06);
     const auto before = animation.Scalars();
     const auto mesh = animation.Mesh();
-    p.response = hha::genie::kClosingResponse;
+    p.response = genie::model::kClosingResponse;
     Check(animation.Retarget(p, true), "close updates recovered dynamics");
     for (std::size_t i = 0; i < 19; ++i) {
         Near(animation.Scalars()[i].value, before[i].value, 0.0,
@@ -417,67 +417,67 @@ void UpdatedParametersAndCancel() {
 
 void ParentScalarAndGestureSettings() {
     Scalar scalar{0.6793503692, 5.1292229541, 0.4, 0.36};
-    Check(hha::genie::AdvanceScalar(&scalar, 0.01, 1.0), "independent parent scalar advances");
+    Check(genie::model::AdvanceScalar(&scalar, 0.01, 1.0), "independent parent scalar advances");
     Near(scalar.value, 0.7186374734118445, 1e-14, "reference turnaround state preserves momentum");
     Near(scalar.velocity, 2.841255856778858, 1e-13, "reference turnaround derivative");
     Check(scalar.velocity > 0.0, "parent scalar still moves forward after target reverses");
     const auto before = scalar;
     for (double bad : {0.0, -1.0, std::numeric_limits<double>::infinity(),
                        std::numeric_limits<double>::quiet_NaN()}) {
-        Check(!hha::genie::AdvanceScalar(&scalar, bad, 1.0), "invalid parent delta rejected");
+        Check(!genie::model::AdvanceScalar(&scalar, bad, 1.0), "invalid parent delta rejected");
         Near(scalar.value, before.value, 0.0, "bad delta preserves parent position");
         Near(scalar.velocity, before.velocity, 0.0, "bad delta preserves parent velocity");
     }
-    Check(!hha::genie::AdvanceScalar(nullptr, .01, 1.0), "null parent scalar rejected");
-    Check(!hha::genie::AdvanceScalar(&scalar, .01, 0.0), "invalid parent damping rejected");
+    Check(!genie::model::AdvanceScalar(nullptr, .01, 1.0), "null parent scalar rejected");
+    Check(!genie::model::AdvanceScalar(&scalar, .01, 0.0), "invalid parent damping rejected");
 
-    hha::genie::reference::GestureSettings settings{};
-    Check(hha::genie::reference::SettingsForGesture(0.5, {0.0, 0.0}, &settings), "ordinary gesture settings");
+    genie::model::reference::GestureSettings settings{};
+    Check(genie::model::reference::SettingsForGesture(0.5, {0.0, 0.0}, &settings), "ordinary gesture settings");
     Near(settings.layout.response, 0.32, 1e-15, "published gesture layout response");
     Near(settings.layout.damping_ratio, 1.1, 0.0, "gesture mesh is overdamped");
     Near(settings.position.response, 0.4, 1e-15, "position has its own response");
     Near(settings.position.damping_ratio, 0.83, 1e-15, "position has its own damping");
     Near(settings.scale.response, 0.44, 1e-15, "scale response independent of layout");
     Near(settings.scale.damping_ratio, 0.84, 0.0, "scale has its own damping");
-    Check(hha::genie::reference::SettingsForGesture(0.5, {-4000.0, -5000.0}, &settings), "fast flick settings");
+    Check(genie::model::reference::SettingsForGesture(0.5, {-4000.0, -5000.0}, &settings), "fast flick settings");
     Near(settings.layout.response, 0.224, 1e-15, "upward speed shortens layout response");
     Near(settings.position.response, 0.48, 1e-15, "horizontal speed lengthens position response");
-    Check(hha::genie::reference::SettingsForGesture(0.5, {40000.0, -50000.0}, &settings), "speed modifiers clamp");
+    Check(genie::model::reference::SettingsForGesture(0.5, {40000.0, -50000.0}, &settings), "speed modifiers clamp");
     Near(settings.layout.response, 0.224, 1e-15, "layout speed weight capped");
     Near(settings.position.response, 0.48, 1e-15, "position speed weight capped");
-    Check(hha::genie::reference::SettingsForGesture(1.5, {0.0, 0.0}, &settings), "frame weight not clamped");
+    Check(genie::model::reference::SettingsForGesture(1.5, {0.0, 0.0}, &settings), "frame weight not clamped");
     Near(settings.layout.response, 0.28, 1e-15, "frame weight extrapolates source formula");
     const auto old = settings;
-    Check(!hha::genie::reference::SettingsForGesture(100.0, {0.0, 0.0}, &settings), "nonphysical extrapolation rejected");
+    Check(!genie::model::reference::SettingsForGesture(100.0, {0.0, 0.0}, &settings), "nonphysical extrapolation rejected");
     Near(settings.layout.response, old.layout.response, 0.0, "invalid gesture preserves settings");
-    Check(!hha::genie::reference::SettingsForGesture(0.5,
+    Check(!genie::model::reference::SettingsForGesture(0.5,
         {std::numeric_limits<double>::quiet_NaN(), 0.0}, &settings), "nonfinite gesture rejected");
-    Check(!hha::genie::reference::SettingsForGesture(0.5, {0.0, 0.0}, nullptr), "null gesture result rejected");
+    Check(!genie::model::reference::SettingsForGesture(0.5, {0.0, 0.0}, nullptr), "null gesture result rejected");
 }
 void HostContourEndpoints() {
-    for(const auto& icon:std::array<hha::genie::Rect,3>{{{869,1657,171,171},{83,806,165,165},{606,1372,171,171}}}) {
-        const hha::genie::Rect window{0,0,1120,2436};
-        hha::genie::Rect host{};
-        Check(hha::genie::HostViewportForIcon(icon,window,&host),"contour host derives from raw mesh");
+    for(const auto& icon:std::array<genie::model::Rect,3>{{{869,1657,171,171},{83,806,165,165},{606,1372,171,171}}}) {
+        const genie::model::Rect window{0,0,1120,2436};
+        genie::model::Rect host{};
+        Check(genie::model::HostViewportForIcon(icon,window,&host),"contour host derives from raw mesh");
         Parameters p;Animation seed;
-        Check(hha::genie::ParametersForIcon(icon,window,&p)&&seed.Reset(p,true),"raw icon seed initializes");
-        const auto mesh=hha::genie::ContourMesh(seed,p);
+        Check(genie::model::ParametersForIcon(icon,window,&p)&&seed.Reset(p,true),"raw icon seed initializes");
+        const auto mesh=genie::model::ContourMesh(seed,p);
         Near(host.left+mesh[0].x*host.width,icon.left,1e-10,"raw contour left matches icon");
         Near(host.top+mesh[0].y*host.height,icon.top,1e-10,"raw contour top matches icon");
         Near((mesh[2].x-mesh[0].x)*host.width,icon.width,1e-10,"raw contour width matches icon");
         Near((mesh[6].y-mesh[0].y)*host.height,icon.height,1e-10,"raw contour height matches icon");
         Near(host.height/host.width,window.height/window.width,1e-12,"host avoids aspect crop");
         seed.Retarget(false);seed.Advance(.06);
-        const auto before=hha::genie::ContourMesh(seed,p);
-        p.response=hha::genie::kClosingResponse;
+        const auto before=genie::model::ContourMesh(seed,p);
+        p.response=genie::model::kClosingResponse;
         Check(seed.Retarget(p,true),"contour reverses");
-        const auto after=hha::genie::ContourMesh(seed,p);
+        const auto after=genie::model::ContourMesh(seed,p);
         for(std::size_t i=0;i<before.size();++i) {
             Near(before[i].x,after[i].x,0,"contour x stays continuous");
             Near(before[i].y,after[i].y,0,"contour y stays continuous");
         }
         seed.Retarget(p,false);seed.Advance(5);
-        const auto full=hha::genie::ContourMesh(seed,p);
+        const auto full=genie::model::ContourMesh(seed,p);
         Near(full[0].x,0,1e-12,"full contour left restores");
         Near(full[8].y,1,1e-12,"full contour bottom restores");
 
@@ -485,7 +485,7 @@ void HostContourEndpoints() {
 }
 
 void PortraitWindowAdmission() {
-    using hha::genie::PortraitWindow;
+    using genie::model::PortraitWindow;
     Check(PortraitWindow(171,171,1120,2436),"portrait open admits a square icon endpoint");
     Check(PortraitWindow(1120,2436,171,171),"portrait close admits a square icon endpoint");
     Check(!PortraitWindow(171,171,2436,1120),"landscape device open keeps stock motion");
@@ -506,7 +506,7 @@ void PortraitWindowAdmission() {
 }
 
 void IconPairingAfterRepeatedLaunches() {
-    std::array<hha::AnimationSource,4> sources{};
+    std::array<genie::AnimationSource,4> sources{};
     // Replay a reused ID after a cold open, a key-driven close and then a
     // gesture close. The gesture host must start at its released presentation.
     sources[0].valid=true;sources[0].animation_id=7;
@@ -517,55 +517,55 @@ void IconPairingAfterRepeatedLaunches() {
     sources[1].transition.geometry={0,0,1120,2436,869,1657,171,171};
     sources[2]=sources[1];sources[2].transition.event_ns=3000000000LL;
     sources[2].transition.geometry={284.7f,361.3f,550.5f,1197.4f,869,1657,171,171};
-    const auto* current=hha::FindIconSource(sources,7,3001000000LL);
+    const auto* current=genie::FindIconSource(sources,7,3001000000LL);
     Check(current==&sources[2],"reused ID pairs icon with latest gesture, not historical open");
     Near(current->transition.geometry[2],550.5,1e-5,"icon inherits released host width");
     Near(current->transition.geometry[3],1197.4,1e-4,"icon inherits released host height");
     sources[3]=sources[2];sources[3].transition.event_ns=3000500000LL;
-    Check(hha::FindIconSource(sources,7,3001000000LL)==&sources[3],"newest matching epoch wins");
+    Check(genie::FindIconSource(sources,7,3001000000LL)==&sources[3],"newest matching epoch wins");
     sources[3].supported=false;
-    Check(!hha::FindIconSource(sources,7,3001000000LL),"unsupported newest source preserves stock icon instead of borrowing older App geometry");
+    Check(!genie::FindIconSource(sources,7,3001000000LL),"unsupported newest source preserves stock icon instead of borrowing older App geometry");
     sources[3].valid=false;
-    Check(hha::FindIconSource(sources,7,3001000000LL)==&sources[2],"retired source cannot steal icon");
-    Check(!hha::FindIconSource(sources,8,3001000000LL),"unmatched ID keeps stock icon");
-    Check(hha::FindIconSource(sources,7,3700000000LL)==&sources[2],
+    Check(genie::FindIconSource(sources,7,3001000000LL)==&sources[2],"retired source cannot steal icon");
+    Check(!genie::FindIconSource(sources,8,3001000000LL),"unmatched ID keeps stock icon");
+    Check(genie::FindIconSource(sources,7,3700000000LL)==&sources[2],
           "live source still pairs after a callback is stalled longer than 500ms");
-    Check(hha::FindIconSource(sources,7,8000000000LL)==&sources[2],
+    Check(genie::FindIconSource(sources,7,8000000000LL)==&sources[2],
           "source lifetime rather than elapsed wall time determines pairing");
-    Check(!hha::FindIconSource(sources,7,500000000LL),"future source cannot pair with icon");
+    Check(!genie::FindIconSource(sources,7,500000000LL),"future source cannot pair with icon");
     sources[2].valid=false;sources[1].valid=false;sources[0].valid=false;
-    Check(!hha::FindIconSource(sources,7,8000000000LL),
+    Check(!genie::FindIconSource(sources,7,8000000000LL),
           "stopping every matching source prevents a late icon from reviving retired animation");
     sources[3].valid=true;sources[3].supported=true;
     sources[3].transition.event_ns=9000000000LL;
-    Check(!hha::FindIconSource(sources,7,8999999999LL),
+    Check(!genie::FindIconSource(sources,7,8999999999LL),
           "a reused ID cannot select a new source before its own event time");
-    Check(hha::FindIconSource(sources,7,9000000000LL)==&sources[3],
+    Check(genie::FindIconSource(sources,7,9000000000LL)==&sources[3],
           "a reused ID pairs with its new live epoch after prior sources stop");
 }
 
 void CornerEndpointMetrics() {
     const Rect icon{349,2122,160,160},window{0,0,1120,2436};
-    const double icon_ratio=hha::genie::CornerRatio(42.64,icon);
-    const double device_ratio=hha::genie::CornerRatio(180,window);
+    const double icon_ratio=genie::model::CornerRatio(42.64,icon);
+    const double device_ratio=genie::model::CornerRatio(180,window);
     Near(icon_ratio*icon.width,42.64,1e-12,"icon round-rect metric preserves physical radius");
     Near(device_ratio*window.width,180,1e-12,"device round-rect metric preserves physical radius");
     Check(icon_ratio>0.225,"real icon radius is not clipped to historical fixed ratio");
     Check(device_ratio>0,"full-device endpoint keeps nonzero device corners");
-    Near(hha::genie::CornerRatio(90,{0,0,560,1218}),device_ratio,1e-15,
+    Near(genie::model::CornerRatio(90,{0,0,560,1218}),device_ratio,1e-15,
          "gesture release inherits the same radius ratio after uniform scaling");
-    Near(hha::genie::CornerRatio(1000,icon),.5,1e-15,"radius clamps to half shortest side");
-    Near(hha::genie::CornerRatio(1000,{0,0,400,100}),.125,1e-15,
+    Near(genie::model::CornerRatio(1000,icon),.5,1e-15,"radius clamps to half shortest side");
+    Near(genie::model::CornerRatio(1000,{0,0,400,100}),.125,1e-15,
          "landscape round-rect clamp respects height");
-    Near(hha::genie::CornerRatio(0,window),0,0,"square device corner remains square");
-    Near(hha::genie::CornerRatio(-1,icon),0,0,"negative radius cannot invert corner coverage");
-    Near(hha::genie::CornerRatio(20,{0,0,0,100}),0,0,"invalid metric cannot divide by zero");
+    Near(genie::model::CornerRatio(0,window),0,0,"square device corner remains square");
+    Near(genie::model::CornerRatio(-1,icon),0,0,"negative radius cannot invert corner coverage");
+    Near(genie::model::CornerRatio(20,{0,0,0,100}),0,0,"invalid metric cannot divide by zero");
 }
 
 void TransitionQueueOrdering() {
-    hha::PendingTransitions pending;
+    genie::PendingTransitions pending;
     Check(!pending.Ready() && !pending.Take(),"empty dispatcher has no command");
-    hha::BridgeCommand a,b;
+    genie::BridgeCommand a,b;
     a.transition.leash_layer=10;a.transition.event_ns=100;
     b.transition.leash_layer=20;b.transition.event_ns=200;
     Check(pending.Post(a)&&pending.Post(b),"replacement transition queues");

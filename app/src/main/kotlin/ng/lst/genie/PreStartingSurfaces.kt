@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 import android.annotation.SuppressLint
 import android.graphics.Point
@@ -342,7 +342,7 @@ internal class PreStartingSurfaces(
             synchronized(checkNotNull(surfaceLock.get(parent))) {
                 if (surfaceValid.invoke(parent) != true || surfaceLayer.invoke(parent) != leash)
                     return unavailable(leash, "parent-retired")
-                parentCopy = copySurface.newInstance(parent, "HHA.central.prestarting.parent")
+                parentCopy = copySurface.newInstance(parent, "Genie.central.prestarting.parent")
             }
             return Preview(surfaceCopy, checkNotNull(parentCopy)).also {
                 openingExclusions.remove(leash)
@@ -508,8 +508,8 @@ internal class PreStartingSurfaces(
             // A manager color has no producer/BBQ child and no buffer extent.
             // Copy its exact registry SC. Buffer previews still resolve BBQ
             // from the original producer before copying away its Java owner.
-            val copy = if (color) copySurface.newInstance(source, "HHA.central.prestarting.color")
-                else ContentSurfaces.copy(source, "HHA.central.prestarting", width, height)
+            val copy = if (color) copySurface.newInstance(source, "Genie.central.prestarting.color")
+                else ContentSurfaces.copy(source, "Genie.central.prestarting", width, height)
             try {
                 val contentLayer = this.layer(copy)
                 if (contentLayer < 0 || contentLayer in seen) {
@@ -560,7 +560,7 @@ internal class PreStartingSurfaces(
     }.getOrNull()
 
     companion object {
-        private const val TAG = "HHA.PreStarting"
+        private const val TAG = "Genie.PreStarting"
         private const val PRESTART_SNAPSHOT = 1
         private const val PRESTART_SPLASH = 2
         private const val MAX_DRAW_DOMAINS = 64

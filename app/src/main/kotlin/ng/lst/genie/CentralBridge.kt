@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -61,7 +61,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val sessions = LinkedHashMap<Int, Active>() // Bridge worker only.
     private val lastEvents = HashMap<Int, Long>()
     private val changeQueued = AtomicBoolean()
-    private val worker = HandlerThread("HHA.Bridge").apply { start() }
+    private val worker = HandlerThread("Genie.Bridge").apply { start() }
     private val handler = Handler(worker.looper)
     private var hook: HookHandle? = null
     @Volatile private var closed = false
@@ -106,7 +106,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         try {
             val context = access.field(service, "mContext") as Context
             if (!authorized(context, caller)) {
-                reply.writeException(SecurityException("HHA bridge is restricted to the launcher UID"))
+                reply.writeException(SecurityException("Genie bridge is restricted to the launcher UID"))
                 return
             }
             var prepared = false
@@ -808,7 +808,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 // Exact registered producer + planned identity domain are still
                 // required. A matching builder size alone cannot authorize SELF.
                 preStarting.opening(request.leash, width, height)?.use { preview ->
-                    val resolved = ContentSurfaces.copy(source, "HHA.local.buffer", width, height)
+                    val resolved = ContentSurfaces.copy(source, "Genie.local.buffer", width, height)
                     try {
                         if (surfaceLayer.invoke(resolved) == surfaceLayer.invoke(preview.surface)) {
                             surfaceShowing(SurfaceEvents.Show(preview.surface, parent = preview.parent,
@@ -1002,7 +1002,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 surfacesChanged()
                 return
             }
-            val bufferSurface = ContentSurfaces.copy(show.surface, "HHA.publication.buffer", width, height)
+            val bufferSurface = ContentSurfaces.copy(show.surface, "Genie.publication.buffer", width, height)
             try {
             val layer = surfaceLayer.invoke(bufferSurface) as Int
             // Layout may run repeatedly before mSurfaceShown flips. One early
@@ -1144,14 +1144,14 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             var oemCopies: List<Any> = emptyList()
             var parentCopy: Any? = null
             try {
-                parentCopy = copySurface.newInstance(selected.parent, "HHA.central.parent")
-                contentCopy = if (group != null) copySurface.newInstance(group.output, "HHA.central.group")
+                parentCopy = copySurface.newInstance(selected.parent, "Genie.central.parent")
+                contentCopy = if (group != null) copySurface.newInstance(group.output, "Genie.central.group")
                 else selected.content?.let {
-                    if (size != null) ContentSurfaces.copy(it, "HHA.central.content", size.first, size.second)
-                    else copySurface.newInstance(it, "HHA.central.content")
+                    if (size != null) ContentSurfaces.copy(it, "Genie.central.content", size.first, size.second)
+                    else copySurface.newInstance(it, "Genie.central.content")
                 }
                 companionCopy = companion?.content?.let {
-                    ContentSurfaces.copy(it, "HHA.central.starting", checkNotNull(size).first, size.second)
+                    ContentSurfaces.copy(it, "Genie.central.starting", checkNotNull(size).first, size.second)
                 }
                 val excluded = mutableSetOf(primaryLayer)
                 contentCopy?.let { excluded += surfaceLayer.invoke(it) as Int }
@@ -1389,7 +1389,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     }
 
     private companion object {
-        const val TAG = "HHA.Bridge"
+        const val TAG = "Genie.Bridge"
         const val LAUNCHER = "com.miui.home"
         const val DESCRIPTOR = "android.view.IWindowManager"
         const val TRANSACTION = 0x484841

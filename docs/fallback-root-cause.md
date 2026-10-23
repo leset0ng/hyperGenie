@@ -40,7 +40,7 @@ The renderer has13 inherited companions even though the bridge's immediate list 
 
 ## 2. Java session retirement is not native closing-session retirement
 
-`CentralBridge.stop()` at1051 removes the worker request and calls `ContentAnimator.stopRequest()`. The native function marks a matching session with `cancel_ns = now +48ms` (`hha_content.cpp:1285`). But `FrameCurrent()` at670 only finishes on that timestamp when `!session.closing`.
+`CentralBridge.stop()` at1051 removes the worker request and calls `ContentAnimator.stopRequest()`. The native function marks a matching session with `cancel_ns = now +48ms` (`genie_content.cpp:1285`). But `FrameCurrent()` at670 only finishes on that timestamp when `!session.closing`.
 
 The existing cancellation rule deliberately keeps a closing silhouette until its deadline because stopping an OEM animation does not itself hide its surfaces. That rule also applies to **superseded ownership**, since the stop API carries no reason/retirement mode. Thus stopping Java discovery prevents future lookups but leaves the already-installed closing effect on the newly claimed starting window.
 
@@ -82,7 +82,7 @@ ROM preload additionally skips bitmap splash creation within10 seconds when a ca
 
 This is an admission/recovery problem in addition to the visible layer mismatch:
 
-1. `Observe()` (`hha_native.cpp:331`) defers initial `QueueTransition` for anchored streams until first-frame preparation succeeds.
+1. `Observe()` (`genie_native.cpp:331`) defers initial `QueueTransition` for anchored streams until first-frame preparation succeeds.
 2. `TuneParent()` at442 marks the stream unsupported and returns if `PrepareContentGroup` fails. It correctly preserves stock host geometry for that transaction.
 3. `CentralBridge.prepareGroup()` returns before `publish()` when `subtrees.ready(source)` is null. It therefore records no new transition/session for the rejected opening.
 4. `surfacesChanged()` at529 rechecks **existing sessions**. The later buffer-ready event cannot resume a rejected Launcher's transaction or re-authorize its host rewrite. A newer Launcher animation callback is required.

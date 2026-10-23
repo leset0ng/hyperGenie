@@ -1,4 +1,4 @@
-# HyperHomeAnimation
+# hyperGenie
 
 A libxposed / LSPosed API 102 module integrating the recovered iOS Genie
 content animation into compatible HyperOS 4+ launchers.
@@ -96,7 +96,7 @@ adb install -r -g app/build/outputs/apk/debug/app-debug.apk
 adb reboot
 ```
 
-Enable `ng.lst.hha` for **`com.miui.home` and `system`** in LSPosed. Do not add
+Enable `ng.lst.genie` for **`com.miui.home` and `system`** in LSPosed. Do not add
 Settings, Calculator or other App scopes. A headless AVD needs those same two
 entries in its LSPosed configuration. Reboot after changing scope or installing
 an updated native module; automatic hot reload is disabled because persistent
@@ -117,7 +117,7 @@ The module app has no Activity. Its metadata is shown by the framework.
 
 ## Runtime switches
 
-Launcher reads `/data/local/tmp/hha.conf`, or `/data/adb/hha.conf` if absent,
+Launcher reads `/data/local/tmp/genie.conf`, or `/data/adb/genie.conf` if absent,
 at most every 250 ms. Preserve launcher read permissions when replacing the file.
 
 ```ini
@@ -136,7 +136,7 @@ A zero system animation scale bypasses the custom renderer.
 
 ```text
 app/src/main/
-├── kotlin/ng/lst/hha/
+├── kotlin/ng/lst/genie/
 │   ├── HookEntry.kt          # system_server module entry
 │   ├── CentralBridge.kt      # authenticated lookup, ownership and lifecycle
 │   ├── PreStartingSurfaces.kt # owned OEM preview copies and domain checks
@@ -145,11 +145,11 @@ app/src/main/
 │   ├── OptionalMembers.kt    # shared per-component reflection caches
 │   └── ContentAnimator.kt    # central JNI boundary
 ├── cpp/
-│   ├── hha_native.cpp        # launcher event/geometry correlation
-│   ├── hha_bridge.h/.cpp     # authenticated preview preparation and async updates
-│   ├── hha_content.cpp       # SELF renderer, vsync, handoff and retarget
-│   ├── hha_genie.h/.cpp      # recovered geometry and oscillator model
-│   └── hha_viewport.h        # uniform host and mesh contour adaptation
+│   ├── genie_native.cpp        # launcher event/geometry correlation
+│   ├── genie_bridge.h/.cpp     # authenticated preview preparation and async updates
+│   ├── genie_content.cpp       # SELF renderer, vsync, handoff and retarget
+│   ├── genie_model.h/.cpp      # recovered geometry and oscillator model
+│   └── genie_viewport.h        # uniform host and mesh contour adaptation
 └── resources/META-INF/xposed/
     ├── java_init.list
     ├── native_init.list

@@ -14,7 +14,7 @@ static void ObserveAlpha(ASurfaceTransaction*,ASurfaceControl* surface,float val
     ++alpha_writes;suppressed=surface;
 }
 #define ASurfaceTransaction_setBufferAlpha ObserveAlpha
-#include "../app/src/main/cpp/hha_native.cpp"
+#include "../app/src/main/cpp/genie_native.cpp"
 #undef ASurfaceTransaction_setBufferAlpha
 namespace {
 int assertions=0, prepared=0, retained=0, released=0, queued=0, cancelled=0, local_cancels=0;
@@ -96,7 +96,7 @@ void CheckStock(const Param& parameters) {
     Check(g_last[0].host_transaction_id==0&&!g_last[0].supported,"rejected source cannot publish a custom viewport");
 }
 }
-namespace hha {
+namespace genie {
 void QueueTransition(const Transition&){++queued;}
 void QueueCancel(int32_t,int64_t){++cancelled;}
 bool WarmIconRenderer(){return true;}
@@ -107,7 +107,7 @@ bool PrepareOpeningPreview(void*,void*,int,int,const Transition& transition) {
     ++preview_prepared;
     return accept_preview&&!transition.closing;
 }
-GroupPreparation PrepareContentGroupStatus(void*,void*,genie::Rect*,const Transition& transition) {
+GroupPreparation PrepareContentGroupStatus(void*,void*,genie::model::Rect*,const Transition& transition) {
     ++group_prepared;
     if(transition.task_id<0) return GroupPreparation::Rejected;
     if(accept_group) return GroupPreparation::Ready;
@@ -253,7 +253,7 @@ int main(){
     const auto pending_properties=Properties(pending_group);
     Check(!g_last[0].supported&&g_last[0].retry_pending&&!g_last[0].admitted,
           "deferred group remains unadmitted and icon-ineligible");
-    Check(!hha::FindIconSource(g_last,77,Now()),"pending group cannot lend custom geometry to the icon");
+    Check(!genie::FindIconSource(g_last,77,Now()),"pending group cannot lend custom geometry to the icon");
     Param stale_host(2,76);const auto stale_properties=Properties(stale_host);
     TuneParent(reinterpret_cast<void*>(0x1212),&shell_control,stale_host.Reference());
     Check(group_prepared==1&&Properties(stale_host)==stale_properties,

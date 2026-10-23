@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 import android.annotation.SuppressLint
 import android.graphics.PixelFormat
@@ -76,7 +76,7 @@ internal class LiveSubtrees(
     private val lastFrame = blastType.getMethod("getLastAcquiredFrameNum")
     private val lock = Any()
     private val records = LinkedHashMap<Int, Record>()
-    private val worker = HandlerThread("HHA.Subtrees").apply { start() }
+    private val worker = HandlerThread("Genie.Subtrees").apply { start() }
     private val handler = Handler(worker.looper)
     private val direct = Executor { it.run() }
     private var nextGeneration = 0L
@@ -96,9 +96,9 @@ internal class LiveSubtrees(
 
         init {
             try {
-                source = retain(record.source, "HHA.subtree.lease.source").also(held::add)
-                output = retain(checkNotNull(record.output), "HHA.subtree.lease.output").also(held::add)
-                parent = retain(record.parent, "HHA.subtree.lease.parent").also(held::add)
+                source = retain(record.source, "Genie.subtree.lease.source").also(held::add)
+                output = retain(checkNotNull(record.output), "Genie.subtree.lease.output").also(held::add)
+                parent = retain(record.parent, "Genie.subtree.lease.parent").also(held::add)
             } catch (error: Throwable) {
                 held.forEach(::release)
                 throw error
@@ -131,9 +131,9 @@ internal class LiveSubtrees(
         val hideCopy: Any
         val parentCopy: Any
         try {
-            sourceCopy = retain(source, "HHA.subtree.source").also(held::add)
-            hideCopy = retain(hideTarget, "HHA.subtree.window").also(held::add)
-            parentCopy = retain(parent, "HHA.subtree.parent").also(held::add)
+            sourceCopy = retain(source, "Genie.subtree.source").also(held::add)
+            hideCopy = retain(hideTarget, "Genie.subtree.window").also(held::add)
+            parentCopy = retain(parent, "Genie.subtree.parent").also(held::add)
         } catch (error: Throwable) {
             held.forEach(::release)
             report("cannot retain subtree capabilities", error)
@@ -273,7 +273,7 @@ internal class LiveSubtrees(
         val current = synchronized(lock) { !closed && !record.retired && records[record.sourceLayer] === record }
         if (!current) { destroy(record); return }
         try {
-            val name = "HHA.Subtree.${record.sourceLayer}.${record.generation}"
+            val name = "Genie.Subtree.${record.sourceLayer}.${record.generation}"
             val output = control("$name.output", record.parent, record.width, record.height)
             synchronized(lock) { record.output = output }
             record.mirrorHost = control("$name.mirror-host", null)
@@ -355,8 +355,8 @@ internal class LiveSubtrees(
     /** Caller holds lock. No borrowed transaction escapes this method. */
     private fun publication(record: Record, transaction: Any, active: Boolean, guarded: Boolean): Boolean {
         if (!valid(record.hideTarget) || (active && !valid(record.output))) return false
-        val hideCopy = retain(record.hideTarget, "HHA.subtree.publication.window")
-        val outputCopy = record.output?.let { retain(it, "HHA.subtree.publication.output") }
+        val hideCopy = retain(record.hideTarget, "Genie.subtree.publication.window")
+        val outputCopy = record.output?.let { retain(it, "Genie.subtree.publication.output") }
         val serial = ++record.visibilitySerial
         record.active = active
         if (active) record.activeCommitted = false
@@ -381,7 +381,7 @@ internal class LiveSubtrees(
                 // A caller can commit a formerly borrowed transaction after close().
                 // Keep its owned capability copies until that exact commit, then repair
                 // on a cleanup worker even if the regular HandlerThread has exited.
-                if (!handler.post(work)) Thread(work, "HHA.SubtreeRetire").start()
+                if (!handler.post(work)) Thread(work, "Genie.SubtreeRetire").start()
             }
         } catch (error: Throwable) {
             release(hideCopy)
@@ -494,7 +494,7 @@ internal class LiveSubtrees(
                 "onTransactionCommitted" -> { if (once.compareAndSet(false, true)) action(); null }
                 "hashCode" -> System.identityHashCode(proxy)
                 "equals" -> proxy === args?.firstOrNull()
-                "toString" -> "HHA.SubtreeCommit"
+                "toString" -> "Genie.SubtreeCommit"
                 else -> null
             }
         }
@@ -572,7 +572,7 @@ internal class LiveSubtrees(
     }
 
     private companion object {
-        const val TAG = "HHA.Subtrees"
+        const val TAG = "Genie.Subtrees"
         const val MAX_ENTRIES = 4
         const val MAX_EXTENT = 16384
         const val FIRST_BUFFER_TIMEOUT_MS = 2000L

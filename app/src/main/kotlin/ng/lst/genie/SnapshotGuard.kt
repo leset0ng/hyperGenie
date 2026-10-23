@@ -1,4 +1,4 @@
-package ng.lst.hha
+package ng.lst.genie
 
 import android.annotation.SuppressLint
 import android.util.Log
@@ -247,7 +247,7 @@ internal class SnapshotGuard(private val module: XposedModule, loader: ClassLoad
     }
 
     private companion object {
-        const val TAG = "HHA.Snapshot"
+        const val TAG = "Genie.Snapshot"
         fun field(type: Class<*>, name: String): Field =
             find(type) { it.getDeclaredField(name).apply { isAccessible = true } }
         fun <T> find(type: Class<*>, lookup: (Class<*>) -> T): T {

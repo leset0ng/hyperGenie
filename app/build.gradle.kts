@@ -3,12 +3,12 @@ plugins {
 }
 
 android {
-    namespace = "ng.lst.hha"
+    namespace = "ng.lst.genie"
     compileSdk = 37
     ndkVersion = "30.0.14904198"
 
     defaultConfig {
-        applicationId = "ng.lst.hha"
+        applicationId = "ng.lst.genie"
         minSdk = 29
         targetSdk = 37
         versionCode = 1
