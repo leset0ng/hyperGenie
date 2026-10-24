@@ -102,16 +102,17 @@ entries in its LSPosed configuration. Reboot after changing scope or installing
 an updated native module; automatic hot reload is disabled because persistent
 native workers pin their library until process exit.
 
-On a root ADB AVD, `tests/run-renderer-device-tests.sh` runs the actual renderer
-controller in an isolated executable with fake surface capabilities and empty
-SDK transactions. It covers frame/prime ordering, retained layers, scoped stops,
-commit order, independent detach completions, and atomic CLIENT-guard lifetime.
-The current suite passes 12,776 checks; `ADB_SERIAL` selects a device. It does not
-install the module or touch real App layers. `tests/run-launcher-device-tests.sh`
-adds 127 checks of the actual Launcher hooks with isolated parameter trees and
-fake capabilities, including separate OEM construction transactions, reused
-pre-start closing, exclusive preview/group preparation, admission retries, and
-failure fallbacks.
+On an AVD with an existing root ADB shell, the isolated device suites exercise
+the production renderer and Launcher hooks without installing the module or touching App layers:
+
+```sh
+ADB_SERIAL=emulator-5580 tests/run-renderer-device-tests.sh
+ADB_SERIAL=emulator-5580 tests/run-launcher-device-tests.sh
+```
+
+They cover shared frame publication, paused cancellation and reversal, exact
+source/epoch ownership, pending commit barriers, closing host publication,
+private readback geometry, and retirement of the current floating icon.
 
 The module app has no Activity. Its metadata is shown by the framework.
 
@@ -139,6 +140,7 @@ app/src/main/
 ├── kotlin/ng/lst/genie/
 │   ├── HookEntry.kt          # system_server module entry
 │   ├── CentralBridge.kt      # authenticated lookup, ownership and lifecycle
+│   ├── LiveSubtrees.kt       # composed content, publication and closing hosts
 │   ├── PreStartingSurfaces.kt # owned OEM preview copies and domain checks
 │   ├── SurfaceEvents.kt      # first-show transactions and lifecycle wakeups
 │   ├── SnapshotGuard.kt      # prevent snapshots of deformed Task content
@@ -157,119 +159,66 @@ app/src/main/
     └── scope.list            # launcher + system only
 ```
 
-## Validation status
+## Gesture automation
 
-**The confirmed square-frame paths and exact startup-preview close continuation
-have been repaired.** Latest AVD cold, held-main and rapid captures do not show the
-earlier square App plates or nested Settings content in the inspected contact
-sheets. All1031 detailed sampled relevant draws retain SELF and159 publication
-diagnostics contain no inherited-contour reset. Held Gallery/Calculator startup
-previews both closed through the new authenticated path. One ordinary cold request
-still exceeded the64ms first-buffer wait and deferred; nonuniform OEM crops also
-retain the stock route until their sampled crop can be converted safely. See
-[current fallback validation](docs/fallback-routing-validation.md) for the installed
-SHA, recordings, sample limits and remaining boundaries.
+`tests/avd-gesture-runner.py` compiles one persistent Android input helper and
+repeats touch gestures on `emulator-5580`, display 0. Confirm the icon positions
+on the current Launcher before using this 1120×2436 example:
 
-The current build passes Android assembly/lint, 775 native geometry/reference
-checks, 12,776 isolated checks of the actual renderer and 127 Launcher-hook
-integration checks, plus20 actual-compiled-class JVM checks for exact preview-close
-authorization and bridge integration. Shared frame regression covers publication order, distinct
-texture domains, source-authenticated rapid reversal, composed-output replacement,
-preview-mask retirement and worker/icon coalescence of a pending prime. The last
-race has a failing-before/passing-after device regression. Earlier installed AVD captures
-confirm six ordinary App/icon registrations and a close-to-open adjust with
-`accepted=1 primed=1`, stable core processes and no new crash entries. See
-[shared animation frames](docs/animation-frame-sync.md). Retired helper-only
-tests have been removed; actual detach completion and JNI cancellation checks
-cover the production paths. Sampled Settings/Calculator
-transitions verify content access, composition and cleanup; these checks do not
-establish complete visual fidelity. The earlier positive-shadow CLIENT guard
-caused a visible dark exterior and has been replaced by a fully transparent
-positive-width border, with standard shadow radius left zero.
+```sh
+python3 tests/avd-gesture-runner.py \
+  --phone 166,2202 --settings 955,1769 \
+  --home-swipe 560,2420,300,1500 --size 1120,2436 \
+  --cycles 6 --open-dwell-ms 1000 --home-gap-ms 120 \
+  --cycle-gap-ms 1000 --focus-mode scheduled \
+  --native-close-gate-ms 60
+```
 
-Browser/gallery opening captures exposed a separate problem: OEM preview
-buffers could remain visible after their registry entries disappeared, while
-the renderer had already cleared their shader. Already-verified opening previews
-now keep the shared mesh until final retirement of that same request, and a
-starting-to-App handoff primes its inherited state immediately. Actual icon and
-device corner radii replace the former hard-coded .225-to-zero mask; the AVD's
-configured device radius is 180px. Position and velocity survive reversal.
+Add `--dry-run` to print the plan without connecting. The runner rejects other
+serials, physical devices and displays. Its default focus mode checks Launcher
+before every tap. `scheduled` checks only the first tap, allowing subsequent
+touches during an animation without adding focus-query latency.
 
-OEM preview selection also uses the verified type mapping: `1=Snapshot`,
-`2=Splash`. Snapshot requires its observed identity draw domain; Splash uses its
-fixed full-size Canvas domain. An earlier installed capture found no shader
-loss after attachment across 14 sampled preview layers and no shadow draw
-scopes; core processes and the crash buffer remained unchanged. Those bounded
-samples do not establish current visual acceptance.
+The optional gate requires `verbose=1` and waits for the current Phone close
+before sending the next tap. Its delay measures close-to-touch time; actual App
+startup must be checked separately in native and ActivityTaskManager logs. A
+missing close aborts the dependent tap. JSONL output records injected event times,
+actual timing, gate observations and rejected input. Use `--open-dwell-ms 200`
+for startup interruption, or `--pattern same-phone --cycle-gap-ms 0` for reversal.
+`--sdk` and `--java-home` select local toolchains.
 
-Cold startup and rapid switching now use event-driven content discovery rather
-than 16/50ms polling. Standard App/starting buffers are protected at creation,
-client attachment and first layout, before an already-shown container can
-expose the producer's first buffer. Client attach also appends SELF to the real
-pending/sync publication transactions; ordinary show and manager-preview
-hooks reinforce their actual show transaction. Early effect-only transactions
-are owned by the bridge, while borrowed platform transactions are only appended.
-The independent OEM
-pre-start preview is resolved by exact ownership through a restricted capability
-request, then primed in the launcher's first host transaction before stock
-cropping is removed. That request never takes the WM lock or waits for rendering;
-ordinary App capabilities remain server-only. An unavailable proof keeps both
-App/icon stock viewports.
+## Current behavior
 
-Same-Task/UID/fullscreen Activity handoffs preserve motion instead of cancelling
-on every token change. Different Apps keep independent overlapping lifetimes,
-per-stream event ordering, and all outstanding publication commit barriers.
-Per-request snapshot ownership also covers a window cancelled before worker
-lookup, and old cleanup cannot unblock or replace a newer request's release.
-See [first-frame publication and validation](docs/first-frame-publication.md)
-for the preceding publication repair. Independent SurfaceView content now uses
-a live subtree mirror, private virtual display and owned BLAST output; SELF
-warps that composed buffer once. Local legacy `[BBQ]` previews resolve their
-actual buffer child before copying the producer control. Closing transfers the
-tracked hide/show transaction into Launcher's first host transaction, so a
-planar video child cannot leak while the bridge worker catches up.
+Parallel App transitions keep independent motion owners and bounded publication
+lifetimes. An interrupted opening pauses at its current mesh state so a verified
+closing continuation can inherit position and velocity. Closing composed content
+uses a separate SurfaceFlinger host in the same initial transaction, preserving
+the OEM alpha curve while the old Task fades. Its relative layer follows the
+old Task's ordering below a newly opening App. Only module-owned output and host
+layers are trusted overlays, so their retained visual content does not block
+Launcher touches.
 
-Rapid parallel previews now use the exact opening Change/domain proof, including
-merged-animation lifetime and pre-enqueue Snapshot validation. Earlier cold
-and rapid captures had zero rejected preparations, first-draw misses or
-uncovered BBQ descendants in their samples. See [live child content and validation](docs/live-child-content.md)
-for measured coverage, lifecycle behavior and the extra composition cost.
+The floating icon retains its real square buffer domain. Private SF-to-Launcher
+readback reports the logical final icon rather than the tall shader viewport;
+when a verified closing host takes over, the stopped icon's parent and current
+buffer are hidden in the original Stop transaction. Late publications and
+restores wait for their matching commits, keeping an old request from exposing
+or hiding the next App. A confirmed return to the same Task through Launcher's
+local animation ends only that closing owner, allowing its original content to
+return through the existing atomic restore.
 
-Gesture-release closing keeps the dragged presentation rectangle separate from
-the full content buffer. The authenticated group preparation returns its actual
-buffer dimensions to Launcher for App/icon publication; scaled closing endpoints
-are checked for uniform scale instead of being required to equal fullscreen
-size. One-shot and tracked publications share the full content origin and the
-release corner metric. The regression suite covers translated/scaled closing,
-first-frame commit/cleanup, and rejection of distorted, oversized or incomplete
-opening domains. Installed AVD checks pass five gesture closes (including a
-fresh Launcher with no cached opening, two swipe lengths, Settings, Contacts
-and Calculator) plus two Home-key closes. Every close publishes both App/icon
-viewports with `accepted=1 primed=1`; core process IDs, crash logs and runtime
-configuration remain stable. Production Binder probes also reject distorted
-and oversized closes, a partial opening and the older protocol version. Sampled
-recording frames show the closing contour deforming before icon handoff.
-This validates the sampled release path; current fallback and visual failures
-remain recorded above. Continuous finger-tracking Genie deformation
-remains outside the implemented path.
-
-The emulator has a separate verified host-capture buffer-selection problem
-when its secondary display is enabled; recordings temporarily disable it and
-restore it afterward. HDR/color-processing bypasses, other display
-configurations, full gesture fidelity and production performance remain outside
-current validation. The module remains an experimental integration.
-
-Ignored local evidence is under `temp/ios-module-integration/validation/` and
-`temp/ios-module-integration/resumed-validation/`, including physical recordings,
-SurfaceFlinger dumps, source-footprint comparisons and module logs.
+Current AVD recordings cover Phone/Settings parallel switching, startup-preview
+interruption and gesture closing. Physical-device visual acceptance, rotation,
+other display configurations, HDR/color processing and full finger-tracking
+remain outside this validation. The module remains an experimental integration.
 
 ## Requirements and scope
 
 | Item | Verified value |
 | --- | --- |
-| Runtime | Android 17 / API 37, HyperOS OS4.0, arm64-v8a |
-| Launcher | RELEASE-8.01.02.7722-260904-09221445-R |
-| Framework | LSPosed 2.2.1 (7930), API 102, HYOS-spawner support |
+| Runtime | Android 17 / API 37, HyperOS OS4.0.24.0.XFRCNXM, arm64-v8a |
+| Launcher | RELEASE-8.01.02.8244-260915-09172210-R |
+| Framework | LSPosed 2.2.1 (7912), API 102, HYOS-spawner support |
 | Build | compileSdk 37, NDK 30.0.14904198, CMake 3.22.1 |
 | Toolchain | AGP 9.4.1, Gradle 9.8.1, JDK 21 |
 

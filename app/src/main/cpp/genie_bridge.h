@@ -12,11 +12,11 @@
 namespace genie {
 
 // IWindowManager private extension; mirrored by CentralBridge.kt. Ordinary App
-// capabilities stay in system_server. The restricted prepare operation returns
-// only an exactly owned OEM pre-start preview for same-transaction publication.
+// capabilities stay in system_server. Restricted prepare operations return
+// verified preview/output capabilities and an optional owned closing host.
 constexpr int32_t kBridgeCode = 0x484841;
 constexpr int32_t kBridgeMagic = 0x48484131;
-constexpr int32_t kBridgeVersion = 4;
+constexpr int32_t kBridgeVersion = 5;
 
 struct Transition {
     int32_t leash_layer = -1;
@@ -106,10 +106,49 @@ private:
 // Nonblocking, coalesced dispatch. Never make a synchronous WMS call from a
 // launcher animation callback, which can be part of a WMS lock dependency.
 enum class GroupPreparation { Rejected, Deferred, Ready };
+enum class PublicationKind : int32_t { None=0, NormalGroup=1, RegisteredPreview=2, OwnedClosingGroup=3 };
+
+// readFromParcel creates an sp<SurfaceControl> using &host as its owner tag.
+// Keep that address stable until the exact parcel reference has been released.
+struct GroupPublication {
+    PublicationKind kind=PublicationKind::None;
+    void* host=nullptr;
+    void (*release)(const void*,const void*)=nullptr;
+    GroupPublication()=default;
+    GroupPublication(const GroupPublication&)=delete;
+    GroupPublication& operator=(const GroupPublication&)=delete;
+    GroupPublication(GroupPublication&&)=delete;
+    GroupPublication& operator=(GroupPublication&&)=delete;
+    ~GroupPublication() {Reset();}
+    void Reset() {
+        if(host && release) release(host,&host);
+        host=nullptr;release=nullptr;kind=PublicationKind::None;
+    }
+};
+
+// A private parameter object keeps the owned host's alpha independent from
+// the OEM App springs. Its parcel-owned sp reference also needs a stable tag.
+struct AnimationParameters {
+    void* object=nullptr;
+    void (*release)(const void*,const void*)=nullptr;
+    AnimationParameters()=default;
+    AnimationParameters(const AnimationParameters&)=delete;
+    AnimationParameters& operator=(const AnimationParameters&)=delete;
+    AnimationParameters(AnimationParameters&&)=delete;
+    AnimationParameters& operator=(AnimationParameters&&)=delete;
+    ~AnimationParameters() {Reset();}
+    const void* Reference() const {return &object;}
+    void Reset() {
+        if(object && release) release(object,&object);
+        object=nullptr;release=nullptr;
+    }
+};
+bool CloneAnimationParameters(const void* reference,AnimationParameters* output);
+
 // PREPARE_GROUP accepted=2 means the exact group is awaiting its first buffer.
-// No host transaction is changed until a Ready reply has been merged.
+// No host transaction is changed until a typed Ready reply has been validated.
 GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::model::Rect* window,
-                                          const Transition& transition);
+                                          const Transition& transition,GroupPublication* publication=nullptr);
 
 void QueueTransition(const Transition& transition);
 void QueueCancel(int32_t leash_layer, int64_t event_ns);

@@ -78,6 +78,10 @@ internal object ContentAnimator {
 
     fun running(): Boolean = initialized && nativeRunning()
 
+    /** Includes the request's publications and detach commit barriers across hosts. */
+    fun requestRunning(eventTimeNanos: Long): Boolean =
+        initialized && eventTimeNanos > 0L && nativeRequestRunning(eventTimeNanos)
+
     fun stop() {
         if (!initialized) return
         runCatching { nativeStop() }.onFailure {
@@ -120,6 +124,7 @@ internal object ContentAnimator {
     @JvmStatic external fun nativeStopRequest(parent: Long, eventNs: Long)
     @JvmStatic external fun nativeRevokeRequest(parent: Long, eventNs: Long)
     @JvmStatic external fun nativeRunning(): Boolean
+    @JvmStatic external fun nativeRequestRunning(eventNs: Long): Boolean
     @JvmStatic external fun nativeStop()
 
     private const val TAG = "Genie"

@@ -34,6 +34,10 @@ constexpr char kReparent[] =
     "_ZN7android21SurfaceComposerClient11Transaction8reparentERKNS_2spINS_14SurfaceControlEEES6_";
 constexpr char kStop[] =
     "_ZN7android21SurfaceComposerClient11Transaction15stopSFAnimationERKNS_2spINS_14SurfaceControlEEEi";
+constexpr char kHomeParams[] =
+    "_ZN7android19SFAnimationListener23onSFAnimationHomeParamsENS_3gui14CallAnimParamsEi";
+constexpr char kSetCallback[] =
+    "_ZN7android14SurfaceControl22setSFAnimationCallbackERKNS_2wpINS_19SFAnimationListener19SFAnimationCallbackEEE";
 
 struct NativeAPIEntries {
     uint32_t version;
@@ -47,6 +51,9 @@ using BlastUpdateFn = void* (*)(void*,const void*,uint32_t,uint32_t,int32_t);
 using LayerFn = int32_t (*)(const void*);
 using NameFn = const std::string& (*)(const void*);
 using TransactionIdFn = uint64_t (*)(void*);
+using HomeParamsFn = void (*)(void*, const void*, int32_t);
+using SetCallbackFn = void (*)(void*, const void*);
+using HostCommitFn = void (*)(ASurfaceTransaction*,void*,ASurfaceTransaction_OnCommit);
 AnimationFn g_start = nullptr;
 AnimationFn g_adjust = nullptr;
 AnimationFn g_reparent = nullptr;
@@ -57,6 +64,11 @@ std::atomic<bool> g_native_entered{false};
 LayerFn g_layer = nullptr;
 NameFn g_name = nullptr;
 TransactionIdFn g_transaction_id = nullptr; // Optional transaction diagnostics.
+HomeParamsFn g_home_params = nullptr;
+SetCallbackFn g_set_callback = nullptr;
+HostCommitFn g_host_commit = nullptr;
+const void* g_listener_vtable = nullptr;
+const void* g_params_vtable = nullptr;
 const NativeAPIEntries* g_api = nullptr;
 std::atomic<bool> g_installed{false};
 std::mutex g_mutex;
@@ -157,10 +169,201 @@ struct IconBuffer {
     int32_t parent=-1;
     int width=0,height=0;
     int32_t animation_id=-1;
+    int32_t source_leash=-1;
     int64_t request_ns=0;
+    void* parent_control=nullptr;
+    void* readback_child=nullptr;
+    void* listener=nullptr;
+    bool closing=false;
+    bool readback_logged=false;
 };
 std::array<IconBuffer,16> g_icons{};
 size_t g_next_icon=0;
+
+void* ReadBoundListener(const void* control) {
+    if(!control || !g_listener_vtable) return nullptr;
+    // Validate this ROM's listener layout only when acquiring a capability.
+    // Retaining the parent keeps these objects alive without per-frame maps IO.
+    genie::abi::detail::Readable memory;
+    const auto address=reinterpret_cast<uintptr_t>(control);
+    uintptr_t listener=0,table=0,callback=0,callback_table=0;
+    if(!memory.Read(address+0xa8,listener) || !listener ||
+       !memory.Read(listener,table) || table!=reinterpret_cast<uintptr_t>(g_listener_vtable) ||
+       !memory.Read(listener+0x28,callback) || !callback ||
+       !memory.Read(callback,callback_table) || !callback_table) return nullptr;
+    return reinterpret_cast<void*>(listener);
+}
+
+struct ReadbackEndpoint {
+    std::array<float,9> corners{};
+    uint16_t present=0;
+};
+struct AppReadback {
+    void* control=nullptr;
+    int32_t layer=-1;
+    int32_t source_leash=-1;
+    int32_t animation_id=-1;
+    int64_t request_ns=0;
+    void* listener=nullptr;
+    bool closing=false;
+    bool readback_logged=false;
+    ReadbackEndpoint endpoint;
+    genie::PublicationKind kind=genie::PublicationKind::None;
+    void* owned_host=nullptr;
+    int32_t owned_layer=-1;
+    bool host_started=false;
+    bool host_committed=false;
+    uintptr_t host_commit_token=0;
+};
+std::array<AppReadback,32> g_apps{};
+size_t g_next_app=0;
+// Tokens are never reused, including after a registry slot is evicted. A
+// transaction discarded without apply owns no heap state through its callback.
+uintptr_t g_next_host_commit_token=1;
+
+ReadbackEndpoint ReadEndpoint(const void* parameters) {
+    ReadbackEndpoint result;
+    constexpr const char* keys[]={"radiusRatio","cornerTLX","cornerTLY","cornerTRX","cornerTRY",
+        "cornerBRX","cornerBRY","cornerBLX","cornerBLY"};
+    for(size_t i=0;i<std::size(keys);++i) {
+        const auto property=Spring(parameters,keys[i]);
+        if(property.valid) {
+            result.corners[i]=property.end;
+            result.present|=1u<<i;
+        }
+    }
+    return result;
+}
+
+const Last* CurrentReadbackSource(int32_t leash,int32_t animation_id,int64_t request_ns,bool closing) {
+    // Caller holds g_mutex. A stopped source retains its exact epoch until a
+    // newer request or registry eviction, covering queued takeover callbacks.
+    if(leash<0 || request_ns<=0 || !closing) return nullptr;
+    const Last* latest=nullptr;
+    for(const auto& source:g_last) if(source.transition.leash_layer==leash &&
+        (!latest || source.transition.event_ns>latest->transition.event_ns)) latest=&source;
+    if(!latest || latest->transition.event_ns!=request_ns ||
+       latest->animation_id!=animation_id || !latest->transition.closing ||
+       !latest->supported || !latest->admitted || latest->preparing || latest->retry_pending) return nullptr;
+    return latest;
+}
+
+const Last* CurrentReadbackSource(const IconBuffer& icon) {
+    if(!icon.surface || icon.surface!=icon.readback_child || !icon.parent_control || icon.parent<0) return nullptr;
+    return CurrentReadbackSource(icon.source_leash,icon.animation_id,icon.request_ns,icon.closing);
+}
+
+const Last* CurrentReadbackSource(const AppReadback& app) {
+    if(!app.control || app.layer<0 || app.layer!=app.source_leash) return nullptr;
+    return CurrentReadbackSource(app.source_leash,app.animation_id,app.request_ns,app.closing);
+}
+
+const AppReadback* ReadbackApp(const Last& source) {
+    for(const auto& app:g_apps) if(app.control && app.source_leash==source.transition.leash_layer &&
+        app.animation_id==source.animation_id && app.request_ns==source.transition.event_ns) return &app;
+    return nullptr;
+}
+
+bool CurrentListener(void* control,int32_t layer,void* listener) {
+    void* current=nullptr;
+    std::memcpy(&current,static_cast<unsigned char*>(control)+0xa8,sizeof(current));
+    return current==listener && g_layer && g_layer(control)==layer;
+}
+
+void SetCallback(void* control,const void* callback) {
+    g_set_callback(control,callback);
+    if(!control || !g_layer) return;
+    const int32_t layer=g_layer(control);
+    bool bound=false;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(const auto& app:g_apps) if(app.control==control && app.layer==layer && CurrentReadbackSource(app)) {
+            bound=true;break;
+        }
+        if(!bound) for(const auto& icon:g_icons) if(icon.parent_control==control && icon.parent==layer &&
+            CurrentReadbackSource(icon)) {bound=true;break;}
+    }
+    if(!bound) return;
+    void* listener=ReadBoundListener(control);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for(auto& app:g_apps) if(app.control==control && app.layer==layer && CurrentReadbackSource(app)) {
+        if(app.listener!=listener) app.readback_logged=false;
+        app.listener=listener;
+        break;
+    }
+    for(auto& icon:g_icons) if(icon.parent_control==control && icon.parent==layer &&
+        CurrentReadbackSource(icon)) {
+        if(icon.listener!=listener) icon.readback_logged=false;
+        icon.listener=listener;
+        break;
+    }
+}
+
+void HomeParams(void* listener,const void* parameters,int32_t id) {
+    const Config config=ReadConfig();
+    const void* table=nullptr;
+    if(parameters) std::memcpy(&table,parameters,sizeof(table));
+    bool normalize=false,log=false;
+    const char* kind="app";
+    int32_t parent=-1,source=-1;
+    int64_t request=0;
+    std::array<float,12> geometry{};
+    ReadbackEndpoint endpoint;
+    if(config.enabled && config.content && listener && parameters &&
+       g_listener_vtable && g_params_vtable && table==g_params_vtable) {
+        std::memcpy(&table,listener,sizeof(table));
+        if(table==g_listener_vtable) {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for(auto& app:g_apps) if(app.listener==listener) {
+                const auto* current=CurrentReadbackSource(app);
+                if(!current || !CurrentListener(app.control,app.layer,listener)) continue;
+                normalize=true;
+                parent=app.layer;source=app.source_leash;request=app.request_ns;
+                geometry=current->transition.geometry;
+                endpoint=app.endpoint;
+                log=config.verbose && !app.readback_logged;
+                if(log) app.readback_logged=true;
+                break;
+            }
+            if(!normalize) for(auto& icon:g_icons) if(icon.listener==listener) {
+                const auto* current=CurrentReadbackSource(icon);
+                if(!current || !CurrentListener(icon.parent_control,icon.parent,listener)) continue;
+                normalize=true;kind="icon";
+                parent=icon.parent;source=icon.source_leash;request=icon.request_ns;
+                geometry=current->transition.geometry;
+                if(const auto* app=ReadbackApp(*current)) endpoint=app->endpoint;
+                log=config.verbose && !icon.readback_logged;
+                if(log) icon.readback_logged=true;
+                break;
+            }
+        }
+    }
+    if(!normalize) {
+        g_home_params(listener,parameters,id);
+        return;
+    }
+    // CallAnimParams is an indirect by-value object with a trivial destructor:
+    // vptr followed by 28 floats. Launcher uses this private logical endpoint
+    // for its fallback underlay; SF keeps the original animated presentation.
+    alignas(8) std::array<unsigned char,0x78> copy{};
+    std::memcpy(copy.data(),parameters,copy.size());
+    const auto set=[&copy](size_t index,float value) {
+        std::memcpy(copy.data()+8+index*sizeof(value),&value,sizeof(value));
+    };
+    set(0,geometry[4]+geometry[6]/2);
+    set(2,geometry[5]+geometry[7]/2);
+    set(4,geometry[6]);set(6,geometry[7]);set(8,1);set(10,0);
+    set(12,geometry[11]);
+    for(size_t index:{1,3,5,7,9,11,13,15}) set(index,0);
+    // Preserve OEM endpoint units exactly instead of inferring corner ratios.
+    if(endpoint.present&1u) set(14,endpoint.corners[0]);
+    for(size_t i=1;i<endpoint.corners.size();++i) if(endpoint.present&(1u<<i)) set(15+i,endpoint.corners[i]);
+    if(log) __android_log_print(ANDROID_LOG_INFO,kTag,
+        "%s readback listener=%p layer=%d source=%d request=%lld closing=1 callback=%d endpoint=%.2f,%.2f %.2fx%.2f alpha=0",
+        kind,listener,parent,source,static_cast<long long>(request),id,
+        geometry[4],geometry[5],geometry[6],geometry[7]);
+    g_home_params(listener,copy.data(),id);
+}
 
 void* BlastUpdate(void* queue,const void* reference,uint32_t width,uint32_t height,int32_t format) {
     void* result=g_blast_update(queue,reference,width,height,format);
@@ -175,9 +378,16 @@ void* BlastUpdate(void* queue,const void* reference,uint32_t width,uint32_t heig
             if(!entry) entry=&g_icons[g_next_icon++%g_icons.size()];
             if(entry->surface!=surface) {
                 genie::ReleaseIconSurface(entry->surface,entry);
+                genie::ReleaseIconSurface(entry->parent_control,entry);
                 entry->surface=const_cast<void*>(surface);
                 entry->animation_id=-1;
+                entry->source_leash=-1;
                 entry->request_ns=0;
+                entry->parent_control=nullptr;
+                entry->readback_child=nullptr;
+                entry->listener=nullptr;
+                entry->closing=false;
+                entry->readback_logged=false;
                 genie::RetainIconSurface(entry->surface,entry);
             }
             entry->parent=parent;entry->width=width;entry->height=height;
@@ -323,7 +533,9 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
         previous->animation_id=animation_id;
         previous->valid=true;
         previous->supported=true;
-        previous->admitted=continuing;
+        // Every accepted source epoch must acquire its own publication and
+        // closing host, including a reversal submitted through adjust.
+        previous->admitted=false;
         previous->retry_pending=false;
         previous->preparing=false;
     }
@@ -339,8 +551,8 @@ void Observe(const void* surface, const void* parameters, bool adjust) {
     // geometry to the central worker without taking the WM lock.
     // A rejected initial publication may become ready before a later adjust.
     // Retry its first-frame proof instead of permanently leaving it on stock.
-    if(!continuing && (request.task_id>=0 ||
-       (g_name && g_name(control).find("Pre startup opening leash")==0))) return;
+    if(request.task_id>=0 ||
+       (g_name && g_name(control).find("Pre startup opening leash")==0)) return;
     genie::QueueTransition(request);
 }
 void SetSpring(const void* parameters,const char* key,float start,float end) {
@@ -381,6 +593,86 @@ void SuppressFloatingIcon(void* transaction,const void* control,const void* para
         static_cast<unsigned long long>(transaction_id),
         static_cast<unsigned long long>(snapshot.host_transaction_id));
 }
+void SuppressBoundIconFallback(void* transaction,const void* surface,const void* parameters,const char* reason) {
+    const void* control=surface?*static_cast<const void* const*>(surface):nullptr;
+    if(!control || !g_layer || !g_name || g_name(control).find("FloatingIcon_all")!=0) return;
+    const int32_t layer=g_layer(control);
+    Last binding;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(const auto& icon:g_icons) if(icon.surface && icon.parent==layer &&
+            icon.source_leash>=0 && icon.request_ns>0) {
+            binding.transition.leash_layer=icon.source_leash;
+            binding.transition.event_ns=icon.request_ns;
+            break;
+        }
+    }
+    if(binding.transition.event_ns<=0) return;
+    // A successful registration leaves SELF on this exact buffer until OEM
+    // removal. Stock aspect/crop springs cannot reuse that virtual viewport.
+    // A replacement child resets its binding and retains ordinary stock motion.
+    const uint64_t transaction_id=transaction && g_transaction_id?g_transaction_id(transaction):0;
+    SuppressFloatingIcon(transaction,control,parameters,layer,binding,reason,transaction_id);
+}
+constexpr const char* kViewportSprings[]={"centerX","centerY","width","height","ratio",
+    "radius","radiusRatio","cornerTLX","cornerTLY","cornerTRX","cornerTRY",
+    "cornerBRX","cornerBRY","cornerBLX","cornerBLY"};
+
+bool IndependentParameters(const void* source,const void* copy) {
+    if(!copy || !*static_cast<const void* const*>(copy) ||
+       *static_cast<const void* const*>(copy)==*static_cast<const void* const*>(source) ||
+       !Spring(copy,"alpha").valid) return false;
+    for(const char* key:kViewportSprings) {
+        const auto* original=Find(source,0x18,key);
+        const auto* cloned=Find(copy,0x18,key);
+        if((original!=nullptr)!=(cloned!=nullptr)) return false;
+        if(!original) continue;
+        const auto* a=*reinterpret_cast<const unsigned char* const*>(original);
+        const auto* b=*reinterpret_cast<const unsigned char* const*>(cloned);
+        if(!a || !b || a==b || std::memcmp(a+0x10,b+0x10,0x18)!=0) return false;
+    }
+    const auto* alpha=Find(source,0x18,"alpha");
+    const auto* cloned_alpha=Find(copy,0x18,"alpha");
+    return alpha && cloned_alpha && *reinterpret_cast<const void* const*>(alpha)!=
+        *reinterpret_cast<const void* const*>(cloned_alpha);
+}
+
+void TuneOwnedParameters(const void* source,const void* copy,bool starting) {
+    for(const char* key:kViewportSprings) {
+        const auto* original=Find(source,0x18,key);
+        const auto* cloned=Find(copy,0x18,key);
+        if(!original || !cloned) continue;
+        const auto* a=*reinterpret_cast<const unsigned char* const*>(original);
+        auto* b=*reinterpret_cast<unsigned char* const*>(cloned);
+        if(a && b) std::memcpy(b+0x10,a+0x10,0x18);
+    }
+    SetFixed(copy,"needDrawWindowMask",0);
+    // The independent host keeps the cloned OEM alpha curve even after the
+    // source Task stops; no visibility override extends that fade.
+    if(starting) {
+        // An OEM adjust may omit the App type because its own host already
+        // exists. A fresh owned host needs the ordinary App start contract.
+        auto* object=*static_cast<unsigned char* const*>(copy);
+        const int32_t app_type=2,adjust_type=0;
+        std::memcpy(object+0x40,&app_type,sizeof(app_type));
+        std::memcpy(object+0x44,&adjust_type,sizeof(adjust_type));
+    }
+}
+
+bool ValidPublication(const genie::GroupPublication& publication,const Last& source,const void* control) {
+    switch(publication.kind) {
+        case genie::PublicationKind::NormalGroup:
+            return !source.transition.closing && !publication.host;
+        case genie::PublicationKind::RegisteredPreview:
+            return !publication.host;
+        case genie::PublicationKind::OwnedClosingGroup:
+            return source.transition.closing && publication.host && publication.release && g_layer &&
+                g_layer(publication.host)>=0 && g_layer(publication.host)!=g_layer(control);
+        default:
+            return false;
+    }
+}
+
 void TuneParent(void* transaction,const void* surface,const void* parameters) {
     const Config config=ReadConfig();
     if (!config.enabled || !config.content || !parameters) return;
@@ -412,12 +704,20 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
             "portrait guard keeps stock host animation start=%.1fx%.1f end=%.1fx%.1f type=%d",
             start_width,start_height,end_width,end_height,type);
+        SuppressBoundIconFallback(transaction,surface,parameters,"unsupported-host");
         return;
     }
     const bool closing=end_width*end_height<start_width*start_height;
     // Replaces the former 0.8/1.25 aspect window: endpoints must be portrait.
     // Preserve native listeners/IDs while replacing the app's crop viewport.
     // The visible contour is produced by the same mesh as the content.
+    genie::GroupPublication owned;
+    genie::AnimationParameters owned_parameters;
+    genie::Transition publication_request;
+    bool start_owned=false,dispatch_publication=false;
+    uintptr_t owned_commit_token=0;
+    int32_t owned_layer=-1,owned_source=-1;
+    uint64_t owned_transaction=0;
     if(surface && g_layer) {
         const void* control=*static_cast<const void* const*>(surface);
         const int32_t layer=control?g_layer(control):-1;
@@ -426,7 +726,20 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             if(is_icon) {
-                if(const auto* source=genie::FindIconSource(g_last,animation_id,Now())) snapshot=*source;
+                const IconBuffer* bound=nullptr;
+                for(const auto& icon:g_icons) if(icon.surface && icon.parent==layer && icon.source_leash>=0) {
+                    bound=&icon;break;
+                }
+                if(bound) {
+                    // OEM IDs are reused by independent Apps. A late callback
+                    // for an existing icon must keep its established App leash;
+                    // only a newer epoch on that same leash can retarget it.
+                    for(const auto& source:g_last) if(source.valid && source.supported &&
+                        source.transition.leash_layer==bound->source_leash && source.animation_id==animation_id &&
+                        source.transition.event_ns>=bound->request_ns && source.transition.event_ns<=Now()) {
+                        snapshot=source;break;
+                    }
+                } else if(const auto* source=genie::FindIconSource(g_last,animation_id,Now())) snapshot=*source;
             } else {
                 for(const auto& entry:g_last) if(entry.valid && entry.transition.leash_layer==layer) {
                     snapshot=entry;break;
@@ -435,10 +748,17 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         }
         if(!snapshot.valid || snapshot.preparing ||
            (!snapshot.supported && !snapshot.retry_pending) ||
-           (!is_icon && snapshot.animation_id!=animation_id)) return;
+           (!is_icon && snapshot.animation_id!=animation_id)) {
+            SuppressBoundIconFallback(transaction,surface,parameters,"source-not-ready");
+            return;
+        }
         // A deferred publication has no renderer session to keep alive. Do not
         // revive its original motion after the renderer's ordinary deadline.
-        if(snapshot.retry_pending && Now()-snapshot.transition.event_ns>=1500000000LL) return;
+        if(snapshot.retry_pending && Now()-snapshot.transition.event_ns>=1500000000LL) {
+            SuppressBoundIconFallback(transaction,surface,parameters,"source-expired");
+            return;
+        }
+        const auto endpoint=is_icon?ReadbackEndpoint{}:ReadEndpoint(parameters);
         const auto& geometry=snapshot.transition.geometry;
         const size_t small=snapshot.transition.closing?4:0;
         const size_t full=snapshot.transition.closing?0:4;
@@ -447,7 +767,14 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             genie::model::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
         const bool prestart=g_name && g_name(control).find("Pre startup opening leash")==0;
         bool prepared_now=false;
+        genie::GroupPublication publication;
+        // Clone before asking the server to reparent its output. If this ABI is
+        // unavailable, the original App keeps its entire stock transaction.
+        if(!is_icon && snapshot.transition.closing && (snapshot.transition.task_id>=0 || prestart) &&
+           (!genie::CloneAnimationParameters(parameters,&owned_parameters) ||
+            !IndependentParameters(parameters,owned_parameters.Reference()))) return;
         if(!is_icon && !snapshot.admitted && (snapshot.transition.task_id>=0 || prestart)) {
+            if(!g_icon_ready.load(std::memory_order_acquire) || !g_start || !g_adjust || !g_host_commit) return;
             // Reserve this generation across the synchronous Binder call. An
             // icon or nested host callback must not publish unprepared geometry.
             {
@@ -465,11 +792,21 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 }
                 if(!reserved) return;
             }
-            const auto result=!snapshot.transition.closing && prestart ?
-                (genie::PrepareOpeningPreview(transaction,const_cast<void*>(control),
-                    static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition) ?
-                    genie::GroupPreparation::Ready : genie::GroupPreparation::Rejected) :
-                genie::PrepareContentGroupStatus(transaction,const_cast<void*>(control),&window,snapshot.transition);
+            auto result=genie::GroupPreparation::Rejected;
+            if(!snapshot.transition.closing && prestart) {
+                if(genie::PrepareOpeningPreview(transaction,const_cast<void*>(control),
+                    static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition)) {
+                    publication.kind=genie::PublicationKind::RegisteredPreview;
+                    result=genie::GroupPreparation::Ready;
+                }
+            } else {
+                result=genie::PrepareContentGroupStatus(transaction,const_cast<void*>(control),&window,
+                    snapshot.transition,&publication);
+            }
+            if(result==genie::GroupPreparation::Ready && !ValidPublication(publication,snapshot,control)) {
+                genie::QueueCancel(snapshot.transition.leash_layer,snapshot.transition.event_ns);
+                result=genie::GroupPreparation::Rejected;
+            }
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 bool current=false;
@@ -519,13 +856,32 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 const_cast<void*>(control),lease.width,lease.height,
                 static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition);
             if(rendering) {
+                const bool floating=g_name && g_name(control).find("FloatingIcon_all")==0;
+                void* listener=floating?ReadBoundListener(control):nullptr;
                 std::lock_guard<std::mutex> lock(g_mutex);
                 for(auto& source:g_icons) if(source.surface==lease.surface && source.parent==layer) {
                     // A nested callback may have replaced or advanced this icon.
                     // Do not let an older registration retag that newer epoch.
                     if(source.request_ns<=snapshot.transition.event_ns) {
+                        const bool changed=source.request_ns!=snapshot.transition.event_ns ||
+                            source.parent_control!=control || source.listener!=listener ||
+                            source.closing!=snapshot.transition.closing;
+                        if(source.parent_control!=control) {
+                            genie::ReleaseIconSurface(source.parent_control,&source);
+                            source.parent_control=floating?const_cast<void*>(control):nullptr;
+                            genie::RetainIconSurface(source.parent_control,&source);
+                        }
                         source.animation_id=animation_id;
+                        source.source_leash=snapshot.transition.leash_layer;
                         source.request_ns=snapshot.transition.event_ns;
+                        source.readback_child=floating?source.surface:nullptr;
+                        source.listener=listener;
+                        source.closing=snapshot.transition.closing;
+                        if(changed) source.readback_logged=false;
+                        if(changed && config.verbose && floating) __android_log_print(ANDROID_LOG_INFO,kTag,
+                            "icon readback bound parent=%d source=%d request=%lld closing=%d listener=%p",
+                            source.parent,source.source_leash,static_cast<long long>(source.request_ns),
+                            source.closing?1:0,source.listener);
                     }
                     break;
                 }
@@ -565,6 +921,7 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             SetDelay(parameters,key,0);
         }
         if(!is_icon) {
+            void* listener=ReadBoundListener(control);
             std::lock_guard<std::mutex> lock(g_mutex);
             for(auto& source:g_last) if(source.valid &&
                 source.transition.event_ns==snapshot.transition.event_ns &&
@@ -575,18 +932,78 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 source.retry_pending=false;
                 source.preparing=false;
                 source.supported=true;
+                // The asynchronous warm-up installs RefBase ownership helpers.
+                // Never retain a raw App capability before that completes.
+                if(g_icon_ready.load(std::memory_order_acquire)) {
+                    AppReadback* entry=nullptr;
+                    for(auto& app:g_apps) if(app.control==control && app.layer==layer) {entry=&app;break;}
+                    if(!entry) entry=&g_apps[g_next_app++%g_apps.size()];
+                    const bool new_epoch=entry->control!=control || entry->request_ns!=source.transition.event_ns ||
+                        entry->source_leash!=source.transition.leash_layer || entry->animation_id!=source.animation_id;
+                    const bool changed=new_epoch || entry->listener!=listener || entry->closing!=source.transition.closing;
+                    if(new_epoch || publication.kind!=genie::PublicationKind::None) {
+                        const bool new_host=new_epoch || entry->owned_host!=publication.host;
+                        if(entry->owned_host!=publication.host) {
+                            genie::ReleaseIconSurface(entry->owned_host,&entry->owned_host);
+                            entry->owned_host=publication.host;
+                            genie::RetainIconSurface(entry->owned_host,&entry->owned_host);
+                        }
+                        entry->kind=publication.kind;
+                        entry->owned_layer=entry->owned_host && g_layer?g_layer(entry->owned_host):-1;
+                        if(new_host) {
+                            entry->host_started=false;
+                            entry->host_committed=false;
+                            entry->host_commit_token=0;
+                        }
+                    }
+                    if(entry->control!=control) {
+                        genie::ReleaseIconSurface(entry->control,entry);
+                        entry->control=const_cast<void*>(control);
+                        genie::RetainIconSurface(entry->control,entry);
+                    }
+                    entry->layer=layer;
+                    entry->source_leash=source.transition.leash_layer;
+                    entry->animation_id=source.animation_id;
+                    entry->request_ns=source.transition.event_ns;
+                    entry->listener=listener;
+                    entry->closing=source.transition.closing;
+                    if(new_epoch) entry->endpoint=endpoint;
+                    if(changed) entry->readback_logged=false;
+                    if(entry->kind==genie::PublicationKind::OwnedClosingGroup && entry->owned_host &&
+                       entry->owned_layer>=0 && entry->closing && owned_parameters.object && g_layer && g_host_commit &&
+                       g_layer(entry->owned_host)==entry->owned_layer && CurrentReadbackSource(*entry) &&
+                       (entry->host_started?entry->host_committed:g_next_host_commit_token!=0)) {
+                        start_owned=!entry->host_started;
+                        if(start_owned) {
+                            entry->host_started=true;
+                            entry->host_committed=false;
+                            entry->host_commit_token=g_next_host_commit_token++;
+                        }
+                        owned_commit_token=entry->host_commit_token;
+                        owned.host=entry->owned_host;
+                        genie::RetainIconSurface(owned.host,&owned.host);
+                        owned.release=[](const void* surface,const void* owner) {
+                            genie::ReleaseIconSurface(const_cast<void*>(surface),owner);
+                        };
+                        owned_layer=entry->owned_layer;
+                    }
+                    if(changed && config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
+                        "app readback bound parent=%d source=%d request=%lld closing=%d listener=%p",
+                        entry->layer,entry->source_leash,static_cast<long long>(entry->request_ns),
+                        entry->closing?1:0,entry->listener);
+                }
                 break;
             }
         }
-        if(prepared_now) genie::QueueTransition(snapshot.transition);
+        publication_request=snapshot.transition;
+        dispatch_publication=prepared_now;
+        owned_source=layer;
+        owned_transaction=transaction_id;
         __android_log_print(ANDROID_LOG_INFO,kTag,"mesh viewport layer=%d animation=%d source=%d epoch=%lld hostTxn=%llu start=%.1fx%.1f end=%.1fx%.1f",layer,
             animation_id,snapshot.transition.leash_layer,static_cast<long long>(snapshot.transition.event_ns),
             static_cast<unsigned long long>(transaction_id),start.width,start.height,end.width,end.height);
     }
-    constexpr const char* keys[]={"centerX","centerY","width","height","ratio",
-        "radius","radiusRatio","cornerTLX","cornerTLY","cornerTRX","cornerTRY",
-        "cornerBRX","cornerBRY","cornerBLX","cornerBLY"};
-    for (const char* key:keys) {
+    for (const char* key:kViewportSprings) {
         const auto* value=Find(parameters,0x18,key);
         auto* property=value?*reinterpret_cast<unsigned char* const*>(value):nullptr;
         if (!property) continue;
@@ -594,6 +1011,37 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         std::memcpy(property+0x20,&damping,4);
         std::memcpy(property+0x24,&response,4);
     }
+    if(owned.host) {
+        TuneOwnedParameters(parameters,owned_parameters.Reference(),start_owned);
+        const void* host=owned.host;
+        (start_owned?g_start:g_adjust)(transaction,&host,owned_parameters.Reference());
+        if(start_owned) {
+            // No other transaction may adjust this host before its initial
+            // SELF, reparent and start have committed together. Register out
+            // of lock because a callback may run immediately. An obsolete
+            // token can never unlock a newer host or a reused registry slot.
+            g_host_commit(static_cast<ASurfaceTransaction*>(transaction),
+                reinterpret_cast<void*>(owned_commit_token),
+                [](void* context,ASurfaceTransactionStats*) {
+                    const auto token=reinterpret_cast<uintptr_t>(context);
+                    if(!token) return;
+                    std::lock_guard<std::mutex> lock(g_mutex);
+                    for(auto& app:g_apps) if(app.owned_host && app.host_started &&
+                        app.host_commit_token==token) {
+                        app.host_committed=true;
+                        break;
+                    }
+                });
+        }
+        if(config.verbose && start_owned) {
+            const auto alpha=Spring(owned_parameters.Reference(),"alpha");
+            __android_log_print(ANDROID_LOG_INFO,kTag,
+                "owned closing host source=%d request=%lld animation=%d host=%d transaction=%llu alpha=%.2f->%.2f",
+                owned_source,static_cast<long long>(publication_request.event_ns),animation_id,owned_layer,
+                static_cast<unsigned long long>(owned_transaction),alpha.start,alpha.end);
+        }
+    }
+    if(dispatch_publication) genie::QueueTransition(publication_request);
 }
 void* Start(void* transaction,const void* surface,const void* parameters) {
     Observe(surface,parameters,false);
@@ -639,9 +1087,46 @@ void* Reparent(void* transaction,const void* child,const void* parent) {
     }
     return g_reparent(transaction,child,parent);
 }
+void SuppressStoppedIcons(void* transaction,const void* control,int32_t animation_id) {
+    if(!transaction || !control || animation_id<0 || !g_layer || !g_name ||
+       !g_icon_ready.load(std::memory_order_acquire)) return;
+    const auto config=ReadConfig();
+    if(!config.enabled || !config.content) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for(const auto& icon:g_icons) {
+        const auto* source=CurrentReadbackSource(icon);
+        if(!source || icon.animation_id!=animation_id || icon.width<=0 || icon.height<=0 ||
+           g_layer(icon.parent_control)!=icon.parent || g_layer(icon.surface)<0 ||
+           g_layer(icon.surface)==icon.parent ||
+           g_name(icon.parent_control).find("FloatingIcon_all")!=0) continue;
+        int child_parent=-1;
+        if(std::sscanf(g_name(icon.surface).c_str(),"[BBQ] FloatingIcon_all#%d",&child_parent)!=1 ||
+           child_parent!=icon.parent) continue;
+        const auto* app=ReadbackApp(*source);
+        if(!app || CurrentReadbackSource(*app)!=source ||
+           app->kind!=genie::PublicationKind::OwnedClosingGroup || !app->owned_host ||
+           !app->host_started || !app->host_committed || !app->host_commit_token ||
+           app->owned_layer<0 || g_layer(app->owned_host)!=app->owned_layer ||
+           g_layer(app->control)!=app->layer ||
+           g_layer(icon.surface)==app->layer || g_layer(icon.surface)==app->owned_layer ||
+           (control!=icon.parent_control && control!=app->control)) continue;
+        // Stock Stop freezes the icon's last SELF frame while the independent
+        // closing host keeps moving. Hide only these exact temporary controls
+        // in that caller transaction; the shared mesh and OEM Stop stay intact.
+        ASurfaceTransaction_setBufferAlpha(static_cast<ASurfaceTransaction*>(transaction),
+            reinterpret_cast<ASurfaceControl*>(icon.parent_control),0);
+        ASurfaceTransaction_setBufferAlpha(static_cast<ASurfaceTransaction*>(transaction),
+            reinterpret_cast<ASurfaceControl*>(icon.surface),0);
+        if(config.verbose) __android_log_print(ANDROID_LOG_INFO,kTag,
+            "stopped icon hidden parent=%d buffer=%d source=%d request=%lld animation=%d",
+            icon.parent,g_layer(icon.surface),icon.source_leash,
+            static_cast<long long>(icon.request_ns),animation_id);
+    }
+}
 void* Stop(void* transaction,const void* surface,int32_t animation_id) {
     if (surface && g_layer) {
         const void* control=*static_cast<const void* const*>(surface);
+        SuppressStoppedIcons(transaction,control,animation_id);
         const int32_t id=control?g_layer(control):-1;
         bool cancel=false;
         {
@@ -667,11 +1152,20 @@ void Install(void* handle) {
     void* stop=dlsym(handle,kStop);
     void* reparent=dlsym(handle,kReparent);
     void* blast=dlsym(handle,kBlastUpdate);
+    void* home_params=dlsym(handle,kHomeParams);
+    void* set_callback=dlsym(handle,kSetCallback);
+    static void* platform=dlopen("libandroid.so",RTLD_NOW|RTLD_LOCAL);
+    g_host_commit=platform?reinterpret_cast<HostCommitFn>(dlsym(platform,"ASurfaceTransaction_setOnCommit")):nullptr;
+    const auto* listener_table=static_cast<const unsigned char*>(dlsym(handle,
+        "_ZTVN7android19SFAnimationListenerE"));
+    const auto* params_table=static_cast<const unsigned char*>(dlsym(handle,
+        "_ZTVN7android3gui14CallAnimParamsE"));
     g_layer=reinterpret_cast<LayerFn>(dlsym(handle,"_ZNK7android14SurfaceControl10getLayerIdEv"));
     g_name=reinterpret_cast<NameFn>(dlsym(handle,"_ZNK7android14SurfaceControl7getNameEv"));
     g_transaction_id=reinterpret_cast<TransactionIdFn>(dlsym(handle,
         "_ZN7android21SurfaceComposerClient11Transaction5getIdEv"));
-    if (!start || !adjust || !stop || !reparent || !blast || !g_layer || !g_name) {
+    if (!start || !adjust || !stop || !reparent || !blast || !home_params || !set_callback || !g_host_commit ||
+        !listener_table || !params_table || !g_layer || !g_name) {
         __android_log_print(ANDROID_LOG_WARN,kTag,"required launcher interfaces missing; keeping stock");
         return;
     }
@@ -683,6 +1177,8 @@ void Install(void* handle) {
         __android_log_print(ANDROID_LOG_WARN,kTag,"%s; keeping stock",reason);
         return;
     }
+    g_listener_vtable=listener_table+0x18;
+    g_params_vtable=params_table+0x10;
     int status=g_api->hookFunc(start,reinterpret_cast<void*>(Start),reinterpret_cast<void**>(&g_start));
     if (status || !g_start) {
         if (!status) g_api->unhookFunc(start);
@@ -712,6 +1208,27 @@ void Install(void* handle) {
     status=g_api->hookFunc(blast,reinterpret_cast<void*>(BlastUpdate),reinterpret_cast<void**>(&g_blast_update));
     if(status || !g_blast_update) {
         if(!status) g_api->unhookFunc(blast);
+        g_api->unhookFunc(reparent);
+        g_api->unhookFunc(stop);
+        g_api->unhookFunc(adjust);
+        g_api->unhookFunc(start);
+        return;
+    }
+    status=g_api->hookFunc(home_params,reinterpret_cast<void*>(HomeParams),reinterpret_cast<void**>(&g_home_params));
+    if(status || !g_home_params) {
+        if(!status) g_api->unhookFunc(home_params);
+        g_api->unhookFunc(blast);
+        g_api->unhookFunc(reparent);
+        g_api->unhookFunc(stop);
+        g_api->unhookFunc(adjust);
+        g_api->unhookFunc(start);
+        return;
+    }
+    status=g_api->hookFunc(set_callback,reinterpret_cast<void*>(SetCallback),reinterpret_cast<void**>(&g_set_callback));
+    if(status || !g_set_callback) {
+        if(!status) g_api->unhookFunc(set_callback);
+        g_api->unhookFunc(home_params);
+        g_api->unhookFunc(blast);
         g_api->unhookFunc(reparent);
         g_api->unhookFunc(stop);
         g_api->unhookFunc(adjust);

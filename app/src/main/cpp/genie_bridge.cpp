@@ -175,8 +175,48 @@ void Queue(Command command) {
 }
 }  // namespace
 
+bool CloneAnimationParameters(const void* reference,AnimationParameters* output) {
+    if(!reference || !output) return false;
+    output->Reset();
+    const void* source=*static_cast<const void* const*>(reference);
+    if(!source) return false;
+    static void* binder=dlopen("libbinder_ndk.so",RTLD_NOW|RTLD_LOCAL);
+    static void* gui=dlopen("libgui.so",RTLD_NOW|RTLD_LOCAL);
+    static void* utils=dlopen("libutils.so",RTLD_NOW|RTLD_LOCAL);
+    using CreateParcel=AParcel* (*)();
+    using ViewParcel=void* (*)(AParcel*);
+    using Write=int32_t (*)(const void*,void*);
+    using Read=int32_t (*)(const void*,void**);
+    using Release=void (*)(const void*,const void*);
+    static auto create=binder?reinterpret_cast<CreateParcel>(dlsym(binder,"AParcel_create")):nullptr;
+    static auto view=binder?reinterpret_cast<ViewParcel>(dlsym(binder,
+        "_Z26AParcel_viewPlatformParcelP7AParcel")):nullptr;
+    static auto write=gui?reinterpret_cast<Write>(dlsym(gui,
+        "_ZN7android3gui17SfAnimationParams13writeToParcelEPNS_6ParcelE")):nullptr;
+    static auto read=gui?reinterpret_cast<Read>(dlsym(gui,
+        "_ZN7android3gui17SfAnimationParams14readFromParcelEPKNS_6ParcelEPNS_2spIS1_EE")):nullptr;
+    static auto release=utils?reinterpret_cast<Release>(dlsym(utils,"_ZNK7android7RefBase9decStrongEPKv")):nullptr;
+    static const auto* table=gui?static_cast<const unsigned char*>(dlsym(gui,
+        "_ZTVN7android3gui17SfAnimationParamsE")):nullptr;
+    if(!create || !view || !write || !read || !release || !table ||
+       *static_cast<const void* const*>(source)!=table+0x10) return false;
+    AParcel* parcel=create();
+    if(!parcel) return false;
+    void* platform=view(parcel);
+    output->release=release;
+    const bool copied=platform && write(source,platform)==0 && AParcel_setDataPosition(parcel,0)==STATUS_OK &&
+        read(platform,&output->object)==0 && output->object && output->object!=source &&
+        *static_cast<const void* const*>(output->object)==table+0x10;
+    AParcel_delete(parcel);
+    if(!copied) output->Reset();
+    return copied;
+}
+
 GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie::model::Rect* window,
-                                          const Transition& transition) {
+                                          const Transition& transition,GroupPublication* publication) {
+    GroupPublication local;
+    auto* prepared=publication?publication:&local;
+    prepared->Reset();
     static void* library=dlopen("libbinder_ndk.so",RTLD_NOW|RTLD_LOCAL);
     using CheckService=AIBinder* (*)(const char*);
     static auto check=library?reinterpret_cast<CheckService>(dlsym(library,"AServiceManager_checkService")):nullptr;
@@ -184,15 +224,17 @@ GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie:
     using ViewParcel=const void* (*)(const AParcel*);
     using ReadSurface=int32_t (*)(const void*,void**);
     using Release=void (*)(const void*,const void*);
+    using Layer=int32_t (*)(const void*);
     using ReadTransaction=int32_t (*)(void*,const void*);
     using MergeTransaction=void* (*)(void*,void*);
     auto symbol=[&](const char* name) {return platform?dlsym(platform,name):nullptr;};
     static auto view=library?reinterpret_cast<ViewParcel>(dlsym(library,"_Z26AParcel_viewPlatformParcelPK7AParcel")):nullptr;
     static auto read=reinterpret_cast<ReadSurface>(symbol("_ZN7android14SurfaceControl14readFromParcelERKNS_6ParcelEPNS_2spIS0_EE"));
     static auto release=reinterpret_cast<Release>(symbol("_ZNK7android7RefBase9decStrongEPKv"));
+    static auto layer=reinterpret_cast<Layer>(symbol("_ZNK7android14SurfaceControl10getLayerIdEv"));
     static auto read_transaction=reinterpret_cast<ReadTransaction>(symbol("_ZN7android21SurfaceComposerClient11Transaction14readFromParcelEPKNS_6ParcelE"));
     static auto merge_transaction=reinterpret_cast<MergeTransaction>(symbol("_ZN7android21SurfaceComposerClient11Transaction5mergeEOS1_"));
-    if(!check || !transaction || !parent || !window || !view || !read || !release || !read_transaction ||
+    if(!check || !transaction || !parent || !window || !view || !read || !release || !layer || !read_transaction ||
        !merge_transaction || transition.task_id<0) return GroupPreparation::Rejected;
     AIBinder* binder=check("window");
     if(!binder) return GroupPreparation::Rejected;
@@ -203,32 +245,48 @@ GroupPreparation PrepareContentGroupStatus(void* transaction,void* parent,genie:
     AParcel* output=nullptr;
     int32_t accepted=0;
     binder_status_t status=Send(binder,transition,4,&output,&accepted);
-    int32_t width=0,height=0;
+    int32_t kind=0,width=0,height=0;
     if(status==STATUS_OK && accepted==1) {
-        status=AParcel_readInt32(output,&width);
+        status=AParcel_readInt32(output,&kind);
+        if(status==STATUS_OK) status=AParcel_readInt32(output,&width);
         if(status==STATUS_OK) status=AParcel_readInt32(output,&height);
     }
+    const auto type=static_cast<PublicationKind>(kind);
+    const bool owned=type==PublicationKind::OwnedClosingGroup;
+    const bool recognized=type==PublicationKind::NormalGroup || type==PublicationKind::RegisteredPreview || owned;
+    const bool direction=owned?transition.closing && publication:
+        type!=PublicationKind::NormalGroup || !transition.closing;
     void* output_surface=nullptr;
     ASurfaceTransaction* visibility=ASurfaceTransaction_create();
     bool primed=false;
-    if(status==STATUS_OK && accepted==1 && visibility &&
+    if(status==STATUS_OK && accepted==1 && recognized && direction && visibility &&
        width>0 && height>width && width<=16384 && height<=16384) {
         const void* parcel=view(output);
-        if(parcel && read(parcel,&output_surface)==0 && output_surface &&
-           read_transaction(visibility,parcel)==0) {
-            // The server supplies the inherited shader state and both native
-            // and visibility commit listeners. Never overwrite it locally.
+        bool capabilities=parcel && read(parcel,&output_surface)==0 && output_surface;
+        if(capabilities && owned) {
+            prepared->release=release;
+            capabilities=read(parcel,&prepared->host)==0 && prepared->host;
+            if(capabilities) {
+                const int32_t id=layer(prepared->host);
+                capabilities=id>=0 && id!=layer(parent) && id!=layer(output_surface);
+            }
+        }
+        if(capabilities && read_transaction(visibility,parcel)==0) {
+            // The server supplies shader state, visibility and host topology in
+            // this transaction. The caller adds the owned host's first motion.
             merge_transaction(transaction,visibility);
             *window={0,0,static_cast<double>(width),static_cast<double>(height)};
+            prepared->kind=type;
             primed=true;
         }
     }
+    if(!primed) prepared->Reset();
     if(output_surface) release(output_surface,&output_surface);
     if(visibility) ASurfaceTransaction_delete(visibility);
     if(output) AParcel_delete(output);
     AIBinder_decStrong(binder);
     __android_log_print(primed?ANDROID_LOG_INFO:ANDROID_LOG_DEBUG,"Genie.Bridge",
-        "group before host leash=%d accepted=%d primed=%d status=%d domain=%dx%d",transition.leash_layer,accepted,primed,status,width,height);
+        "group before host leash=%d accepted=%d kind=%d primed=%d status=%d domain=%dx%d",transition.leash_layer,accepted,kind,primed,status,width,height);
     if(accepted==1 && !primed) QueueCancel(transition.leash_layer,transition.event_ns);
     if(primed) return GroupPreparation::Ready;
     return status==STATUS_OK && accepted==2 ? GroupPreparation::Deferred : GroupPreparation::Rejected;

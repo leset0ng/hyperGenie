@@ -12,6 +12,8 @@ import java.lang.reflect.Method
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 
 /** Copies only OEM previews whose local domain matches the selected fullscreen window. */
@@ -22,11 +24,35 @@ internal class PreStartingSurfaces(
     private val onChanged: () -> Unit = {},
 ) : AutoCloseable {
     /** Independently owned copies; neither object is borrowed from an OEM registry. */
-    data class Preview(val surface: Any, val parent: Any) : AutoCloseable {
+    data class Preview(val surface: Any, val parent: Any, val identity: RegisteredIdentity) : AutoCloseable {
         override fun close() {
             runCatching { surface.javaClass.getMethod("release").invoke(surface) }
             runCatching { parent.javaClass.getMethod("release").invoke(parent) }
         }
+    }
+    /** Identity evidence must not extend the OEM animation's merged lifetime. */
+    class RegisteredIdentity(
+        animation: Any, val token: Long, producer: Any, val producerLayer: Int,
+        val bufferLayer: Int, parent: Any, val parentLayer: Int, display: Any,
+        val userId: Int, val width: Int, val height: Int,
+    ) {
+        val animation = WeakReference(animation)
+        val producer = WeakReference(producer)
+        val parent = WeakReference(parent)
+        val display = WeakReference(display)
+
+        private fun sameLiveObject(left: WeakReference<Any>, right: WeakReference<Any>): Boolean {
+            val original = left.get() ?: return false
+            return original === (right.get() ?: return false)
+        }
+
+        fun sameSource(other: RegisteredIdentity): Boolean =
+            sameLiveObject(animation, other.animation) && token == other.token &&
+                sameLiveObject(producer, other.producer) &&
+                producerLayer == other.producerLayer && bufferLayer == other.bufferLayer &&
+                sameLiveObject(parent, other.parent) && parentLayer == other.parentLayer &&
+                sameLiveObject(display, other.display) &&
+                userId == other.userId && width == other.width && height == other.height
     }
     /** The caller must retry without retiring its currently attached content. */
     class Busy : RuntimeException()
@@ -59,6 +85,12 @@ internal class PreStartingSurfaces(
         val display: WeakReference<Any>?, val frame: Rect?,
     )
     private val managerOwners = WeakHashMap<Any, ManagerOwner>()
+    private data class PendingManagerData(
+        val version: Long, val entries: List<Pair<WeakReference<Any>, WeakReference<Any>>>,
+    )
+    private val pendingManagerVersion = AtomicLong()
+    private val pendingManagerChanges = AtomicInteger()
+    @Volatile private var pendingManagerData = PendingManagerData(-1, emptyList())
     private val managerDiagnostics = ConcurrentHashMap<String, String>()
 
     fun install() {
@@ -218,6 +250,25 @@ internal class PreStartingSurfaces(
     /** Observe exact OEM ownership before current/pending keys can be cleared. */
     private fun managerEvents() {
         val type = managerFactory?.declaringClass ?: return
+        for (name in listOf("removePendingPreStartings", "removePending", "resetIfNeeded")) {
+            runCatching {
+                for (method in type.declaredMethods.filter { it.name == name }) {
+                    hooks += module.hook(method)
+                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                        .setId("prestarting-pending-version-$name-${method.parameterCount}")
+                        .intercept { chain ->
+                            pendingManagerChanges.incrementAndGet()
+                            pendingManagerVersion.incrementAndGet()
+                            try {
+                                chain.proceed()
+                            } finally {
+                                pendingManagerVersion.incrementAndGet()
+                                pendingManagerChanges.decrementAndGet()
+                            }
+                        }
+                }
+            }.onFailure { module.log(Log.WARN, TAG, "pending manager observer unavailable: $name", it) }
+        }
         for ((name, count) in listOf(
             "makePreColorIfNeeded" to 4, "resetIfNeeded" to 3, "reset" to 4,
         )) {
@@ -277,13 +328,18 @@ internal class PreStartingSurfaces(
     fun prepare() {
         manager = managerFactory?.invoke(null)
         controller = controllerFactory?.invoke(null)
-        val pending = manager?.let { members.field(it, "mPendingRemoveStartingData") } as? Map<*, *> ?: return
+        val pending = manager?.let { members.field(it, "mPendingRemoveStartingData") } as? Map<*, *>
         // ROM nests pending-map -> surface lock. Never take this monitor in
         // copy(), where the caller already owns WMS.mGlobalLock.
-        val entries = synchronized(pending) { pending.entries.map { it.key to it.value } }
+        val version = pendingManagerVersion.get()
+        val entries = pending?.let { synchronized(it) { it.entries.map { entry -> entry.key to entry.value } } }
+            .orEmpty()
         entries.forEach { (activity, data) ->
             if (activity != null && data != null) rememberManagerOwner(activity, data)
         }
+        pendingManagerData = PendingManagerData(version, entries.mapNotNull { (activity, data) ->
+            if (activity == null || data == null) null else WeakReference(activity) to WeakReference(data)
+        }.takeIf { pendingManagerChanges.get() == 0 && pendingManagerVersion.get() == version }.orEmpty())
     }
 
     /** Called after every successful options assignment, including tokenless clearing. */
@@ -326,6 +382,10 @@ internal class PreStartingSurfaces(
             parent != null && runCatching { layer(parent) == leash }.getOrDefault(false)
         }
         val animation = matches.singleOrNull() ?: return unavailable(leash, "registered-matches=${matches.size}")
+        val token = (members.call(animation, "getToken") as? Long)?.takeIf { it > 0L }
+            ?: return unavailable(leash, "missing-token")
+        val userId = members.call(animation, "getUserId") as? Int
+            ?: return unavailable(leash, "missing-user")
         val frame = Rect(0, 0, width, height)
         val display = members.field(animation, "mDisplayContent") ?: return unavailable(leash, "missing-display")
         if (members.call(display, "getRotation") != 0 || members.call(display, "getBounds") != frame)
@@ -344,7 +404,9 @@ internal class PreStartingSurfaces(
                     return unavailable(leash, "parent-retired")
                 parentCopy = copySurface.newInstance(parent, "Genie.central.prestarting.parent")
             }
-            return Preview(surfaceCopy, checkNotNull(parentCopy)).also {
+            val identity = RegisteredIdentity(animation, token, source, layer(source), layer(surfaceCopy),
+                parent, leash, display, userId, width, height)
+            return Preview(surfaceCopy, checkNotNull(parentCopy), identity).also {
                 openingExclusions.remove(leash)
                 copies.clear()
                 parentCopy = null
@@ -353,6 +415,36 @@ internal class PreStartingSurfaces(
             copies.forEach(::release)
             parentCopy?.let(::release)
         }
+    }
+
+    /** A close must retain the same registered producer and the Activity's latest launch. */
+    fun closing(identity: RegisteredIdentity, activity: Any, task: Any): Preview? {
+        fun reject(reason: String): Preview? {
+            module.log(Log.DEBUG, TAG, "registered close rejected leash=${identity.parentLayer} " +
+                "token=${identity.token} current=${launchToken(activity)} producer=${identity.producerLayer} " +
+                "buffer=${identity.bufferLayer} reason=$reason")
+            return null
+        }
+        if (launchToken(activity) != identity.token) return reject("launch-token")
+        val animation = identity.animation.get() ?: return reject("animation-collected")
+        val producer = identity.producer.get() ?: return reject("producer-collected")
+        val parent = identity.parent.get() ?: return reject("parent-collected")
+        val display = identity.display.get() ?: return reject("display-collected")
+        val frame = Rect(0, 0, identity.width, identity.height)
+        if (identityDisplay(activity, task, frame, identity.width, identity.height) !== display)
+            return reject("activity-task-display-domain")
+        if (members.field(activity, "mUserId") != identity.userId) return reject("user")
+        val preview = opening(identity.parentLayer, identity.width, identity.height)
+            ?: return reject("registration-or-buffer-domain")
+        if (preview.identity.animation.get() !== animation || preview.identity.producer.get() !== producer ||
+            preview.identity.parent.get() !== parent || preview.identity.display.get() !== display ||
+            !identity.sameSource(preview.identity)) {
+            val live = preview.identity
+            preview.close()
+            return reject("producer-changed liveToken=${live.token} liveProducer=${live.producerLayer} " +
+                "liveBuffer=${live.bufferLayer}")
+        }
+        return preview
     }
 
     private fun unavailable(leash: Int, reason: String): Preview? {
@@ -421,37 +513,48 @@ internal class PreStartingSurfaces(
                     val colors = members.field(currentManager, "mColorSurfaceControlMap") as? Map<*, *> ?: throw Busy()
                     val positions = members.field(currentManager, "mPreSurfaceInitPosMap") as? Map<*, *>
                     val scales = members.field(currentManager, "mPreSurfaceScaleMap") as? Map<*, *>
-                    val candidates = synchronized(managerOwners) {
-                        // Absence from these registries, not isCleared or a
-                        // cleared pending map, is the retirement boundary.
+                    // Match showPreStarting's selected key. Historical registry
+                    // entries can remain visible while an older launch retires;
+                    // they must not acquire the next launch's motion.
+                    val pending = pendingManagerData
+                    val selected = current ?: pending.takeIf {
+                        pendingManagerChanges.get() == 0 && pending.version == pendingManagerVersion.get()
+                    }?.entries?.firstOrNull { it.first.get() === activity }?.second?.get()
+                    val owner = synchronized(managerOwners) {
                         managerOwners.entries.removeAll { (data, _) ->
                             !snapshots.containsKey(data) && !colors.containsKey(data)
                         }
-                        managerOwners.entries.filter { (_, owner) -> owner.activity.get() === activity }
-                            .map { it.key to it.value }
+                        managerOwners[selected]?.takeIf { it.activity.get() === activity }
                     }
-                    if (candidates.isEmpty())
-                        managerDiagnostic(activity, task, current, current, -1, "no-live-registry-key")
-                    for ((data, owner) in candidates) {
+                    if (selected == null || owner == null) {
+                        managerDiagnostic(activity, task, current, selected, -1, "no-current-registry-key")
+                    } else {
+                        val data = selected
                         val color = colors[data]
                         val colorLayer = color?.let(::layer) ?: -1
                         if (owner.task.get() !== task || owner.display?.get() !== display || owner.frame != frame) {
                             managerDiagnostic(activity, task, current, data, colorLayer, "owner-domain")
-                            continue
-                        }
-                        if (positions != null && scales != null &&
-                            identityPair(positions[data], 0f) && identityPair(scales[data], 1f)) {
-                            val snapshot = members.call(data, "getSnapshot")
-                            if (snapshot != null && members.call(snapshot, "getRotation") == 0 &&
-                                members.call(snapshot, "getHardwareBufferWidth") == width &&
-                                members.call(snapshot, "getHardwareBufferHeight") == height) {
-                                addCopy(snapshots[data], width, height, false, seen, owned)
+                        } else {
+                            if (positions != null && scales != null &&
+                                identityPair(positions[data], 0f) && identityPair(scales[data], 1f)) {
+                                val snapshot = members.call(data, "getSnapshot")
+                                // A cached TaskSnapshot can outlive its HardwareBuffer.
+                                // Its expired metadata must not discard the current color layer.
+                                val snapshotMatches = try {
+                                    snapshot != null && members.call(snapshot, "getRotation") == 0 &&
+                                        members.call(snapshot, "getHardwareBufferWidth") == width &&
+                                        members.call(snapshot, "getHardwareBufferHeight") == height
+                                } catch (_: Exception) {
+                                    false
+                                }
+                                if (snapshotMatches) {
+                                    addCopy(snapshots[data], width, height, false, seen, owned)
+                                }
                             }
+                            // Color is independent of snapshot buffer availability.
+                            val result = addCopy(color, width, height, true, seen, owned)
+                            managerDiagnostic(activity, task, current, data, colorLayer, result)
                         }
-                        // Color is an independent solid layer. It can still
-                        // draw after isCleared=true and through a new launch.
-                        val result = addCopy(color, width, height, true, seen, owned)
-                        managerDiagnostic(activity, task, current, data, colorLayer, result)
                     }
                 } finally {
                     lock.unlock()
@@ -552,6 +655,7 @@ internal class PreStartingSurfaces(
         openingExclusions.clear()
         managerDiagnostics.clear()
         synchronized(managerOwners) { managerOwners.clear() }
+        pendingManagerData = PendingManagerData(-1, emptyList())
         synchronized(drawDomains) { drawDomains.clear() }
     }
 

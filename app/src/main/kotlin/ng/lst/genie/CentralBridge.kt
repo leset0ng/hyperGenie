@@ -24,11 +24,14 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val snapshots = SnapshotGuard(module, loader)
     private val preStarting = PreStartingSurfaces(module, loader, ::surfacesChanged)
     private val subtrees = LiveSubtrees(module, loader, ::surfacesChanged)
+    private val groupPublicationLock = Any()
     private val groupOwners = ConcurrentHashMap<Int, Long>()
     private val groupTasks = ConcurrentHashMap<Int, Int>()
     private val taskEvents = ConcurrentHashMap<Int, Long>()
     private val taskRequests = ConcurrentHashMap<Int, Request>()
-    private val events = SurfaceEvents(module, loader, ::surfaceShowing, ::surfacesChanged, ::bufferCreated, ::sourceRemoved)
+    private val taskOpenEvents = ConcurrentHashMap<Int, Long>()
+    private val events = SurfaceEvents(module, loader, ::surfaceShowing, ::surfacesChanged, ::bufferCreated,
+        ::sourceRemoved, ::taskReturned)
     private val snapshotReleases = HashMap<Int, SnapshotRelease>()
     private val wmsClass = Class.forName("com.android.server.wm.WindowManagerService", false, loader)
     private val scClass = Class.forName("android.view.SurfaceControl")
@@ -58,6 +61,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private val earlyPublications = ConcurrentHashMap<Int, Long>()
     private val openingPreviews = ConcurrentHashMap<Int, PreviewCloseIdentity>()
     private val closingPreviews = ConcurrentHashMap<Long, PreviewCloseIdentity>()
+    private val registeredOpeningPreviews = ConcurrentHashMap<Int, RegisteredGrant>()
+    private val registeredClosingPreviews = ConcurrentHashMap<Long, RegisteredCloseIdentity>()
     private val sessions = LinkedHashMap<Int, Active>() // Bridge worker only.
     private val lastEvents = HashMap<Int, Long>()
     private val changeQueued = AtomicBoolean()
@@ -188,6 +193,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     }
                 }
                 writeTransaction.invoke(null, transactionObject.getLong(publication), encoded)
+                rememberRegisteredPreview(preview, request)
                 val transition = Request(TRANSITION, request.leash, request.containerLayer,
                     request.taskId, request.closing, request.eventNs, request.geometry)
                 publish(Envelope(service, context, transition))
@@ -222,6 +228,13 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         }
         if (!taskCurrent(request)) return reject("superseded-task")
         contentEnabled = true
+        if (request.closing && registeredClosingPreviews.containsKey(request.eventNs))
+            return prepareRegisteredPreviewClose(service, context, request, reply)
+        // LRU retirement and domain invalidation can outlive their Task mapping.
+        // Resolve the current producer again instead of rejecting a stale source.
+        val cachedSource = groupTasks[request.taskId]
+        if (cachedSource != null && !subtrees.prepared(cachedSource))
+            groupTasks.remove(request.taskId, cachedSource)
         val source = groupTasks[request.taskId] ?: run {
             // A normal window can appear after the last lifecycle callback.
             // Resolve it now so its verified subtree can start producing a
@@ -232,12 +245,14 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 return if (taskCurrent(request)) defer("companion-registry-busy") else reject("superseded-task")
             }
             groupTasks[request.taskId]
-        } ?: return if (request.closing && preparePreviewClose(service, context, request, reply)) true
+        } ?: return if (request.closing && (prepareRegisteredPreviewClose(service, context, request, reply) ||
+                preparePreviewClose(service, context, request, reply))) true
             else reject("task-source-unavailable")
         // This endpoint holds no WMS/SC locks. Give the already-running VD a
         // bounded chance to commit its first real buffer while Launcher's
         // original host transaction is still untouched and owned by its caller.
         if (!subtrees.awaitReady(source, FIRST_BUFFER_WAIT_MS)) {
+            if (request.closing && prepareRegisteredPreviewClose(service, context, request, reply)) return true
             return if (taskCurrent(request) && groupTasks[request.taskId] == source && subtrees.prepared(source))
                 defer() else reject("source-retired source=$source")
         }
@@ -272,60 +287,183 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     "presentation=${width}x$height buffer=${entry.width}x${entry.height}")
                 return false
             }
+            if (!subtrees.presentationReady(entry)) return defer("previous-host-publication")
+            if (request.closing && match.closingArea == null) return reject("closing-display-domain")
             val transition = Request(TRANSITION, request.leash, request.containerLayer, request.taskId,
                 request.closing, request.eventNs, request.geometry)
             // Unlike a WMS show hook, this authenticated Binder endpoint holds
             // neither WM nor SC/renderer locks. Serialize with an already-running
             // pristine snapshot instead of reverting a ready group to stock.
             if (!snapshots.block(request.taskId, request.eventNs)) return false
-            handler.post {
-                // This synchronous publication can outlive its window before
-                // the ordinary worker lookup registers the Task for cleanup.
-                val cleanup = Active(service, context, transition)
-                cleanup.taskId = request.taskId
-                cleanup.snapshotBlocked = true
-                releaseSnapshotAfterDetach(cleanup)
-            }
             val publication = newTransaction.newInstance()
             val encoded = Parcel.obtain()
+            var host: LiveSubtrees.ClosingHostLease? = null
+            var activated = false
+            var primed = false
+            var exported = false
             try {
                 if (!taskCurrent(request)) return reject("superseded-task")
-                // Companion discovery belongs to the same authenticated Task
-                // and publication as the composed output, before host masking
-                // is removed. In particular, manager color layers have no BBQ.
-                val locks = (listOf(entry.parent, entry.output, entry.source) + match.companions)
+                if (request.closing) {
+                    host = subtrees.closingHost(entry, request.eventNs, checkNotNull(match.closingArea))
+                        ?: return defer("closing-host-unavailable")
+                }
+                // The logical Task authenticates the content. Only our composed
+                // output moves to the independent host in this same publication.
+                val locks = (listOfNotNull(entry.parent, entry.output, entry.source, host?.surface) + match.companions)
                     .map { checkNotNull(surfaceLock.get(it)) }.distinct()
                 fun prime(index: Int): Boolean {
                     if (index < locks.size) return synchronized(locks[index]) { prime(index + 1) }
-                    if (!subtrees.activate(entry, publication)) return false
-                    return ContentAnimator.prime(transactionObject.getLong(publication),
-                        nativeObject.getLong(entry.output), nativeObject.getLong(entry.parent), entry.width, entry.height,
-                        request.geometry, request.closing, request.eventNs,
-                        companions = LongArray(match.companions.size) { nativeObject.getLong(match.companions[it]) },
-                        unwarpedSource = nativeObject.getLong(entry.source))
+                    return synchronized(groupPublicationLock) {
+                        if (!taskCurrent(request) || !subtrees.activate(entry, publication, request.eventNs, host)) {
+                            subtrees.discardPublication(publication)
+                            return@synchronized false
+                        }
+                        activated = true
+                        primed = ContentAnimator.prime(transactionObject.getLong(publication),
+                            nativeObject.getLong(entry.output), nativeObject.getLong(entry.parent), entry.width, entry.height,
+                            request.geometry, request.closing, request.eventNs,
+                            companions = LongArray(match.companions.size) { nativeObject.getLong(match.companions[it]) },
+                            unwarpedSource = nativeObject.getLong(entry.source))
+                        if (primed) groupOwners.merge(source, request.eventNs) { old, next -> maxOf(old, next) }
+                        primed
+                    }
                 }
-                if (!prime(0)) {
-                    subtrees.restore(entry, publication)
-                    return reject("native-prime-rejected")
-                }
-                groupOwners.merge(source, request.eventNs) { old, next -> maxOf(old, next) }
-                earlyPublications[surfaceLayer.invoke(entry.output) as Int] = request.eventNs
+                if (!prime(0)) return reject("native-prime-rejected")
                 val writer = nativeWriteSurface ?: return false
                 writer.invoke(null, nativeObject.getLong(entry.output), encoded)
-                // Visibility, inherited shader state and commit listener reach SF
-                // only in Launcher's matching host geometry transaction.
+                host?.let { writer.invoke(null, nativeObject.getLong(it.surface), encoded) }
+                // Visibility, host topology and shader state reach SF only in
+                // Launcher's matching geometry transaction.
                 writeTransaction.invoke(null, transactionObject.getLong(publication), encoded)
+                reply.writeNoException()
+                reply.writeInt(1)
+                reply.writeInt(if (host != null) 3 else 1)
+                reply.writeInt(entry.width)
+                reply.writeInt(entry.height)
+                reply.appendFrom(encoded, 0, encoded.dataSize())
+                exported = true
+                earlyPublications[surfaceLayer.invoke(entry.output) as Int] = request.eventNs
+                publish(Envelope(service, context, transition))
+                handler.post { process(service, context, transition) }
+                report(Log.INFO, "group before host leash=${request.leash} source=$source " +
+                    "output=${surfaceLayer.invoke(entry.output)} ownedHost=${host?.surface?.let { surfaceLayer.invoke(it) }} " +
+                    "companions=${match.companionLayers} closing=${request.closing}")
+                return true
+            } finally {
+                if (activated && !exported) {
+                    // A failed native prime or parcel write must never leave an
+                    // applied output reparent without its matching Launcher host.
+                    runCatching {
+                        if (primed) ContentAnimator.revokeRequest(match.parentLayer, request.eventNs)
+                        synchronized(groupPublicationLock) {
+                            if (subtrees.restore(entry, publication)) applyTransaction.invoke(publication)
+                            else subtrees.discardPublication(publication)
+                        }
+                    }.onFailure {
+                        subtrees.restoreFailed(source)
+                        report(Log.WARN, "unpublished group rollback failed source=$source", it)
+                    }
+                }
+                host?.close()
+                handler.post {
+                    val cleanup = Active(service, context, transition)
+                    cleanup.taskId = request.taskId
+                    cleanup.task = match.task
+                    cleanup.snapshotBlocked = true
+                    releaseSnapshotAfterDetach(cleanup)
+                }
+                closeTransaction.invoke(publication)
+                encoded.recycle()
+            }
+        }
+    }
+
+    private fun rememberRegisteredPreview(preview: PreStartingSurfaces.Preview, request: Request) {
+        if (request.closing || preview.identity.parentLayer != request.leash) return
+        registeredOpeningPreviews.compute(request.leash) { _, old ->
+            if (old == null || old.openingNs < request.eventNs) RegisteredGrant(preview.identity, request.eventNs)
+            else old
+        }
+        while (registeredOpeningPreviews.size > MAX_PREVIEW_GRANTS)
+            registeredOpeningPreviews.entries.minByOrNull { it.value.openingNs }
+                ?.let { registeredOpeningPreviews.remove(it.key, it.value) }
+    }
+
+    /** Retarget the exact published OEM preview before allowing its host to fall back to stock. */
+    private fun prepareRegisteredPreviewClose(service: Any, context: Context, request: Request, reply: Parcel): Boolean {
+        val pinned = registeredClosingPreviews[request.eventNs]
+        val grant = pinned?.grant ?: registeredOpeningPreviews[request.leash]
+        fun reject(reason: String): Boolean {
+            report(Log.DEBUG, "registered close rejected leash=${request.leash} task=${request.taskId} " +
+                "parent=${request.containerLayer} epoch=${request.eventNs} opening=${grant?.openingNs} " +
+                "token=${grant?.identity?.token} producer=${grant?.identity?.producerLayer} " +
+                "buffer=${grant?.identity?.bufferLayer} reason=$reason")
+            return false
+        }
+        if (grant == null) return reject("no-published-grant")
+        val writer = nativeWriteSurface ?: return reject("surface-writer-unavailable")
+        if (!request.closing || request.leash != grant.identity.parentLayer || request.containerLayer < 0 ||
+            !grant.allowsClose(request.eventNs, request.geometry[2], request.geometry[3]) || !taskCurrent(request))
+            return reject("request-domain-or-epoch")
+        val match = lookupRegisteredPreview(service, request, grant, pinned) ?: return false
+        match.use {
+            val identity = checkNotNull(it.registeredIdentity)
+            if (!snapshots.block(request.taskId, request.eventNs)) return reject("snapshot-busy")
+            val publication = newTransaction.newInstance()
+            val encoded = Parcel.obtain()
+            try {
+                // Recheck original OEM controls before taking publication locks.
+                // WMS show hooks can already hold a producer's own SC monitor.
+                preStarting.closing(grant.identity, identity.activity, it.task)?.close()
+                    ?: return reject("producer-retired-before-prime")
+                val locks = (listOf(it.parent, checkNotNull(it.content)) + it.companions)
+                    .map { surface -> checkNotNull(surfaceLock.get(surface)) }.distinct()
+                fun prime(index: Int): Boolean {
+                    if (index < locks.size) return synchronized(locks[index]) { prime(index + 1) }
+                    return synchronized(groupPublicationLock) {
+                        if (!taskCurrent(request)) return@synchronized reject("superseded-task")
+                        if (!identity.sameLaunch(identity.activity, it.task,
+                                preStarting.launchToken(identity.activity), it.uid))
+                            return@synchronized reject("launch-changed-before-prime")
+                        if (!subtrees.previewReady(it.task)) return@synchronized reject("composed-output-pending")
+                        ContentAnimator.prime(transactionObject.getLong(publication),
+                            nativeObject.getLong(match.content), nativeObject.getLong(match.parent),
+                            match.width, match.height, request.geometry, true, request.eventNs,
+                            companions = LongArray(match.companions.size) { index ->
+                                nativeObject.getLong(match.companions[index]) }, starting = true)
+                    }
+                }
+                if (!prime(0)) return reject("identity-or-native-prime")
+                writer.invoke(null, nativeObject.getLong(it.content), encoded)
+                writeTransaction.invoke(null, transactionObject.getLong(publication), encoded)
+                registeredClosingPreviews.entries.removeIf { entry -> System.nanoTime() - entry.key > SESSION_NS }
+                registeredClosingPreviews[request.eventNs] = identity
+                val remaining = ((SESSION_NS - (System.nanoTime() - request.eventNs)) / 1_000_000L).coerceAtLeast(1L)
+                handler.postDelayed({ registeredClosingPreviews.remove(request.eventNs, identity) }, remaining)
+                earlyPublications[it.contentLayer] = request.eventNs
+                val transition = Request(TRANSITION, request.leash, request.containerLayer, request.taskId,
+                    true, request.eventNs, request.geometry)
                 publish(Envelope(service, context, transition))
                 handler.post { process(service, context, transition) }
                 reply.writeNoException()
                 reply.writeInt(1)
-                reply.writeInt(entry.width)
-                reply.writeInt(entry.height)
+                reply.writeInt(2) // Registered/starting preview.
+                reply.writeInt(it.width)
+                reply.writeInt(it.height)
                 reply.appendFrom(encoded, 0, encoded.dataSize())
-                report(Log.INFO, "group before host leash=${request.leash} source=$source " +
-                    "output=${surfaceLayer.invoke(entry.output)} companions=${match.companionLayers} closing=${request.closing}")
+                report(Log.INFO, "registered close before host leash=${request.leash} task=${it.taskId} " +
+                    "parent=${it.parentLayer} producer=${grant.identity.producerLayer} content=${it.contentLayer} " +
+                    "token=${grant.identity.token} opening=${grant.openingNs} epoch=${request.eventNs} " +
+                    "companions=${it.companionLayers}")
                 return true
             } finally {
+                handler.post {
+                    val cleanup = Active(service, context, request)
+                    cleanup.taskId = request.taskId
+                    cleanup.task = it.task
+                    cleanup.snapshotBlocked = true
+                    releaseSnapshotAfterDetach(cleanup)
+                }
                 closeTransaction.invoke(publication)
                 encoded.recycle()
             }
@@ -342,12 +480,6 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             if (!it.starting || !it.identityDomain || it.content == null || it.contentLayer != identity.bufferLayer ||
                 it.group != null || it.previewIdentity !== identity) return false
             if (!snapshots.block(request.taskId, request.eventNs)) return false
-            handler.post {
-                val cleanup = Active(service, context, request)
-                cleanup.taskId = request.taskId
-                cleanup.snapshotBlocked = true
-                releaseSnapshotAfterDetach(cleanup)
-            }
             val publication = newTransaction.newInstance()
             val encoded = Parcel.obtain()
             try {
@@ -379,6 +511,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 handler.post { process(service, context, transition) }
                 reply.writeNoException()
                 reply.writeInt(1)
+                reply.writeInt(2) // Registered/starting preview.
                 reply.writeInt(it.width)
                 reply.writeInt(it.height)
                 reply.appendFrom(encoded, 0, encoded.dataSize())
@@ -386,6 +519,13 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     "content=${it.contentLayer} launch=${identity.launchToken} companions=${it.companionLayers}")
                 return true
             } finally {
+                handler.post {
+                    val cleanup = Active(service, context, request)
+                    cleanup.taskId = request.taskId
+                    cleanup.task = it.task
+                    cleanup.snapshotBlocked = true
+                    releaseSnapshotAfterDetach(cleanup)
+                }
                 closeTransaction.invoke(publication)
                 encoded.recycle()
             }
@@ -511,10 +651,12 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             earlyPublications.clear()
             openingPreviews.clear()
             closingPreviews.clear()
+            registeredOpeningPreviews.clear()
+            registeredClosingPreviews.clear()
             sessions.values.toList().forEach { stop(it, "disabled") }
             ContentAnimator.stop()
-            groupOwners.clear()
             subtrees.clear()
+            handler.post { restoreRetiredGroups() }
             contentEnabled = false
             return
         }
@@ -566,16 +708,23 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 return ContentAnimator.transition(pointer, parent, match.width, match.height,
                     request.geometry, request.closing, request.eventNs, companions, match.starting)
             }
+            if (request.closing) return false
             val publication = newTransaction.newInstance()
             try {
-                if (!subtrees.activate(group, publication)) return false
-                val primed = ContentAnimator.prime(transactionObject.getLong(publication), pointer, parent,
-                    match.width, match.height, request.geometry, request.closing, request.eventNs,
-                    companions, match.starting, source)
-                if (primed) groupOwners.merge(group.sourceLayer, request.eventNs) { old, next -> maxOf(old, next) }
-                else subtrees.restore(group, publication)
-                applyTransaction.invoke(publication)
-                return primed
+                return synchronized(groupPublicationLock) {
+                    if (!subtrees.activate(group, publication, request.eventNs, null)) {
+                        subtrees.discardPublication(publication)
+                        return@synchronized false
+                    }
+                    val primed = ContentAnimator.prime(transactionObject.getLong(publication), pointer, parent,
+                        match.width, match.height, request.geometry, request.closing, request.eventNs,
+                        companions, match.starting, source)
+                    if (primed) groupOwners.merge(group.sourceLayer, request.eventNs) { old, next -> maxOf(old, next) }
+                    else subtrees.restore(group, publication)
+                    try { applyTransaction.invoke(publication) }
+                    catch (error: Throwable) { subtrees.restoreFailed(group.sourceLayer); throw error }
+                    primed
+                }
             } finally { closeTransaction.invoke(publication) }
         }
         return locked(0)
@@ -590,6 +739,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     }
 
     private fun recordTaskRequest(request: Request) {
+        if (!request.closing) taskOpenEvents.merge(request.taskId, request.eventNs) { old, next -> maxOf(old, next) }
         taskRequests.compute(request.taskId) { _, old ->
             if (old == null || old.eventNs <= request.eventNs) request else old
         }
@@ -598,6 +748,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             val now = System.nanoTime()
             taskEvents.entries.removeIf { now - it.value > SESSION_NS }
             taskRequests.entries.removeIf { now - it.value.eventNs > SESSION_NS }
+            taskOpenEvents.keys.removeIf { !taskEvents.containsKey(it) }
         }
     }
 
@@ -678,6 +829,10 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             }
             val match = lookup(current.service, current.request)
             if (match == null) {
+                if (registeredClosingPreviews.containsKey(current.request.eventNs)) {
+                    stop(current, "owner-changed")
+                    return
+                }
                 if (!current.request.closing && current.contentLayer < 0) startOpeningPreview(current)
                 // Creation, first draw, anchor and removal events drive the next
                 // check. A transient empty tree does not prove visible removal.
@@ -771,6 +926,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             val parent = nativeObject.getLong(preview.parent)
             if (ContentAnimator.transition(content, parent, width, height, request.geometry,
                     false, request.eventNs, starting = true)) {
+                rememberRegisteredPreview(preview, request)
                 current.contentLayer = surfaceLayer.invoke(preview.surface) as Int
                 current.nativeParent = surfaceLayer.invoke(preview.parent) as Int
                 current.width = width
@@ -822,9 +978,55 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     private fun sourceRemoved(layer: Int) {
         subtrees.invalidate(layer)
         openingPreviews.entries.removeIf { it.value.producerLayer == layer || it.value.bufferLayer == layer }
+        registeredOpeningPreviews.entries.removeIf {
+            it.value.identity.producerLayer == layer || it.value.identity.bufferLayer == layer
+        }
         groupTasks.entries.removeIf { it.value == layer }
-        groupOwners.remove(layer)
+        handler.post { restoreRetiredGroups() }
         surfacesChanged()
+    }
+
+    /** OEM local reversal can return to the App without another native SF request. */
+    private fun taskReturned(returned: SurfaceEvents.TaskReturn) {
+        if (closed || !rendererReady) return
+        val request = taskRequests[returned.taskId] ?: return
+        val opening = taskOpenEvents[returned.taskId] ?: return
+        if (!request.closing || returned.enteredNs <= opening || returned.enteredNs >= request.eventNs ||
+            returned.leftNs <= returned.enteredNs || returned.eventNs <= returned.leftNs ||
+            returned.eventNs - request.eventNs !in 1..SESSION_NS ||
+            request.containerLayer != returned.parentLayer) return
+        val source = groupTasks[returned.taskId] ?: return
+        val owner = owners[request.eventNs] ?: return
+        if (owner.task !== returned.task || owner.uid != returned.uid || groupOwners[source] != request.eventNs) return
+        // WMS owns the observer's thread. Its transaction and locks never cross
+        // into this worker, which retains every existing publication barrier.
+        handler.post {
+            synchronized(groupPublicationLock) {
+                val latest = taskRequests[returned.taskId]
+                val latestOwner = owners[request.eventNs]
+                if (closed || latest == null || latest.eventNs != request.eventNs || !latest.closing ||
+                    latest.leash != request.leash || latest.containerLayer != returned.parentLayer || !taskCurrent(request) ||
+                    taskOpenEvents[returned.taskId] != opening || groupTasks[returned.taskId] != source ||
+                    groupOwners[source] != request.eventNs || latestOwner == null || latestOwner.task !== returned.task ||
+                    latestOwner.uid != returned.uid) return@synchronized
+                val current = sessions[request.leash] ?: return@synchronized
+                if (!current.request.closing || current.request.eventNs != request.eventNs ||
+                    current.appliedEventNs != request.eventNs || current.task !== returned.task ||
+                    current.uid != returned.uid || current.activityToken !== returned.activityToken ||
+                    current.nativeParent != returned.parentLayer) return@synchronized
+                if (!subtrees.closingOutputMatches(source, returned.task, returned.parentLayer,
+                        current.contentLayer, request.eventNs)) return@synchronized
+                // This is an ownership-end watermark, never a synthetic open.
+                // A late retry of the retired close cannot republish its hide.
+                taskEvents.merge(returned.taskId, returned.eventNs) { old, next -> maxOf(old, next) }
+                lastEvents[request.leash] = maxOf(lastEvents[request.leash] ?: 0L, returned.eventNs)
+                taskRequests.remove(returned.taskId, latest)
+                stop(current, "local-task-return")
+                restoreRetiredGroups()
+                report(Log.INFO, "local task return task=${returned.taskId} leash=${request.leash} " +
+                    "epoch=${request.eventNs} event=${returned.eventNs}")
+            }
+        }
     }
 
     /** Prepare only a WM-verified identity window; arbitrary process surfaces are never accepted. */
@@ -871,8 +1073,11 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 val owned = if (show.transaction == null) newTransaction.newInstance() else null
                 try {
                     val publication = show.transaction ?: checkNotNull(owned)
-                    if (subtrees.guardHideTarget(publication, outerLayer) && owned != null)
-                        applyTransaction.invoke(owned)
+                    val guarded = subtrees.guardHideTarget(publication, outerLayer)
+                    if (owned != null) {
+                        if (guarded) applyTransaction.invoke(owned)
+                        else subtrees.discardPublication(owned)
+                    }
                 } finally { if (owned != null) closeTransaction.invoke(owned) }
             }
         }
@@ -900,19 +1105,25 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 // A late main window from this exact launch may feed its
                 // offscreen group, but cannot appear unmasked behind the
                 // closing preview or become the old request's shader target.
-                val preview = closingPreviews[request.eventNs] ?: return
+                val preview = closingPreviews[request.eventNs]
+                val registered = registeredClosingPreviews[request.eventNs]
                 val window = show.window ?: return
                 val attrs = access.field(window, "mAttrs") as? WindowManager.LayoutParams ?: return
-                if (!grouped || attrs.type != 1 || taskId != preview.taskId ||
-                    !preview.sameLaunch(activity, task, activity?.let(preStarting::launchToken), uid) ||
+                val sameLaunch = if (registered != null) taskId == registered.taskId &&
+                    registered.sameLaunch(activity, task, activity?.let(preStarting::launchToken), uid)
+                else preview != null && taskId == preview.taskId &&
+                    preview.sameLaunch(activity, task, activity?.let(preStarting::launchToken), uid)
+                if (!grouped || attrs.type != 1 || !sameLaunch ||
                     !taskCurrent(request)) return
                 val owned = if (show.transaction == null) newTransaction.newInstance() else null
                 try {
                     val transaction = show.transaction ?: checkNotNull(owned)
                     val source = surfaceLayer.invoke(show.surface) as Int
-                    if (subtrees.guard(transaction, source)) {
-                        groupOwners.merge(source, request.eventNs) { old, next -> maxOf(old, next) }
-                        if (owned != null) applyTransaction.invoke(owned)
+                    synchronized(groupPublicationLock) {
+                        if (subtrees.guard(transaction, source)) {
+                            groupOwners.merge(source, request.eventNs) { old, next -> maxOf(old, next) }
+                            if (owned != null) applyTransaction.invoke(owned)
+                        } else if (owned != null) subtrees.discardPublication(owned)
                     }
                 } finally { if (owned != null) closeTransaction.invoke(owned) }
                 return
@@ -976,6 +1187,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     } else {
                         val cleanup = Active(envelope.service, envelope.context, request)
                         cleanup.taskId = blockedTask
+                        cleanup.task = task
                         cleanup.snapshotBlocked = true
                         releaseSnapshotAfterDetach(cleanup)
                     }
@@ -994,9 +1206,11 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 val owned = if (show.transaction == null) newTransaction.newInstance() else null
                 try {
                     val publication = show.transaction ?: checkNotNull(owned)
-                    if (subtrees.guard(publication, surfaceLayer.invoke(show.surface) as Int)) {
-                        groupOwners.merge(surfaceLayer.invoke(show.surface) as Int, request.eventNs) { old, next -> maxOf(old, next) }
-                        if (owned != null) applyTransaction.invoke(owned)
+                    synchronized(groupPublicationLock) {
+                        if (subtrees.guard(publication, surfaceLayer.invoke(show.surface) as Int)) {
+                            groupOwners.merge(surfaceLayer.invoke(show.surface) as Int, request.eventNs) { old, next -> maxOf(old, next) }
+                            if (owned != null) applyTransaction.invoke(owned)
+                        } else if (owned != null) subtrees.discardPublication(owned)
                     }
                 } finally { if (owned != null) closeTransaction.invoke(owned) }
                 surfacesChanged()
@@ -1033,6 +1247,9 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                         earlyPublications[layer] = request.eventNs
                         earlyPublications.entries.removeIf { now - it.value > SESSION_NS }
                     }
+                    if (show.leash >= 0) preStarting.opening(request.leash, width, height)?.use { preview ->
+                        if (surfaceLayer.invoke(preview.surface) == layer) rememberRegisteredPreview(preview, request)
+                    }
                     report(Log.INFO, "${if (owned == null) "show" else "created"} primed " +
                         "leash=${request.leash} layer=$layer")
                     surfacesChanged()
@@ -1054,9 +1271,126 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         return access.call(display, "getRotation") == 0 && access.call(display, "getBounds") == frame
     }
 
+    /** WM lock held: prove the physical parent uses the same unrotated fullscreen coordinates. */
+    private fun closingArea(task: Any, parent: Any, width: Int, height: Int): Any? {
+        val taskSurface = access.field(task, "mSurfaceControl") ?: return null
+        if (!isValid(taskSurface) || !isLayer(parent, surfaceLayer.invoke(taskSurface) as Int)) return null
+        val display = access.call(task, "getDisplayContent") ?: return null
+        val area = access.call(task, "getTaskDisplayArea") ?: return null
+        val bounds = Rect(0, 0, width, height)
+        if (access.call(area, "getDisplayContent") !== display ||
+            access.call(task, "getWindowingMode") != 1 || access.call(task, "getBounds") != bounds ||
+            access.call(area, "getBounds") != bounds || access.call(display, "getBounds") != bounds ||
+            access.call(display, "getRotation") != 0) return null
+        val surface = access.field(area, "mSurfaceControl") ?: return null
+        if (!isValid(surface) || isLayer(surface, surfaceLayer.invoke(taskSurface) as Int)) return null
+        return copySurface.newInstance(surface, "Genie.central.closing-area")
+    }
+
+    /** Revalidate the published OEM producer, while binding only the current fullscreen Activity. */
+    private fun lookupRegisteredPreview(service: Any, request: Request, grant: RegisteredGrant,
+                                        pinned: RegisteredCloseIdentity?): Snapshot? {
+        val registered = grant.identity
+        fun reject(reason: String): Snapshot? {
+            report(Log.DEBUG, "registered close lookup rejected leash=${request.leash} task=${request.taskId} " +
+                "parent=${request.containerLayer} token=${registered.token} producer=${registered.producerLayer} " +
+                "buffer=${registered.bufferLayer} reason=$reason")
+            return null
+        }
+        if (request.leash != registered.parentLayer || request.containerLayer < 0 ||
+            !grant.allowsClose(request.eventNs, request.geometry[2], request.geometry[3]))
+            return reject("request-domain-or-epoch")
+        preStarting.prepare()
+        val lock = access.field(service, "mGlobalLock") ?: return reject("missing-wm-lock")
+        return synchronized(lock) {
+            val windows = access.field(service, "mWindowMap") as? Map<*, *> ?: return@synchronized reject("missing-windows")
+            val candidates = windows.values.mapNotNull { window ->
+                window ?: return@mapNotNull null
+                if (access.field(window, "mRemoved") == true || access.field(window, "mViewVisibility") != 0)
+                    return@mapNotNull null
+                val attrs = access.field(window, "mAttrs") as? WindowManager.LayoutParams ?: return@mapNotNull null
+                if (attrs.type !in 1..3 || attrs.packageName == LAUNCHER ||
+                    attrs.flags and WindowManager.LayoutParams.FLAG_SECURE != 0) return@mapNotNull null
+                val activity = access.field(window, "mActivityRecord") ?: return@mapNotNull null
+                val task = access.call(window, "getTask") ?: return@mapNotNull null
+                if (access.call(activity, "getTask") !== task || access.field(task, "mTaskId") != request.taskId)
+                    return@mapNotNull null
+                val parent = access.field(task, "mSurfaceControl")?.takeIf {
+                    isLayer(it, request.containerLayer) } ?: return@mapNotNull null
+                val info = access.field(activity, "info") as? android.content.pm.ActivityInfo ?: return@mapNotNull null
+                val uid = info.applicationInfo?.uid ?: return@mapNotNull null
+                if (uid / 100000 != registered.userId ||
+                    (attrs.type != 3 && access.field(window, "mOwnerUid") != uid)) return@mapNotNull null
+                val token = access.field(activity, "token") ?: return@mapNotNull null
+                val content = if (access.field(window, "mHasSurface") == true)
+                    access.field(window, "mWinAnimator")?.let { access.field(it, "mSurfaceControl") }
+                        ?.takeIf(::isValid) else null
+                Candidate(window, parent, content, activity, task, token, request.taskId, uid, attrs.type)
+            }
+            val selected = candidates.firstOrNull { it.type == 1 } ?: candidates.firstOrNull()
+            val activity = pinned?.activity ?: selected?.activity ?: return@synchronized reject("task-parent-or-window")
+            val task = pinned?.task ?: checkNotNull(selected).task
+            val activityToken = access.field(activity, "token") ?: return@synchronized reject("activity-token")
+            val uid = (access.field(activity, "info") as? android.content.pm.ActivityInfo)?.applicationInfo?.uid
+                ?: return@synchronized reject("activity-uid")
+            if (access.call(activity, "getTask") !== task || access.field(task, "mTaskId") != request.taskId ||
+                !isLayer(access.field(task, "mSurfaceControl"), request.containerLayer) || uid / 100000 != registered.userId)
+                return@synchronized reject("task-parent-or-user")
+            if (candidates.any { it.activity !== activity || it.activityToken !== activityToken ||
+                    it.task !== task || it.uid != uid }) return@synchronized reject("ambiguous-activity")
+            val frame = Rect(0, 0, registered.width, registered.height)
+            // An already pinned OEM producer can outlive its starting WindowState.
+            // Empty discovery cannot replace that capability with a later main window.
+            if ((selected != null && access.call(selected.window, "getFrame") != frame) ||
+                !identityDomain(activity, task, frame, registered.width, registered.height))
+                return@synchronized reject("window-domain")
+            if (preStarting.launchToken(activity) != registered.token)
+                return@synchronized reject("launch-token current=${preStarting.launchToken(activity)}")
+            if (pinned != null && (pinned.grant !== grant || pinned.activityToken !== activityToken ||
+                    pinned.taskId != request.taskId || pinned.uid != uid))
+                return@synchronized reject("pinned-owner-changed")
+            if (!subtrees.previewReady(task)) return@synchronized reject("composed-output-pending")
+            val starting = candidates.filter { it.type == 3 && it.content != null &&
+                access.call(it.window, "getFrame") == frame &&
+                contentSize(it) == (registered.width to registered.height) }
+            val startingWindow = access.field(activity, "mStartingWindow")
+            val companion = if (startingWindow != null) starting.singleOrNull { it.window === startingWindow }
+                else starting.singleOrNull()
+            if (companion == null && starting.isNotEmpty()) return@synchronized reject("ambiguous-starting-window")
+            val preview = preStarting.closing(registered, activity, task)
+                ?: return@synchronized reject("registered-producer-or-domain")
+            var companionCopy: Any? = null
+            var oemCopies: List<Any> = emptyList()
+            var transferred = false
+            try {
+                companionCopy = companion?.content?.let {
+                    ContentSurfaces.copy(it, "Genie.central.registered.starting", registered.width, registered.height)
+                }
+                val excluded = mutableSetOf(registered.producerLayer, registered.bufferLayer)
+                companionCopy?.let { excluded += surfaceLayer.invoke(it) as Int }
+                oemCopies = preStarting.copy(activity, task, frame,
+                    registered.width, registered.height, request.leash, excluded)
+                val companions = (listOfNotNull(companionCopy) + oemCopies).sortedBy { surfaceLayer.invoke(it) as Int }
+                val identity = pinned ?: RegisteredCloseIdentity(grant, activity, activityToken, task, request.taskId, uid)
+                Snapshot(preview.parent, preview.surface, companions, true, registered.width, registered.height,
+                    activityToken, request.taskId, uid, task, true,
+                    null, false, null, identity).also { transferred = true }
+            } finally {
+                if (!transferred) {
+                    preview.close()
+                    release(companionCopy)
+                    oemCopies.forEach(::release)
+                }
+            }
+        }
+    }
+
     /** Copies only while WM's ownership is stable, never returns borrowed surfaces. */
     private fun lookup(service: Any, request: Request,
                        preview: PreviewCloseIdentity? = closingPreviews[request.eventNs]): Snapshot? {
+        registeredClosingPreviews[request.eventNs]?.let {
+            return lookupRegisteredPreview(service, request, it.grant, it)
+        }
         preStarting.prepare()
         val lock = access.field(service, "mGlobalLock") ?: return null
         return synchronized(lock) {
@@ -1143,7 +1477,10 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
             var companionCopy: Any? = null
             var oemCopies: List<Any> = emptyList()
             var parentCopy: Any? = null
+            var closingArea: Any? = null
             try {
+                if (request.closing && request.operation == PREPARE_GROUP && group != null)
+                    closingArea = closingArea(selected.task, selected.parent, group.width, group.height)
                 parentCopy = copySurface.newInstance(selected.parent, "Genie.central.parent")
                 contentCopy = if (group != null) copySurface.newInstance(group.output, "Genie.central.group")
                 else selected.content?.let {
@@ -1177,8 +1514,8 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     size?.first ?: 0, size?.second ?: 0, selected.activityToken,
                     selected.taskId, selected.uid, selected.task,
                     size != null && identityDomain(selected.activity, selected.task, frame, size.first, size.second),
-                    group, selected.type == 1 && subtrees.prepared(primaryLayer), identity).also {
-                    parentCopy = null; contentCopy = null; companionCopy = null; group = null
+                    group, selected.type == 1 && subtrees.prepared(primaryLayer), identity, closingArea = closingArea).also {
+                    parentCopy = null; contentCopy = null; companionCopy = null; group = null; closingArea = null
                     oemCopies = emptyList()
                 }
             } finally {
@@ -1186,6 +1523,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 release(companionCopy)
                 release(contentCopy)
                 release(parentCopy)
+                release(closingArea)
                 group?.close()
             }
         }
@@ -1241,10 +1579,13 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         }
         owners.remove(current.request.eventNs)
         closingPreviews.remove(current.request.eventNs)
+        registeredClosingPreviews.remove(current.request.eventNs)
         earlyPublications.entries.removeIf { it.value == current.request.eventNs }
-        if (reason == "superseded-task" || reason == "owner-changed")
-            ContentAnimator.revokeRequest(current.nativeParent, current.request.eventNs)
-        else ContentAnimator.stopRequest(current.nativeParent, current.request.eventNs)
+        for (parent in setOf(current.nativeParent, current.request.leash).filter { it >= 0 }) {
+            if (reason == "superseded-task" || reason == "owner-changed" || reason == "local-task-return")
+                ContentAnimator.revokeRequest(parent, current.request.eventNs)
+            else ContentAnimator.stopRequest(parent, current.request.eventNs)
+        }
         releaseSnapshotAfterDetach(current)
         report(Log.INFO, "stop parent=${current.parentLayer} reason=$reason")
     }
@@ -1261,7 +1602,9 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 snapshotReleases.remove(previous.taskId)
                 return
             }
-            if (ContentAnimator.running()) handler.postDelayed({ check() }, CHECK_MS)
+            if (ContentAnimator.requestRunning(previous.request.eventNs) ||
+                groupOwners.values.any { it == previous.request.eventNs } ||
+                previous.task?.let { !subtrees.snapshotReady(it) } == true) handler.postDelayed({ check() }, CHECK_MS)
             else {
                 snapshotReleases.remove(previous.taskId)
                 snapshots.unblock(previous.taskId, previous.request.eventNs)
@@ -1279,30 +1622,40 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                 requests.values.none { it.request.eventNs == event }
         }
         if (retired.isEmpty()) return
-        if (ContentAnimator.running()) {
-            handler.postDelayed({ restoreRetiredGroups() }, CHECK_MS)
-            return
-        }
         val transaction = newTransaction.newInstance()
+        val appended = ArrayList<Int>()
         try {
-            retired.forEach { (source, event) ->
-                if (groupOwners[source] == event) {
-                    subtrees.restore(source, transaction)
-                    groupOwners.remove(source, event)
+            synchronized(groupPublicationLock) {
+                retired.forEach { (source, event) ->
+                    if (groupOwners[source] == event && !ContentAnimator.requestRunning(event)) {
+                        if (subtrees.restored(source)) groupOwners.remove(source, event)
+                        else if (!subtrees.restoring(source) && subtrees.restore(source, transaction)) appended += source
+                    }
                 }
+                if (appended.isNotEmpty()) applyTransaction.invoke(transaction)
+                else subtrees.discardPublication(transaction)
             }
-            applyTransaction.invoke(transaction)
-        } finally { closeTransaction.invoke(transaction) }
+        } catch (error: Throwable) {
+            appended.forEach(subtrees::restoreFailed)
+            report(Log.WARN, "subtree restore failed; retaining snapshot protection", error)
+        } finally {
+            closeTransaction.invoke(transaction)
+            if (retired.any { (source, event) -> groupOwners[source] == event })
+                handler.postDelayed({ restoreRetiredGroups() }, CHECK_MS)
+        }
     }
 
     override fun close() {
         if (closed) return
         closed = true
         requests.clear()
+        taskOpenEvents.clear()
         owners.clear()
         earlyPublications.clear()
         openingPreviews.clear()
         closingPreviews.clear()
+        registeredOpeningPreviews.clear()
+        registeredClosingPreviews.clear()
         ContentAnimator.stop()
         runCatching { events.close() }
         groupOwners.clear()
@@ -1330,11 +1683,15 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         val task: Any, val identityDomain: Boolean,
         val group: LiveSubtrees.Entry?, val needsGroup: Boolean,
         val previewIdentity: PreviewCloseIdentity?,
+        val registeredIdentity: RegisteredCloseIdentity? = null,
+        val closingArea: Any? = null,
     ) : AutoCloseable {
         val parentLayer = surfaceLayer.invoke(parent) as Int
         val contentLayer = content?.let { surfaceLayer.invoke(it) as Int } ?: -1
         val companionLayers = companions.map { surfaceLayer.invoke(it) as Int }
-        override fun close() { companions.forEach(::release); release(content); release(parent); group?.close() }
+        override fun close() {
+            companions.forEach(::release); release(content); release(parent); release(closingArea); group?.close()
+        }
     }
 
     private class Candidate(val window: Any, val parent: Any, val content: Any?,
@@ -1357,6 +1714,17 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
     }
 
     private class SnapshotRelease(val eventNs: Long)
+    private data class RegisteredGrant(val identity: PreStartingSurfaces.RegisteredIdentity, val openingNs: Long) {
+        fun allowsClose(eventNs: Long, width: Float, height: Float): Boolean = eventNs > openingNs &&
+            width.isFinite() && height.isFinite() && width > 0f && height > 0f &&
+            width <= identity.width + 2f && height <= identity.height + 2f &&
+            kotlin.math.abs(height - width * identity.height / identity.width) < 2f
+    }
+    private class RegisteredCloseIdentity(val grant: RegisteredGrant, val activity: Any, val activityToken: Any,
+                                         val task: Any, val taskId: Int, val uid: Int) {
+        fun sameLaunch(activity: Any?, task: Any?, token: Long?, uid: Int?): Boolean =
+            this.activity === activity && this.task === task && grant.identity.token == token && this.uid == uid
+    }
     private data class Envelope(val service: Any, val context: Context, val request: Request)
     private data class Owner(val task: Any, val uid: Int, val width: Int, val height: Int)
 
@@ -1394,7 +1762,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         const val DESCRIPTOR = "android.view.IWindowManager"
         const val TRANSACTION = 0x484841
         const val MAGIC = 0x48484131
-        const val VERSION = 4
+        const val VERSION = 5
         const val TRANSITION = 1
         const val CANCEL = 2
         const val PREPARE_PREVIEW = 3

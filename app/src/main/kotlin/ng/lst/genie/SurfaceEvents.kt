@@ -7,6 +7,8 @@ import android.util.Log
 import io.github.libxposed.api.XposedInterface
 import io.github.libxposed.api.XposedInterface.HookHandle
 import io.github.libxposed.api.XposedModule
+import java.lang.ref.WeakReference
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.locks.ReentrantLock
 
@@ -19,6 +21,7 @@ internal class SurfaceEvents(
     private val onChanged: () -> Unit,
     private val onBufferCreated: (Any) -> Unit,
     private val onSourceRemoved: (Int) -> Unit,
+    private val onTaskReturned: (TaskReturn) -> Unit,
 ) : AutoCloseable {
     data class Show(
         val surface: Any,
@@ -30,8 +33,20 @@ internal class SurfaceEvents(
         val verifiedManager: Boolean = false,
     )
 
+    data class TaskReturn(val task: Any, val activityToken: Any, val taskId: Int, val uid: Int,
+                          val parentLayer: Int, val enteredNs: Long, val leftNs: Long, val eventNs: Long)
+
+    private data class FrontVisit(val task: WeakReference<Any>, val activityToken: WeakReference<Any>,
+                                  val taskId: Int, val uid: Int,
+                                  val parentLayer: Int, val enteredNs: Long, val leftNs: Long = 0L)
+    private val frontLock = Any()
+    private val frontAreas = WeakHashMap<Any, FrontVisit>()
+    private val frontVisits = HashMap<Int, FrontVisit>()
+
     private val members = OptionalMembers()
     private val hooks = ArrayList<HookHandle>()
+    private class SourceRemoval(var clientObserved: Boolean = false, var reported: Boolean = false)
+    private val removingSources = ThreadLocal.withInitial { HashMap<Int, SourceRemoval>() }
     private data class Producer(val show: Show, val frame: Rect, val registeredNs: Long)
     private val localProducers = ConcurrentHashMap<Int, Producer>()
     private val surfaceClass = Class.forName("android.view.SurfaceControl")
@@ -71,18 +86,7 @@ internal class SurfaceEvents(
                     result
                 }
             optional("content source removal") {
-                for (destroy in animator.declaredMethods.filter { it.name == "destroySurfaceLocked" }) {
-                    hooks += module.hook(destroy)
-                        .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
-                        .setId("content-source-destroy-${destroy.parameterCount}")
-                        .intercept { chain ->
-                            val source = chain.thisObject?.let { members.field(it, "mSurfaceControl") }
-                            val id = source?.let { runCatching { layer(it) }.getOrDefault(-1) } ?: -1
-                            val result = chain.proceed()
-                            observe { if (id >= 0) onSourceRemoved(id) }
-                            result
-                        }
-                }
+                sourceRemovalEvents(animator)
             }
             creationEvents(animator)
             optional("local legacy buffer creation") {
@@ -109,12 +113,99 @@ internal class SurfaceEvents(
             for (name in listOf("finishDrawingLocked", "destroySurfaceLocked", "hide")) {
                 lifecycle(animator, name)
             }
+            optional("task return ownership") { taskFrontEvents() }
             managerEvents()
             startupEvents()
             module.log(Log.INFO, TAG, "surface lifecycle and publication observers installed")
         } catch (error: Throwable) {
             close()
             throw error
+        }
+    }
+
+    /** A completed front change is stronger than focus or an ordinary surface show. */
+    private fun taskFrontEvents() {
+        val area = Class.forName("com.android.server.wm.TaskDisplayArea", false, loader)
+        val task = Class.forName("com.android.server.wm.Task", false, loader)
+        val moved = area.getDeclaredMethod("onTaskMoved", task, Boolean::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType)
+        hooks += module.hook(moved)
+            .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+            .setId("content-task-return-owner")
+            .intercept { chain ->
+                val owner = chain.thisObject
+                val previous = owner?.let { members.field(it, "mLastLeafTaskToFrontId") } as? Int
+                val eventNs = System.nanoTime()
+                val result = chain.proceed()
+                observe {
+                    if (owner == null || previous == null ||
+                        chain.getArg(1) != true || chain.getArg(2) != false) return@observe
+                    val leaf = chain.getArg(0)?.let { members.call(it, "getTopLeafTask") } ?: return@observe
+                    val id = members.field(leaf, "mTaskId") as? Int ?: return@observe
+                    if (id < 0 || previous == id || members.field(owner, "mLastLeafTaskToFrontId") != id ||
+                        members.call(leaf, "getTaskDisplayArea") !== owner) return@observe
+                    val activity = members.call(leaf, "topRunningActivityLocked") ?: return@observe
+                    val token = members.field(activity, "token") ?: return@observe
+                    val uid = (members.field(activity, "info") as? android.content.pm.ActivityInfo)
+                        ?.applicationInfo?.uid ?: return@observe
+                    val parent = members.field(leaf, "mSurfaceControl") ?: return@observe
+                    if (!valid(parent) || layer(parent) < 0) return@observe
+                    val next = FrontVisit(WeakReference(leaf), WeakReference(token), id, uid, layer(parent), eventNs)
+                    val returned = synchronized(frontLock) {
+                        frontAreas[owner]?.takeIf { it.taskId == previous }?.let {
+                            frontVisits[it.taskId] = it.copy(leftNs = eventNs)
+                        }
+                        val old = frontVisits[id]?.takeIf { previous >= 0 && it.task.get() === leaf &&
+                            it.activityToken.get() === token &&
+                            it.uid == uid && it.parentLayer == next.parentLayer &&
+                            it.enteredNs > 0L && it.leftNs > it.enteredNs && it.leftNs < eventNs }
+                        frontAreas[owner] = next
+                        frontVisits[id] = next
+                        if (frontVisits.size > 64) frontVisits.entries.minByOrNull { it.value.enteredNs }
+                            ?.let { frontVisits.remove(it.key) }
+                        old?.let { TaskReturn(leaf, token, id, uid, next.parentLayer,
+                            it.enteredNs, it.leftNs, eventNs) }
+                    }
+                    returned?.let(onTaskReturned)
+                }
+                result
+            }
+    }
+
+    private fun sourceRemovalEvents(animator: Class<*>) {
+        for (remove in animator.declaredMethods.filter {
+            it.name == "destroySurfaceLocked" || it.name == "removeClientSurfaceWithSync"
+        }) {
+            hooks += module.hook(remove)
+                .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                .setId("content-source-remove-${remove.name}-${remove.parameterCount}")
+                .intercept { chain ->
+                    val source = chain.thisObject?.let { members.field(it, "mSurfaceControl") }
+                    val id = source?.let { runCatching { layer(it) }.getOrDefault(-1) } ?: -1
+                    val pending = if (id >= 0) removingSources.get() else null
+                    val previous = pending?.get(id)
+                    val removal = if (pending != null) previous ?: SourceRemoval().also { pending[id] = it }
+                        else null
+                    val clientRemoval = remove.name == "removeClientSurfaceWithSync"
+                    if (clientRemoval) removal?.clientObserved = true
+                    try {
+                        val result = chain.proceed()
+                        // setClientSurface replaces the retained producer through
+                        // removeClientSurfaceWithSync without destroying its window.
+                        // Report after the old source is detached, before the caller
+                        // installs its successor. Nested destroy hooks report it once.
+                        if (removal != null && !removal.reported && (clientRemoval || !removal.clientObserved)) {
+                            removal.reported = true
+                            observe { onSourceRemoved(id) }
+                        }
+                        result
+                    } finally {
+                        if (pending != null && previous == null) {
+                            pending.remove(id)
+                            if (pending.isEmpty()) removingSources.remove()
+                        }
+                    }
+                }
         }
     }
 
@@ -400,6 +491,7 @@ internal class SurfaceEvents(
         hooks.asReversed().forEach { runCatching { it.unhook() } }
         hooks.clear()
         localProducers.clear()
+        synchronized(frontLock) { frontAreas.clear(); frontVisits.clear() }
     }
 
     private companion object { const val TAG = "Genie.SurfaceEvents" }
