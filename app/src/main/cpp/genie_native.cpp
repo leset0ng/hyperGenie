@@ -772,7 +772,19 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
         // unavailable, the original App keeps its entire stock transaction.
         if(!is_icon && snapshot.transition.closing && (snapshot.transition.task_id>=0 || prestart) &&
            (!genie::CloneAnimationParameters(parameters,&owned_parameters) ||
-            !IndependentParameters(parameters,owned_parameters.Reference()))) return;
+            !IndependentParameters(parameters,owned_parameters.Reference()))) {
+            // This epoch cannot publish its closing host. Keep a later icon
+            // callback from admitting it through the previous opening owner.
+            std::lock_guard<std::mutex> lock(g_mutex);
+            for(auto& source:g_last) if(source.valid &&
+                source.transition.event_ns==snapshot.transition.event_ns &&
+                source.transition.leash_layer==layer && source.animation_id==animation_id) {
+                source.supported=false;
+                source.retry_pending=false;
+                break;
+            }
+            return;
+        }
         if(!is_icon && !snapshot.admitted && (snapshot.transition.task_id>=0 || prestart)) {
             if(!g_icon_ready.load(std::memory_order_acquire) || !g_start || !g_adjust || !g_host_commit) return;
             // Reserve this generation across the synchronous Binder call. An

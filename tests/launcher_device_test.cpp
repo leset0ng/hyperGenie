@@ -608,6 +608,51 @@ void CheckOwnedHostDomains() {
               "failed or aliased parameter clones reject owned preparation before changing any OEM property");
     }
 }
+void CheckOwnedHostCloneFallback() {
+    for(bool alias:{false,true}) for(bool bound:{false,true}) {
+        PrepareOwnedFixture();publication_kind=genie::PublicationKind::NormalGroup;
+        const void* app_control=&app;const void* icon_control=&icon;
+        Param opening(2);Start(reinterpret_cast<void*>(0x5500),&app_control,opening.Reference());
+        AddChild();
+        if(bound) {
+            Param opening_icon;
+            TuneParent(reinterpret_cast<void*>(0x5510),&icon_control,opening_icon.Reference());
+        }
+        const int registrations=prepared;
+        const int64_t opening_epoch=g_last[0].transition.event_ns;
+        Check(g_last[0].admitted&&(!bound||g_icons[0].request_ns==opening_epoch),
+              "clone fallback starts with an admitted opening and an optional registered icon");
+        publication_kind=genie::PublicationKind::OwnedClosingGroup;accept_clone=alias;shallow_clone=alias;
+        Param closing(-1,78);Reverse(closing);const auto original=Properties(closing);
+        Adjust(reinterpret_cast<void*>(0x5520),&app_control,closing.Reference());
+        Check(clone_calls==1&&group_prepared==1&&queued==1&&!g_last[0].admitted&&
+              g_last[0].transition.closing&&g_last[0].transition.event_ns>opening_epoch&&
+              Properties(closing)==original&&owned_retained==0&&parameter_leases.empty()&&
+              parameters_issued==parameters_released,
+              "failed or aliased closing clone preserves stock App parameters without preparing a new group");
+        Param closing_icon(1,78),expected_icon(1,78);Reverse(closing_icon);Reverse(expected_icon);
+        if(bound) {
+            SetSpring(expected_icon.Reference(),"alpha",0,0);
+            SetVelocity(expected_icon.Reference(),"alpha",0);SetDelay(expected_icon.Reference(),"alpha",0);
+        }
+        void* transaction=reinterpret_cast<void*>(0x5530);
+        Adjust(transaction,&icon_control,closing_icon.Reference());
+        Check(prepared==registrations,
+              "failed closing clone cannot register its newer epoch through the matching icon callback");
+        Check(!g_last[0].supported&&!g_last[0].retry_pending&&
+              g_icons[0].request_ns==(bound?opening_epoch:0)&&Properties(closing_icon)==Properties(expected_icon)&&
+              alpha_writes==(bound?1:0)&&(!bound||alpha_calls.back().transaction==transaction),
+              "clone failure preserves stock icon geometry and suppresses only its previously customized buffer");
+        accept_clone=true;shallow_clone=false;
+        Param recovered(-1,79);Reverse(recovered);
+        Adjust(reinterpret_cast<void*>(0x5540),&app_control,recovered.Reference());
+        Param recovered_icon(1,79);Reverse(recovered_icon);
+        TuneParent(reinterpret_cast<void*>(0x5550),&icon_control,recovered_icon.Reference());
+        Check(group_prepared==2&&queued==2&&prepared==registrations+1&&g_last[0].admitted&&g_last[0].supported&&
+              g_icons[0].request_ns==g_last[0].transition.event_ns&&g_icons[0].animation_id==79,
+              "a newer valid closing epoch recovers group and icon admission after parameter clone failure");
+    }
+}
 void CheckOwnedHostCommit() {
     PrepareOwnedFixture();auto_host_commit=false;pause_owned_start=true;
     Param first(2);Reverse(first);const void* control=&app;
@@ -858,7 +903,7 @@ bool PrepareIcon(void*,void* surface,void* parent,int tw,int th,int ww,int wh,co
 }
 int main(){
     CheckStopSuppression();
-    CheckOwnedHostPositive();CheckOwnedHostEpochs();CheckOwnedHostDomains();CheckOwnedHostCommit();
+    CheckOwnedHostPositive();CheckOwnedHostEpochs();CheckOwnedHostDomains();CheckOwnedHostCloneFallback();CheckOwnedHostCommit();
     CheckReadbackPositive();CheckReadbackEndpoints();CheckReadbackIdentity();CheckAppReadbackIdentity();
     // An established icon must keep its App identity when another App reuses
     // the same OEM animation ID, including callbacks after its App has stopped.
