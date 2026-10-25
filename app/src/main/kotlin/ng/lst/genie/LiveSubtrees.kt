@@ -816,9 +816,10 @@ internal class LiveSubtrees(
     private fun ownedTransaction(append: (Any) -> Unit) {
         val transaction = transactionConstructor.newInstance()
         try {
-            try { append(transaction) }
-            catch (error: Throwable) { discardPublication(transaction); throw error }
-            applyTransaction.invoke(transaction)
+            try {
+                append(transaction)
+                applyTransaction.invoke(transaction)
+            } catch (error: Throwable) { discardPublication(transaction); throw error }
         }
         finally { close(transaction) }
     }

@@ -356,7 +356,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     runCatching {
                         if (primed) ContentAnimator.revokeRequest(match.parentLayer, request.eventNs)
                         synchronized(groupPublicationLock) {
-                            if (subtrees.restore(entry, publication)) applyTransaction.invoke(publication)
+                            if (subtrees.restore(entry, publication)) applySubtreePublication(publication)
                             else subtrees.discardPublication(publication)
                         }
                     }.onFailure {
@@ -721,7 +721,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                         companions, match.starting, source)
                     if (primed) groupOwners.merge(group.sourceLayer, request.eventNs) { old, next -> maxOf(old, next) }
                     else subtrees.restore(group, publication)
-                    try { applyTransaction.invoke(publication) }
+                    try { applySubtreePublication(publication) }
                     catch (error: Throwable) { subtrees.restoreFailed(group.sourceLayer); throw error }
                     primed
                 }
@@ -1075,7 +1075,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     val publication = show.transaction ?: checkNotNull(owned)
                     val guarded = subtrees.guardHideTarget(publication, outerLayer)
                     if (owned != null) {
-                        if (guarded) applyTransaction.invoke(owned)
+                        if (guarded) applySubtreePublication(owned)
                         else subtrees.discardPublication(owned)
                     }
                 } finally { if (owned != null) closeTransaction.invoke(owned) }
@@ -1122,7 +1122,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     synchronized(groupPublicationLock) {
                         if (subtrees.guard(transaction, source)) {
                             groupOwners.merge(source, request.eventNs) { old, next -> maxOf(old, next) }
-                            if (owned != null) applyTransaction.invoke(owned)
+                            if (owned != null) applySubtreePublication(owned)
                         } else if (owned != null) subtrees.discardPublication(owned)
                     }
                 } finally { if (owned != null) closeTransaction.invoke(owned) }
@@ -1209,7 +1209,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                     synchronized(groupPublicationLock) {
                         if (subtrees.guard(publication, surfaceLayer.invoke(show.surface) as Int)) {
                             groupOwners.merge(surfaceLayer.invoke(show.surface) as Int, request.eventNs) { old, next -> maxOf(old, next) }
-                            if (owned != null) applyTransaction.invoke(owned)
+                            if (owned != null) applySubtreePublication(owned)
                         } else if (owned != null) subtrees.discardPublication(owned)
                     }
                 } finally { if (owned != null) closeTransaction.invoke(owned) }
@@ -1614,6 +1614,15 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
         handler.postDelayed({ check() }, CHECK_MS)
     }
 
+    /** A rejected owned apply has no commit callback to retire its publication. */
+    private fun applySubtreePublication(transaction: Any) {
+        try { applyTransaction.invoke(transaction) }
+        catch (error: Throwable) {
+            subtrees.discardPublication(transaction)
+            throw error
+        }
+    }
+
     /** Cleanup only: no content lookup, and a newer request always keeps its group. */
     private fun restoreRetiredGroups() {
         if (closed || groupOwners.isEmpty()) return
@@ -1632,7 +1641,7 @@ internal class CentralBridge(private val module: XposedModule, loader: ClassLoad
                         else if (!subtrees.restoring(source) && subtrees.restore(source, transaction)) appended += source
                     }
                 }
-                if (appended.isNotEmpty()) applyTransaction.invoke(transaction)
+                if (appended.isNotEmpty()) applySubtreePublication(transaction)
                 else subtrees.discardPublication(transaction)
             }
         } catch (error: Throwable) {
