@@ -1,3 +1,7 @@
+# 本仓库因为有一堆神秘bug作者修不明白，所以放弃开发。
+
+---
+
 # hyperGenie
 
 A libxposed / LSPosed API 102 module integrating the recovered iOS Genie
@@ -214,13 +218,13 @@ remain outside this validation. The module remains an experimental integration.
 
 ## Requirements and scope
 
-| Item | Verified value |
-| --- | --- |
-| Runtime | Android 17 / API 37, HyperOS OS4.0.24.0.XFRCNXM, arm64-v8a |
-| Launcher | RELEASE-8.01.02.8244-260915-09172210-R |
-| Framework | LSPosed 2.2.1 (7912), API 102, HYOS-spawner support |
-| Build | compileSdk 37, NDK 30.0.14904198, CMake 3.22.1 |
-| Toolchain | AGP 9.4.1, Gradle 9.8.1, JDK 21 |
+| Item      | Verified value                                             |
+| --------- | ---------------------------------------------------------- |
+| Runtime   | Android 17 / API 37, HyperOS OS4.0.24.0.XFRCNXM, arm64-v8a |
+| Launcher  | RELEASE-8.01.02.8244-260915-09172210-R                     |
+| Framework | LSPosed 2.2.1 (7912), API 102, HYOS-spawner support        |
+| Build     | compileSdk 37, NDK 30.0.14904198, CMake 3.22.1             |
+| Toolchain | AGP 9.4.1, Gradle 9.8.1, JDK 21                            |
 
 The physical pandora / 25098PN5AC on `OS4.0.4.0.XBLCNXM` and launcher
 `RELEASE-8.01.02.8565-260918-10121010-R` also passes the runtime animation
