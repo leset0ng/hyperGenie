@@ -1843,6 +1843,254 @@ void LinkedIconCannotCrossAppOwnership() {
     std::puts("PASS a linked icon cannot migrate to another live App request");
 }
 
+void LinkedIconComposedPreviewReversal() {
+    // Reproduce the rapid-home topology: the old preview owns the icon, while
+    // a newly composed Task output explicitly retains that preview capability.
+    for(const auto& order:std::array<std::array<int,3>,6>{{
+            {{0,1,2}},{{0,2,1}},{{1,0,2}},{{1,2,0}},{{2,0,1}},{{2,1,0}}}}) {
+        auto& controller=Fresh();const auto opening=LinkedGeometry(false);
+        const auto opening_request=NowNs()-100000000LL;
+        Check(QueueSession(342,344,1120,2436,opening,false,opening_request,{},true),
+              "seed the OEM opening preview before its composed Task output exists");
+        Pump(controller);
+        controller.active->animation.Advance(.07);
+        genie::model::AdvanceScalar(&controller.active->corner,.07,1.0);
+        const auto opening_commit=PrimeTestIcon(347,346,opening,false,opening_request);
+        Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,344,opening_request);
+        controller.active->cancel_ns=NowNs()-1;
+        const auto opening_state=controller.active->animation.Scalars();
+        const auto opening_frames=controller.active->frames;
+        const auto closing=LinkedGeometry(true);const auto closing_request=NowNs();
+        auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create composed close host transaction");
+        const auto app_commit=commits.size();
+        Check(QueueSession(352,183,1120,2436,closing,true,closing_request,{342,348},false,
+                           0,0,app_transaction,reinterpret_cast<void*>(351)),
+              "prime a composed closing output with the exact old preview capability");
+        ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+        Check(controller.pending && controller.pending->primed_continuation &&
+              !Owns(*controller.pending,347) && !Owns(*controller.active,352),
+              "composed close inherits motion but awaits explicit icon registration without a reverse output capability");
+        for(size_t i=0;i<opening_state.size();++i)
+            Check(controller.pending->animation.Scalars()[i].value==opening_state[i].value &&
+                  controller.pending->animation.Scalars()[i].velocity==opening_state[i].velocity,
+                  "composed close preserves paused opening spring positions and velocities");
+        const auto app_snapshot=layer_uniforms.at(352);
+        auto* icon_transaction=ASurfaceTransaction_create();Check(icon_transaction,"create composed icon close transaction");
+        const auto icon_commit=commits.size();ResetEvents();
+        Check(PrimeLinkedIcon(icon_transaction,347,346,171,171,1120,2436,closing,true,
+                              closing_request,closing_request,183),
+              "authenticated composed close accepts its explicitly retained opening preview's icon");
+        Check(Owns(*controller.pending,347) && layer_uniforms.at(352)==app_snapshot &&
+              std::equal(app_snapshot.begin(),app_snapshot.begin()+36,layer_uniforms.at(347).begin()),
+              "icon close joins the composed snapshot without resetting or advancing its mesh");
+        Check(layer_uniforms.at(347)[40]==171 && layer_uniforms.at(347)[41]==171,
+              "composed close retains the icon's square source footprint");
+        ASurfaceTransaction_apply(icon_transaction);ASurfaceTransaction_delete(icon_transaction);
+        const std::array<size_t,3> barriers{opening_commit,app_commit,icon_commit};
+        for(size_t index=0;index<order.size();++index) {
+            ResetEvents();Commit(barriers[order[index]]);Pump(controller);
+            if(index+1<order.size()) Check(controller.pending && controller.active &&
+                controller.active->request_ns==opening_request &&
+                controller.active->frames==opening_frames && events.empty(),
+                "no commit ordering lets the old preview overwrite the new icon or starts an incomplete closing publication");
+        }
+        Check(controller.active && controller.active->layer==352 && !controller.pending &&
+              controller.overlapping.empty() && Owns(*controller.active,347) &&
+              Owns(*controller.active,342) && Owns(*controller.active,348),
+              "all publications commit into one composed closing owner with its registered preview and icon");
+        ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);
+        Check(events.size()==4 && std::all_of(events.begin(),events.end(),[&](const Event& event) {
+            return !event.clear && event.transaction==events.front().transaction;
+        }),"composed output, old previews and icon advance in one transaction after adoption");
+        Check(std::equal(layer_uniforms.at(352).begin(),layer_uniforms.at(352).begin()+36,
+                         layer_uniforms.at(347).begin()),"composed output and icon retain one live mesh");
+        Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,344,opening_request);
+        ResetEvents();Frame(controller.active->last_ns+16000000LL,&controller);
+        Check(controller.active && controller.active->request_ns==closing_request && events.size()==4,
+              "a delayed stop for the old preview cannot stop the composed closing icon");
+        Stop(controller);DrainCompletions();Check(!Running(),"composed icon reversal drains every publication and detach");
+        for(const auto& entry:references) Check(entry.second==0,"composed icon reversal releases all retained capabilities");
+    }
+    std::puts("PASS rapid-home composed preview icon reversal across every host commit order");
+}
+
+void ComposedCloseInheritsEstablishedDonor() {
+    // The real rapid-home topology after preview→content takeover: the donor is
+    // an established content owner (starting=false) on its own output layer,
+    // paused at reversal. A composed close on a new output layer carries the old
+    // previews as companions. Its first publication must inherit the donor's
+    // mesh motion instead of starting flat from zero deformation.
+    auto& controller=Fresh();const auto opening=LinkedGeometry(false);
+    const auto opening_request=NowNs()-100000000LL;
+    Check(QueueSession(340,344,1120,2436,opening,false,opening_request,{342},false),
+          "seed an established composed opening owner, not a starting preview");
+    Pump(controller);
+    Check(controller.active&&controller.active->layer==340&&!controller.active->starting,
+          "established opening owner adopted with its preview companion");
+    controller.active->animation.Advance(.07);
+    genie::model::AdvanceScalar(&controller.active->corner,.07,1.0);
+    Java_ng_lst_genie_ContentAnimator_nativeStopRequest(nullptr,nullptr,344,opening_request);
+    controller.active->cancel_ns=NowNs()-1;
+    const auto opening_state=controller.active->animation.Scalars();
+    const auto closing=LinkedGeometry(true);const auto closing_request=NowNs();
+    auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create established-donor close transaction");
+    const auto app_commit=commits.size();
+    Check(QueueSession(352,183,1120,2436,closing,true,closing_request,{342,348},false,
+                       0,0,app_transaction,reinterpret_cast<void*>(351)),
+          "prime the composed close on a new output while its established donor is paused");
+    ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+    Check(controller.pending&&controller.pending->layer==352&&controller.pending->primed_continuation,
+          "a new-output composed close inherits the established donor instead of starting flat");
+    for(size_t i=0;i<opening_state.size();++i)
+        Check(controller.pending->animation.Scalars()[i].value==opening_state[i].value &&
+              controller.pending->animation.Scalars()[i].velocity==opening_state[i].velocity,
+              "established-donor close preserves every spring position and velocity");
+    Commit(app_commit);Pump(controller);
+    Stop(controller);DrainCompletions();Check(!Running(),"established-donor reversal drains its publication");
+    for(const auto& entry:references) Check(entry.second==0,"established-donor reversal releases all capabilities");
+    std::puts("PASS composed close inherits an established content donor across output layers");
+}
+
+void AdjacentSameParentStreamsDoNotInherit() {
+    // Same parent, same domain, same direction, different request epochs and no
+    // shared companion: adjacent streams on one Task host must not inherit each
+    // other's donor motion merely because Related() sees their common parent.
+    auto& controller=Fresh();const auto opening=LinkedGeometry(false);
+    const auto first_request=NowNs()-100000000LL;
+    Check(QueueSession(340,344,1120,2436,opening,false,first_request,{},false),
+          "seed the first same-parent stream");
+    Pump(controller);
+    controller.active->animation.Advance(.07);
+    const auto second_request=NowNs();
+    auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create adjacent stream transaction");
+    Check(QueueSession(352,344,1120,2436,opening,false,second_request,{},false,
+                       0,0,app_transaction,nullptr),
+          "prime the adjacent same-parent stream with no shared companion");
+    ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+    Check(controller.pending&&!controller.pending->primed_continuation,
+          "same-parent adjacent streams without shared proof never inherit donor motion");
+    Commit(commits.size()-1);Pump(controller);
+    Stop(controller);DrainCompletions();Check(!Running(),"adjacent-stream rejection drains its publication");
+    for(const auto& entry:references) Check(entry.second==0,"adjacent-stream rejection releases all capabilities");
+    std::puts("PASS adjacent same-parent streams require shared stream proof");
+}
+
+void OppositeDirectionWithoutSharedProofDoesNotInherit() {
+    // A reversal on the same parent without shared preview/companion proof is
+    // not a stream continuation either: direction alone must never admit motion.
+    auto& controller=Fresh();const auto opening=LinkedGeometry(false);
+    const auto open_request=NowNs()-100000000LL;
+    Check(QueueSession(340,344,1120,2436,opening,false,open_request,{},false),
+          "seed the opposite-direction donor");
+    Pump(controller);
+    controller.active->animation.Advance(.07);
+    const auto close_request=NowNs();
+    auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create opposite-direction transaction");
+    Check(QueueSession(352,344,1120,2436,LinkedGeometry(true),true,close_request,{},false,
+                       0,0,app_transaction,nullptr),
+          "prime the opposite-direction stream with no shared companion");
+    ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+    Check(controller.pending&&!controller.pending->primed_continuation,
+          "opposite-direction streams without shared proof never inherit donor motion");
+    Commit(commits.size()-1);Pump(controller);
+    Stop(controller);DrainCompletions();Check(!Running(),"opposite-direction rejection drains its publication");
+    for(const auto& entry:references) Check(entry.second==0,"opposite-direction rejection releases all capabilities");
+    std::puts("PASS opposite-direction streams require shared stream proof");
+}
+
+std::array<float,4> ScreenQuad(const std::array<float,44>& values) {
+    float left=values[0],top=values[1],right=values[0],bottom=values[1];
+    for(size_t i=1;i<9;++i) {
+        left=std::min(left,values[i*4]);right=std::max(right,values[i*4]);
+        top=std::min(top,values[i*4+1]);bottom=std::max(bottom,values[i*4+1]);
+    }
+    return {left*1120.f,top*2436.f,right*1120.f,bottom*2436.f};
+}
+void ComposedCloseKeepsPresentedContour() {
+    // The observed 20-50ms failure: the old owner's handoff/retire dropped the
+    // icon's mask before any successor registered the same child, so the raw
+    // plate flashed until re-registration. The first closing frames must keep
+    // the mask and continue the last presented contour in screen space.
+    auto& controller=Fresh();
+    const auto opening=LinkedGeometry(false);
+    const auto open_request=NowNs()-100000000LL;
+    Check(QueueSession(340,344,1120,2436,opening,false,open_request,{342},false),
+          "seed the established opening owner with its shared preview");
+    Pump(controller);
+    Commit(PrimeTestIcon(347,346,opening,false,open_request));
+    Pump(controller);
+    controller.active->animation.Advance(.07);
+    genie::model::AdvanceScalar(&controller.active->corner,.07,1.0);
+    Frame(controller.active->last_ns+16000000LL,&controller);
+    Check(layer_uniforms.count(347)==1,"presented icon carries its mesh mask");
+    const auto presented=ScreenQuad(layer_uniforms.at(347));
+    const auto presented_mask=layer_uniforms.at(347);
+    ResetEvents();
+    const auto closing=LinkedGeometry(true);
+    const auto closing_request=NowNs();
+    auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create closing publication transaction");
+    const auto app_commit=commits.size();
+    Check(QueueSession(352,183,1120,2436,closing,true,closing_request,{342,348},false,
+                       0,0,app_transaction,reinterpret_cast<void*>(351)),
+          "publish the composed close on its new output before icon re-registration");
+    ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+    Commit(app_commit);Pump(controller);
+    const auto cleared=Cleared();
+    Check(std::find(cleared.begin(),cleared.end(),347)==cleared.end(),
+          "handoff keeps the presented icon mask while a live successor will present the child");
+    Check(std::find(cleared.begin(),cleared.end(),342)==cleared.end(),
+          "handoff keeps the presented preview mask while a live successor will present it");
+    Check(layer_uniforms.count(347)==1&&layer_uniforms.at(347)==presented_mask,
+          "the retained icon keeps its last presented mask, not a raw plate");
+    const auto continued=ScreenQuad(layer_uniforms.at(347));
+    auto within=[&](const std::array<float,4>& a,const std::array<float,4>& b) {
+        for(size_t i=0;i<4;++i) if(std::abs(a[i]-b[i])>8.f) return false;
+        return true;
+    };
+    Check(within(continued,presented),
+          "first closing frames continue the last presented contour in screen space");
+    Stop(controller);DrainCompletions();Check(!Running(),"contour continuity drains every publication");
+    for(const auto& entry:references) Check(entry.second==0,"contour continuity releases all capabilities");
+    std::puts("PASS closing publication keeps the presented contour with its mask in place");
+}
+
+void LinkedIconComposedPreviewProofIsolation() {
+    for(int invalid=0;invalid<8;++invalid) {
+        auto& controller=Fresh();const auto opening=LinkedGeometry(false);
+        const auto opening_request=NowNs()-100000000LL;
+        Check(QueueSession(342,344,1120,2436,opening,false,opening_request,{},true),
+              "seed the exact preview and icon before checking composed-close proof isolation");
+        Pump(controller);Commit(PrimeTestIcon(347,346,opening,false,opening_request));
+        const auto closing=LinkedGeometry(true);const auto closing_request=NowNs();
+        auto* app_transaction=ASurfaceTransaction_create();Check(app_transaction,"create composed proof test transaction");
+        const auto app_commit=commits.size();
+        Check(QueueSession(352,183,1120,2436,closing,true,closing_request,
+                           invalid==0?std::vector<jlong>{348}:std::vector<jlong>{342,348},false,
+                           0,0,app_transaction,reinterpret_cast<void*>(351)),
+              "prime a group before corrupting one required predecessor proof");
+        ASurfaceTransaction_apply(app_transaction);ASurfaceTransaction_delete(app_transaction);
+        if(invalid==1) controller.active->starting=false;
+        if(invalid==2) controller.active->texture_width=171;
+        if(invalid==3) for(auto& item:controller.pending->companions) if(item.layer==342) item.texture_width=171;
+        if(invalid==4) {
+            controller.active->cancel_ns=NowNs()-1;
+            controller.active->started_ns=NowNs()-1500000001LL;
+        }
+        auto* icon_transaction=ASurfaceTransaction_create();Check(icon_transaction,"create rejected composed icon transaction");
+        ResetEvents();const auto callbacks=commits.size();
+        Check(!PrimeLinkedIcon(icon_transaction,347,346,171,171,1120,2436,closing,true,closing_request,
+                               invalid==5?closing_request-1:closing_request,
+                               invalid==6?-1:(invalid==7?344:183)),
+              "a composed output cannot bypass an absent, expired, icon-typed, or mismatched preview/request proof");
+        Check(events.empty() && commits.size()==callbacks && Owns(*controller.active,347) &&
+              !Owns(*controller.pending,347),"invalid composed proof leaves both ownership and transaction unchanged");
+        ASurfaceTransaction_delete(icon_transaction);Commit(app_commit);Pump(controller);
+        Stop(controller);DrainCompletions();Check(!Running(),"rejected composed proof drains normal publication cleanup");
+        for(const auto& entry:references) Check(entry.second==0,"rejected composed proof leaks no capabilities");
+    }
+    std::puts("PASS composed icon transfer requires exact live preview and bridge Task/request proof");
+}
+
 void LinkedIconPendingReversalPublication() {
     auto& controller=Fresh();const auto closing=LinkedGeometry(true);
     const auto old_request=NowNs()-100000000LL;
@@ -2493,7 +2741,12 @@ int main() {
     GestureClosingSessionPublication();GestureClosingHostPublication();GesturePublicationRejectsIncompatibleGeometry();
     GroupedSourcePublication();RevokedGroupKeepsMask();GroupReplacementDoesNotBecomePreview();
     LinkedIconVisibleRetirement();LateLinkedIconSharesFrames();LinkedIconBeforeAppHandoff();LinkedIconPublicationCancellation();
-    LinkedIconSeedLosesToAppPublication();LinkedIconCannotCrossAppOwnership();
+    LinkedIconSeedLosesToAppPublication();LinkedIconCannotCrossAppOwnership();LinkedIconComposedPreviewReversal();
+    ComposedCloseInheritsEstablishedDonor();
+    ComposedCloseKeepsPresentedContour();
+    AdjacentSameParentStreamsDoNotInherit();
+    OppositeDirectionWithoutSharedProofDoesNotInherit();
+    LinkedIconComposedPreviewProofIsolation();
     LinkedIconPendingReversalPublication();LinkedIconSelectsPendingPublication();
     LinkedIconWholeOwnerPublication();LinkedIconAppCommitOrders();WorkerCoalescencePreservesPrimedSnapshot();
     LinkedIconCannotReviveCancelledRequest();LinkedIconReversalEpochIsolation();

@@ -245,12 +245,25 @@ bool Related(const Session& a, const Session& b) {
             [&](const Companion& companion) {return Owns(b,companion.layer);});
 }
 
+// Stream-continuity proof weaker than Related(): shared registered preview or
+// companion ownership. Same-parent adjacency alone is never proof — adjacent
+// streams on one Task host must stay independent.
+bool SharedCompanionOwnership(const Session& a,const Session& b) {
+    return Owns(a,b.layer) || Owns(b,a.layer) ||
+        std::any_of(a.companions.begin(),a.companions.end(),
+            [&](const Companion& companion) {return Owns(b,companion.layer);}) ||
+        std::any_of(b.companions.begin(),b.companions.end(),
+            [&](const Companion& companion) {return Owns(a,companion.layer);});
+}
+
 bool OpeningPaused(const Session& session,int64_t now) {
     return !session.closing && session.cancel_ns>0 && now>=session.cancel_ns;
 }
 
 bool PausedOpeningExpired(const Session& session,int64_t now) {
-    return !session.closing && session.cancel_ns>0 && now-session.started_ns>=1500000000LL;
+    // Symmetric: a paused donor expires for both directions, so a stale
+    // closing donor can never seed an arbitrarily late successor.
+    return session.cancel_ns>0 && now-session.started_ns>=1500000000LL;
 }
 
 bool LiveOwner(const Controller& controller, const Session& retiring, int32_t layer,
@@ -262,6 +275,22 @@ bool LiveOwner(const Controller& controller, const Session& retiring, int32_t la
     if(owns(controller.active) || owns(controller.pending)) return true;
     return std::any_of(controller.overlapping.begin(),controller.overlapping.end(),owns) ||
         std::any_of(controller.queued.begin(),controller.queued.end(),owns);
+}
+
+// A live successor from the same surface lineage will present this child: its
+// last mask survives the handoff instead of exposing the raw CLAMP/texture
+// plate. Only the final retirement (no successor) clears icon/preview masks.
+bool MaskSuccessor(const Controller& controller, const Session& retiring,
+                   const Session* preserve) {
+    auto related=[&](const Session* session) {
+        return session && session!=&retiring && session->request_ns>0 &&
+            (Related(*session,retiring)||Related(retiring,*session));
+    };
+    if(related(preserve)) return true;
+    auto matches=[&](const std::unique_ptr<Session>& session) {return related(session.get());};
+    return matches(controller.active)||matches(controller.pending)||
+        std::any_of(controller.overlapping.begin(),controller.overlapping.end(),matches)||
+        std::any_of(controller.queued.begin(),controller.queued.end(),matches);
 }
 
 bool Committed(const Session& session) {
@@ -376,8 +405,9 @@ bool Submit(Controller& controller, Session& session, bool detach,
         // visibility under its mask-free host. An icon's virtual crop is taller
         // than its texture, so clearing SELF would expose its CLAMP backplate.
         // Freeze its last mask until a successor overwrites it or it is removed.
+        const bool freeze=session.preserve_preview_masks||MaskSuccessor(controller,session,preserve);
         for(const auto& companion:session.companions)
-            if(!(session.preserve_preview_masks && (companion.starting || companion.texture_width>0)))
+            if(!(freeze && (companion.starting || companion.texture_width>0)))
                 clear(companion.surface,companion.layer);
         if(!cleared) {
             if(!supplied && !frame) ASurfaceTransaction_delete(transaction);
@@ -496,7 +526,8 @@ void DetachLostSurfaces(Controller& controller,const Session& previous,const Ses
     bool cleared=false;
     for(const auto& item:surfaces) {
         if(item.layer==previous.layer && previous.unwarped_layer>=0) continue;
-        if(previous.preserve_preview_masks && (item.starting || item.texture_width>0)) continue;
+        if((previous.preserve_preview_masks || MaskSuccessor(controller,previous,&next)) &&
+           (item.starting || item.texture_width>0)) continue;
         if(item.layer>=0 && !LiveOwner(controller,previous,item.layer,&next)) {
             ClearSurface(transaction,item.surface);
             cleared=true;
@@ -1168,7 +1199,16 @@ static bool QueueSession(jlong surface,jlong parent,int width,int height,
         const double delta=static_cast<double>(now-event_ns)/1e9;
         if(previous && !PausedOpeningExpired(*previous,now) && previous->width==width && previous->height==height &&
            (previous->layer==next->layer || previous->request_ns==event_ns ||
-            previous->starting || next->starting)) {
+            previous->starting || next->starting ||
+            (previous->request_ns<event_ns &&
+             (SameRequestDomain(*previous,*next) ||
+              SharedCompanionOwnership(*previous,*next))))) {
+            // A composed close can land on a fresh output layer after the
+            // preview→content takeover, while its established donor is paused
+            // on the old output. Shared stream proof ties them; direction alone
+            // never admits motion. Keep that donor's motion through the closing
+            // registration commit.
+
             const auto& current=*previous;
             const auto requested_corner=next->corner;
             next->animation=current.animation;
@@ -1329,9 +1369,10 @@ static bool PrimeLinkedIcon(void* transaction,jlong surface,jlong parent,int tex
             auto conflicting=[&](const std::unique_ptr<Session>& owner) {
                 if(!owner || owner.get()==current || !Owns(*owner,layer) ||
                    SameRequestDomain(*owner,*current)) return false;
-                // A registered preview handoff can change both primary and
-                // parent. Require explicit App-primary capabilities in both
-                // directions; a shared icon or unrelated preview is not proof.
+                // An ordinary preview handoff can change primary and parent.
+                // Require App-primary capabilities in both directions unless
+                // a composed Task output proves the exact preview below; a
+                // shared icon or unrelated preview is never sufficient.
                 const auto includes_app_primary=[](const Session& holder,const Session& app) {
                     return app.texture_width==0 &&
                         std::any_of(holder.companions.begin(),holder.companions.end(),
@@ -1339,10 +1380,26 @@ static bool PrimeLinkedIcon(void* transaction,jlong surface,jlong parent,int tex
                                 return companion.layer==app.layer && companion.texture_width==0;
                             });
                 };
+                // A composed close is authenticated against the live Task and
+                // carries exact preview capabilities from that same launch.
+                // Its output was just created: an older preview cannot already
+                // hold a reciprocal capability for this new output. Require the
+                // real grouped source, explicit old primary, and the bridge's
+                // current Task/request proof instead of that impossible edge.
+                const bool composed_preview=current->unwarped_layer>=0 && current->closing &&
+                    !owner->closing && owner->starting && !PausedOpeningExpired(*owner,now) &&
+                    source_request_ns==event_ns && source_parent_layer>=0 &&
+                    source_parent_layer==current->parent_layer && includes_app_primary(*current,*owner);
                 const bool predecessor=owner->request_ns<current->request_ns &&
                     owner->width==width && owner->height==height &&
                     (owner->layer==current->layer || owner->parent_layer==current->parent_layer ||
-                     (includes_app_primary(*owner,*current) && includes_app_primary(*current,*owner)));
+                     (includes_app_primary(*owner,*current) && includes_app_primary(*current,*owner)) ||
+                     composed_preview);
+                if(!predecessor) __android_log_print(ANDROID_LOG_WARN,kTag,
+                    "icon conflict layer=%d owner=%d parent=%d request=%lld next=%d parent=%d request=%lld grouped=%d source=%d/%lld",
+                    layer,owner->layer,owner->parent_layer,static_cast<long long>(owner->request_ns),
+                    current->layer,current->parent_layer,static_cast<long long>(current->request_ns),
+                    current->unwarped_layer>=0,source_parent_layer,static_cast<long long>(source_request_ns));
                 return !predecessor;
             };
             if(conflicting(controller->active) || conflicting(controller->pending) ||

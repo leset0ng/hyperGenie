@@ -176,6 +176,12 @@ struct IconBuffer {
     void* listener=nullptr;
     bool closing=false;
     bool readback_logged=false;
+    // Set when an exact completed closing generation lands over an older
+    // binding: the retained child converges to that real landed endpoint.
+    bool landed=false;
+    // Last generation whose morph mask was re-primed without a full
+    // registration; bounds the stop/close-observation re-primes.
+    int64_t mask_epoch=0;
 };
 std::array<IconBuffer,16> g_icons{};
 size_t g_next_icon=0;
@@ -253,6 +259,21 @@ const Last* CurrentReadbackSource(const IconBuffer& icon) {
     return CurrentReadbackSource(icon.source_leash,icon.animation_id,icon.request_ns,icon.closing);
 }
 
+const Last* LandedReadbackSource(const IconBuffer& icon) {
+    // Caller holds g_mutex. An exact completed closing generation owns its
+    // true landed endpoint for a bounded window, even when that generation
+    // never acquired render admission. The geometry is real, never invented.
+    if(!icon.landed || icon.request_ns<=0 || !icon.closing ||
+       !icon.surface || icon.surface!=icon.readback_child || !icon.parent_control) return nullptr;
+    const Last* latest=nullptr;
+    for(const auto& source:g_last) if(source.transition.leash_layer==icon.source_leash &&
+        (!latest || source.transition.event_ns>latest->transition.event_ns)) latest=&source;
+    if(!latest || latest->transition.event_ns!=icon.request_ns ||
+       latest->animation_id!=icon.animation_id || !latest->transition.closing ||
+       latest->transition.event_ns>Now() || Now()-latest->transition.event_ns>=1500000000LL) return nullptr;
+    return latest;
+}
+
 const Last* CurrentReadbackSource(const AppReadback& app) {
     if(!app.control || app.layer<0 || app.layer!=app.source_leash) return nullptr;
     return CurrentReadbackSource(app.source_leash,app.animation_id,app.request_ns,app.closing);
@@ -327,6 +348,7 @@ void HomeParams(void* listener,const void* parameters,int32_t id) {
             }
             if(!normalize) for(auto& icon:g_icons) if(icon.listener==listener) {
                 const auto* current=CurrentReadbackSource(icon);
+                if(!current) current=LandedReadbackSource(icon);
                 if(!current || !CurrentListener(icon.parent_control,icon.parent,listener)) continue;
                 normalize=true;kind="icon";
                 parent=icon.parent;source=icon.source_leash;request=icon.request_ns;
@@ -388,6 +410,8 @@ void* BlastUpdate(void* queue,const void* reference,uint32_t width,uint32_t heig
                 entry->listener=nullptr;
                 entry->closing=false;
                 entry->readback_logged=false;
+                entry->landed=false;
+                entry->mask_epoch=0;
                 genie::RetainIconSurface(entry->surface,entry);
             }
             entry->parent=parent;entry->width=width;entry->height=height;
@@ -673,6 +697,96 @@ bool ValidPublication(const genie::GroupPublication& publication,const Last& sou
     }
 }
 
+// While the App's synchronous prepare owns this generation, freeze the host
+// at its presented viewport/crop. The incoming OEM springs start at the gesture
+// presentation: pinning end=start and clearing motion keeps the live mesh
+// exactly where it is. Never touch alpha here. The hold is only the prepare
+// gap: once the generation is older than that, the normal closing springs run
+// from the same presented start so the motion continues without a hard cut.
+void HoldPresentedSprings(void* parameters,bool gap_expired=false,
+                          const genie::model::Rect* motion_end=nullptr) {
+    for(const char* key:kViewportSprings) {
+        const auto spring=Spring(parameters,key);
+        if(!spring.valid || !std::isfinite(spring.start)) continue;
+        SetSpring(parameters,key,spring.start,spring.start);
+        SetVelocity(parameters,key,0);
+        SetDelay(parameters,key,0);
+    }
+    if(gap_expired && motion_end && motion_end->width>0 && motion_end->height>0) {
+        const auto width=Spring(parameters,"width"),height=Spring(parameters,"height");
+        if(width.valid && height.valid) {
+            SetSpring(parameters,"width",width.start,motion_end->width);
+            SetSpring(parameters,"height",height.start,motion_end->height);
+            const auto x=Spring(parameters,"centerX"),y=Spring(parameters,"centerY");
+            SetSpring(parameters,"centerX",x.start,motion_end->left+motion_end->width/2);
+            SetSpring(parameters,"centerY",y.start,motion_end->top+motion_end->height/2);
+        }
+    }
+}
+// The real prepare gap is tens of milliseconds; a failed generation must not
+// freeze the host for the whole close.
+constexpr int64_t kHoldGapNs=150000000LL;
+// The OEM animation stop drops the custom morph mask from its surfaces. When a
+// close is observed but its registration cannot arrive, re-prime the mask for
+// the established custom icon in this same transaction: the presented morph
+// survives the close and animates toward the landed square instead of exposing
+// the raw CLAMP plate. The icon keeps its existing binding; this is a mask
+// continuity action, not a new registration.
+// Only the canonical BBQ child of this parent may be re-primed; a malformed
+// or foreign buffer entry must never reach registration.
+bool ValidIconChild(const IconBuffer& icon) {
+    int child_parent=-1;
+    return g_name && std::sscanf(g_name(icon.surface).c_str(),"[BBQ] FloatingIcon_all#%d",&child_parent)==1 &&
+        child_parent==icon.parent;
+}
+void ReprimeIconMask(void* transaction,const Last& snapshot,int32_t animation_id) {
+    if(!transaction || !g_icon_ready.load(std::memory_order_acquire) ||
+       !snapshot.transition.closing) return;
+    IconBuffer lease;void* parent=nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(auto& icon:g_icons) if(icon.surface && icon.surface==icon.readback_child &&
+            icon.parent_control && ValidIconChild(icon) && icon.source_leash==snapshot.transition.leash_layer &&
+            icon.request_ns>0 && icon.width>0 && icon.height>0 &&
+            icon.mask_epoch!=snapshot.transition.event_ns &&
+            g_layer(icon.parent_control)==icon.parent && g_layer(icon.surface)>=0) {
+            lease=icon;parent=icon.parent_control;
+            genie::RetainIconSurface(lease.surface,&lease);
+            break;
+        }
+    }
+    if(!lease.surface) return;
+    const auto& geometry=snapshot.transition.geometry;
+    const genie::model::Rect window=snapshot.window.width>0?snapshot.window:
+        genie::model::Rect{geometry[0],geometry[1],geometry[2],geometry[3]};
+    genie::PrepareIcon(transaction,lease.surface,parent,lease.width,lease.height,
+        static_cast<int>(window.width),static_cast<int>(window.height),snapshot.transition);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(auto& current:g_icons) if(current.surface==lease.surface &&
+            current.parent==lease.parent && current.mask_epoch!=snapshot.transition.event_ns) {
+            current.mask_epoch=snapshot.transition.event_ns;
+            current.animation_id=animation_id;
+        }
+    }
+    genie::ReleaseIconSurface(lease.surface,&lease);
+}
+// Failed-generation hold: freeze inside the real prepare gap, otherwise let
+// the closing springs run from the same presented start toward the landed
+// viewport so the motion never freezes for the whole close.
+void HoldForGeneration(void* parameters,const Last& snapshot) {
+    const auto& geometry=snapshot.transition.geometry;
+    const size_t small=snapshot.transition.closing?4:0;
+    const size_t full=snapshot.transition.closing?0:4;
+    const genie::model::Rect icon{geometry[small],geometry[small+1],geometry[small+2],geometry[small+3]};
+    const genie::model::Rect window=snapshot.window.width>0?snapshot.window:
+        genie::model::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
+    genie::model::Rect minimized;
+    if(Now()-snapshot.transition.event_ns>=kHoldGapNs &&
+       genie::model::HostViewportForIcon(icon,window,&minimized))
+        HoldPresentedSprings(parameters,true,&minimized);
+    else HoldPresentedSprings(parameters,false);
+}
 void TuneParent(void* transaction,const void* surface,const void* parameters) {
     const Config config=ReadConfig();
     if (!config.enabled || !config.content || !parameters) return;
@@ -746,9 +860,42 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 }
             }
         }
-        if(!snapshot.valid || snapshot.preparing ||
+        if(snapshot.valid && snapshot.preparing) {
+            // Another callback owns this generation's synchronous prepare.
+            // Hold the presented parent/icon viewport; a bare OEM close spring
+            // must never drive a host whose mesh is not re-registered yet.
+            ReprimeIconMask(transaction,snapshot,animation_id);
+            HoldPresentedSprings(const_cast<void*>(parameters));
+            return;
+        }
+        if(!snapshot.valid ||
            (!snapshot.supported && !snapshot.retry_pending) ||
            (!is_icon && snapshot.animation_id!=animation_id)) {
+            // A failed close generation keeps an already customized icon on
+            // its presented viewport instead of the alpha0 clone suppression.
+            // A stopped App's old clone still retires through that suppression.
+            bool hold_generation=!is_icon && snapshot.valid && snapshot.transition.closing &&
+                (!snapshot.supported && !snapshot.retry_pending);
+            if(is_icon && !hold_generation) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(const auto& icon:g_icons) {
+                    if(!(icon.surface && icon.surface==icon.readback_child && icon.parent==layer &&
+                         icon.request_ns>0 && icon.source_leash>=0)) continue;
+                    for(const auto& source:g_last) if(source.valid &&
+                        source.transition.leash_layer==icon.source_leash &&
+                        source.transition.event_ns>=icon.request_ns && source.transition.event_ns<=Now() &&
+                        source.transition.closing &&
+                        (source.preparing || (!source.supported && !source.retry_pending))) {
+                        hold_generation=true;break;
+                    }
+                    if(hold_generation) break;
+                }
+            }
+            if(hold_generation) {
+                ReprimeIconMask(transaction,snapshot,animation_id);
+                HoldForGeneration(const_cast<void*>(parameters),snapshot);
+                return;
+            }
             SuppressBoundIconFallback(transaction,surface,parameters,"source-not-ready");
             return;
         }
@@ -775,14 +922,25 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             !IndependentParameters(parameters,owned_parameters.Reference()))) {
             // This epoch cannot publish its closing host. Keep a later icon
             // callback from admitting it through the previous opening owner.
-            std::lock_guard<std::mutex> lock(g_mutex);
-            for(auto& source:g_last) if(source.valid &&
-                source.transition.event_ns==snapshot.transition.event_ns &&
-                source.transition.leash_layer==layer && source.animation_id==animation_id) {
-                source.supported=false;
-                source.retry_pending=false;
-                break;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                for(auto& source:g_last) if(source.valid &&
+                    source.transition.event_ns==snapshot.transition.event_ns &&
+                    source.transition.leash_layer==layer && source.animation_id==animation_id) {
+                    source.supported=false;
+                    source.retry_pending=false;
+                    break;
+                }
             }
+            // This failed generation keeps its presented host frozen too;
+            // the bare OEM close spring must not drive it on this callback.
+            ReprimeIconMask(transaction,snapshot,animation_id);
+            HoldForGeneration(const_cast<void*>(parameters),snapshot);
+            // An unanchored pre-start close has no Task event to supersede the
+            // live opening on the server. Cancel is ordering only: it stops the
+            // stale opening session without dispatching any render admission.
+            if(snapshot.transition.task_id<0)
+                genie::QueueCancel(layer,snapshot.transition.event_ns);
             return;
         }
         if(!is_icon && !snapshot.admitted && (snapshot.transition.task_id>=0 || prestart)) {
@@ -818,7 +976,14 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             if(result==genie::GroupPreparation::Ready && !ValidPublication(publication,snapshot,control)) {
                 genie::QueueCancel(snapshot.transition.leash_layer,snapshot.transition.event_ns);
                 result=genie::GroupPreparation::Rejected;
+            } else if(result!=genie::GroupPreparation::Ready && snapshot.transition.closing &&
+                      snapshot.transition.task_id<0) {
+                // See the clone-failure path above: without a Task anchor the
+                // server never learns this close exists, so its stale opening
+                // would keep publishing. Cancel carries ordering only.
+                genie::QueueCancel(snapshot.transition.leash_layer,snapshot.transition.event_ns);
             }
+            bool hold_pending=false,abort_generation=false;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 bool current=false;
@@ -834,7 +999,17 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
                 }
                 // A nested newer generation owns the host now. Its publication
                 // guards also reject the obsolete transaction merged by Binder.
-                if(!current || result!=genie::GroupPreparation::Ready) return;
+                hold_pending=current && snapshot.transition.closing && result!=genie::GroupPreparation::Ready;
+                abort_generation=!current || result!=genie::GroupPreparation::Ready;
+            }
+            if(abort_generation) {
+                // A pending close keeps its presented viewport until its
+                // publication lands; stock close springs must not run it.
+                if(hold_pending) {
+                    ReprimeIconMask(transaction,snapshot,animation_id);
+                    HoldForGeneration(const_cast<void*>(parameters),snapshot);
+                }
+                return;
             }
             prepared_now=true;
         }
@@ -1135,27 +1310,92 @@ void SuppressStoppedIcons(void* transaction,const void* control,int32_t animatio
             static_cast<long long>(icon.request_ns),animation_id);
     }
 }
+// Re-prime the established custom icon's morph mask for a generation going
+// down. The OEM's animation stop resets that mask; this call must run after
+// the reset in the same transaction to survive it. The icon keeps its existing
+// binding unless a completed close lands it.
+void ReprimeStoppedIcon(void* transaction,const Last& completed,int32_t source_id,bool landed_retarget) {
+    // A null transaction still carries the landed retarget semantics; the
+    // previous in-completion re-prime accepted it and PrepareIcon passes it
+    // through unchanged.
+    if(!g_icon_ready.load(std::memory_order_acquire)) return;
+    IconBuffer lease;void* parent=nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(auto& icon:g_icons) if(icon.surface && icon.surface==icon.readback_child &&
+            icon.parent_control && ValidIconChild(icon) && icon.source_leash==source_id && icon.request_ns>0 &&
+            icon.width>0 && icon.height>0 &&
+            icon.request_ns<=completed.transition.event_ns &&
+            g_layer(icon.parent_control)==icon.parent && g_layer(icon.surface)>=0) {
+            lease=icon;parent=icon.parent_control;
+            genie::RetainIconSurface(lease.surface,&lease);
+            break;
+        }
+    }
+    if(!lease.surface) return;
+    const auto& geometry=completed.transition.geometry;
+    const size_t full=completed.transition.closing?0:4;
+    const genie::model::Rect window=completed.window.width>0?completed.window:
+        genie::model::Rect{geometry[full],geometry[full+1],geometry[full+2],geometry[full+3]};
+    genie::PrepareIcon(transaction,lease.surface,parent,lease.width,lease.height,
+        static_cast<int>(window.width),static_cast<int>(window.height),completed.transition);
+    if(landed_retarget && completed.transition.closing) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(auto& current:g_icons) if(current.surface==lease.surface &&
+            current.parent==lease.parent && current.request_ns<completed.transition.event_ns) {
+            current.request_ns=completed.transition.event_ns;
+            current.animation_id=completed.animation_id;
+            current.closing=true;
+            current.readback_logged=false;
+            current.landed=true;
+        }
+    }
+    genie::ReleaseIconSurface(lease.surface,&lease);
+}
 void* Stop(void* transaction,const void* surface,int32_t animation_id) {
+    // The OEM stop resets the custom morph mask on the animation's surfaces,
+    // so run it first and let every retained re-prime land on top of that
+    // reset. The OEM may stop the source and its icon parent in either order;
+    // covering both surfaces means the last reset in the batch cannot expose
+    // the raw CLAMP plate before the next generation takes over.
+    void* result=g_stop(transaction,surface,animation_id);
     if (surface && g_layer) {
         const void* control=*static_cast<const void* const*>(surface);
         SuppressStoppedIcons(transaction,control,animation_id);
         const int32_t id=control?g_layer(control):-1;
         bool cancel=false;
         {
-            std::lock_guard<std::mutex> lock(g_mutex);
+            std::unique_lock<std::mutex> lock(g_mutex);
             // Icon buffers share the central App owner's lifetime. An icon's
             // stock completion must not cancel or detach that shared mesh.
             for(auto& slot:g_last) {
                 if(slot.valid && slot.transition.leash_layer==id && slot.animation_id==animation_id) {
+                    const Last completed=slot;
                     slot.valid=false;
                     cancel=true;
+                    lock.unlock();
+                    ReprimeStoppedIcon(transaction,completed,id,true);
+                    lock.lock();
+                    break;
+                }
+            }
+            if(!cancel) for(auto& icon:g_icons) {
+                if(!(icon.surface && icon.surface==icon.readback_child && icon.parent==id &&
+                     icon.source_leash>=0 && icon.request_ns>0)) continue;
+                for(const auto& slot:g_last) if(slot.transition.leash_layer==icon.source_leash &&
+                    slot.animation_id==animation_id && slot.transition.event_ns>=icon.request_ns &&
+                    slot.transition.event_ns>0) {
+                    const Last completed=slot;
+                    lock.unlock();
+                    ReprimeStoppedIcon(transaction,completed,icon.source_leash,false);
+                    lock.lock();
                     break;
                 }
             }
         }
         if(cancel) genie::QueueCancel(id,Now());
     }
-    return g_stop(transaction,surface,animation_id);
+    return result;
 }
 void Install(void* handle) {
     if (!handle || g_installed.exchange(true)) return;

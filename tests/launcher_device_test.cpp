@@ -23,6 +23,8 @@ static void ObserveAlpha(ASurfaceTransaction* transaction,ASurfaceControl* surfa
 #undef ASurfaceTransaction_setBufferAlpha
 namespace {
 int assertions=0, prepared=0, retained=0, released=0, queued=0, cancelled=0, local_cancels=0;
+int32_t cancel_layer=-1;int64_t cancel_epoch=0;
+std::vector<int> stop_prime_order;
 int preview_prepared=0,group_prepared=0;
 int parent_retained=0,parent_released=0,home_calls=0,set_callback_calls=0;
 int owned_retained=0,owned_released=0,publication_issued=0,publication_released=0;
@@ -161,6 +163,7 @@ void* StockAdjust(void* transaction,const void* surface,const void* parameters) 
 }
 uint64_t TransactionId(void* transaction){return reinterpret_cast<uintptr_t>(transaction);}
 void* StockStop(void* transaction,const void* surface,int32_t id) {
+    stop_prime_order.push_back(0);
     StockAnimation('X',transaction,surface,nullptr);animation_calls.back().animation_id=id;return transaction;
 }
 void ReleasePublication(const void* control,const void* owner) {
@@ -215,6 +218,8 @@ void Reset() {
     g_home_params=StockHome;g_set_callback=StockSetCallback;g_blast_update=StockBlast;g_icon_ready=true;
     g_listener_vtable=listener_table.data();g_params_vtable=params_table.data();
     alpha_writes=prepared=retained=released=queued=cancelled=local_cancels=0;
+    stop_prime_order.clear();
+    cancel_layer=-1;cancel_epoch=0;
     suppressed=nullptr;alpha_calls.clear();accept=true;reenter_replace=false;
     preview_prepared=group_prepared=0;accept_preview=accept_group=true;defer_group=false;
     publication_kind=genie::PublicationKind::NormalGroup;publication_host=&owned_host;
@@ -257,6 +262,13 @@ void CheckStock(const Param& parameters) {
     const void* reference=&parameters.ref;
     Check(Spring(reference,"ratio").start!=Spring(reference,"ratio").end,"rejected preparation preserves OEM aspect animation");
     Check(g_last[0].host_transaction_id==0&&!g_last[0].supported,"rejected source cannot publish a custom viewport");
+}
+void CheckHeld(const Param& parameters) {
+    const void* reference=&parameters.ref;
+    Check(Spring(reference,"ratio").start==Spring(reference,"ratio").end,"pending close holds its presented aspect instead of the OEM close spring");
+    Check(Spring(reference,"width").start==Spring(reference,"width").end&&
+          Spring(reference,"width").velocity==0,"pending close holds its presented viewport");
+    Check(g_last[0].host_transaction_id==0&&!g_last[0].supported,"held close still publishes no custom viewport");
 }
 void BindReadback(bool closing=true,bool registered=true,bool callback_ready=true,bool app_registered=true) {
     Reset();if(!registered)icon.listener=nullptr;
@@ -601,11 +613,20 @@ void CheckOwnedHostDomains() {
           "disabling the feature stops owned-host routing even for an already admitted epoch");
     for(bool alias:{false,true}) {
         PrepareOwnedFixture();accept_clone=alias;shallow_clone=alias;
-        Param source(2);Reverse(source);const auto original=Properties(source);
+        Param source(2);Reverse(source);
+        const auto original_alpha=Spring(source.Reference(),"alpha");
         Start(reinterpret_cast<void*>(0x5100),&control,source.Reference());
         Check(clone_calls==1&&group_prepared==0&&animation_calls.size()==1&&animation_calls[0].control==&app&&
-              Properties(source)==original&&owned_retained==0&&parameters_issued==parameters_released&&parameter_leases.empty(),
-              "failed or aliased parameter clones reject owned preparation before changing any OEM property");
+              owned_retained==0&&parameters_issued==parameters_released&&parameter_leases.empty(),
+              "failed or aliased parameter clones reject owned preparation and never enter a custom host");
+        Check(Spring(source.Reference(),"alpha").start==original_alpha.start&&
+              Spring(source.Reference(),"alpha").end==original_alpha.end,
+              "failed closing clone leaves non-viewport OEM properties untouched");
+        for(const char* key:{"centerX","width","ratio","cornerTLX"}) {
+            const auto spring=Spring(source.Reference(),key);
+            Check(spring.valid&&spring.start==spring.end&&spring.velocity==0&&spring.delay==0,
+                  "failed closing clone holds the presented viewport/crop instead of the bare OEM close spring");
+        }
     }
 }
 void CheckOwnedHostCloneFallback() {
@@ -623,32 +644,43 @@ void CheckOwnedHostCloneFallback() {
         Check(g_last[0].admitted&&(!bound||g_icons[0].request_ns==opening_epoch),
               "clone fallback starts with an admitted opening and an optional registered icon");
         publication_kind=genie::PublicationKind::OwnedClosingGroup;accept_clone=alias;shallow_clone=alias;
-        Param closing(-1,78);Reverse(closing);const auto original=Properties(closing);
+        Param closing(-1,78);Reverse(closing);const auto original_alpha=Spring(closing.Reference(),"alpha");
         Adjust(reinterpret_cast<void*>(0x5520),&app_control,closing.Reference());
         Check(clone_calls==1&&group_prepared==1&&queued==1&&!g_last[0].admitted&&
               g_last[0].transition.closing&&g_last[0].transition.event_ns>opening_epoch&&
-              Properties(closing)==original&&owned_retained==0&&parameter_leases.empty()&&
+              owned_retained==0&&parameter_leases.empty()&&
               parameters_issued==parameters_released,
-              "failed or aliased closing clone preserves stock App parameters without preparing a new group");
-        Param closing_icon(1,78),expected_icon(1,78);Reverse(closing_icon);Reverse(expected_icon);
-        if(bound) {
-            SetSpring(expected_icon.Reference(),"alpha",0,0);
-            SetVelocity(expected_icon.Reference(),"alpha",0);SetDelay(expected_icon.Reference(),"alpha",0);
+              "failed or aliased closing clone never prepares a new group or enters a custom host");
+        Check(Spring(closing.Reference(),"alpha").start==original_alpha.start&&
+              Spring(closing.Reference(),"alpha").end==original_alpha.end,
+              "failed closing clone leaves non-viewport App properties untouched");
+        for(const char* key:{"centerX","width","ratio","cornerTLX"}) {
+            const auto spring=Spring(closing.Reference(),key);
+            Check(spring.valid&&spring.start==spring.end&&spring.velocity==0&&spring.delay==0,
+                  "failed closing clone holds the App presented viewport/crop");
         }
+        Param closing_icon(1,78),expected_icon(1,78);Reverse(closing_icon);Reverse(expected_icon);
         void* transaction=reinterpret_cast<void*>(0x5530);
         Adjust(transaction,&icon_control,closing_icon.Reference());
-        Check(prepared==registrations,
-              "failed closing clone cannot register its newer epoch through the matching icon callback");
+        Check(prepared==registrations+(bound?1:0),
+              "the failed closing clone re-primes only the established icon mask and never registers through the icon callback");
         Check(!g_last[0].supported&&!g_last[0].retry_pending&&
-              g_icons[0].request_ns==(bound?opening_epoch:0)&&Properties(closing_icon)==Properties(expected_icon)&&
-              alpha_writes==(bound?1:0)&&(!bound||alpha_calls.back().transaction==transaction),
-              "clone failure preserves stock icon geometry and suppresses only its previously customized buffer");
+              g_icons[0].request_ns==(bound?opening_epoch:0)&&alpha_writes==0&&!suppressed,
+              "failed clone generation never hides its established custom icon");
+        if(bound) {
+            for(const char* key:{"centerX","width","ratio","cornerTLX"}) {
+                const auto spring=Spring(closing_icon.Reference(),key);
+                Check(spring.valid&&spring.start==spring.end&&spring.velocity==0&&spring.delay==0,
+                      "failed clone generation holds the established icon's presented viewport/crop");
+            }
+        } else Check(Properties(closing_icon)==Properties(expected_icon),
+              "clone failure preserves stock icon geometry when no custom buffer exists");
         accept_clone=true;shallow_clone=false;
         Param recovered(-1,79);Reverse(recovered);
         Adjust(reinterpret_cast<void*>(0x5540),&app_control,recovered.Reference());
         Param recovered_icon(1,79);Reverse(recovered_icon);
         TuneParent(reinterpret_cast<void*>(0x5550),&icon_control,recovered_icon.Reference());
-        Check(group_prepared==2&&queued==2&&prepared==registrations+1&&g_last[0].admitted&&g_last[0].supported&&
+        Check(group_prepared==2&&queued==2&&prepared==registrations+(bound?2:1)&&g_last[0].admitted&&g_last[0].supported&&
               g_icons[0].request_ns==g_last[0].transition.event_ns&&g_icons[0].animation_id==79,
               "a newer valid closing epoch recovers group and icon admission after parameter clone failure");
     }
@@ -817,14 +849,21 @@ void CheckStopSuppression() {
             case 31:g_layer=nullptr;break;
             case 32:g_name=nullptr;break;
             case 33:malformed_child.name="Unrelated buffer";
-                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;break;
-            case 34:g_icons[0].surface=g_icons[0].readback_child=&app;break;
+                // A buffer replacement resets request_ns; a forged pointer swap
+                // must model the same binding invalidation to stay faithful.
+                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;
+                g_icons[0].request_ns=0;break;
+            case 34:g_icons[0].surface=g_icons[0].readback_child=&app;
+                g_icons[0].request_ns=0;break;
             case 35:malformed_child.id=icon.id;
-                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;break;
+                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;
+                g_icons[0].request_ns=0;break;
             case 36:malformed_child.id=app.id;
-                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;break;
+                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;
+                g_icons[0].request_ns=0;break;
             case 37:malformed_child.id=owned_host.id;
-                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;break;
+                g_icons[0].surface=g_icons[0].readback_child=&malformed_child;
+                g_icons[0].request_ns=0;break;
         }
         ClearStopObservations();Stop(transaction,surface,id);
         Check(alpha_calls.empty()&&alpha_writes==0&&animation_calls.size()==1&&
@@ -858,7 +897,7 @@ bool CloneAnimationParameters(const void* reference,AnimationParameters* output)
     parameter_leases.emplace_back(copy.release(),&output->object);++parameters_issued;return true;
 }
 void QueueTransition(const Transition&){++queued;}
-void QueueCancel(int32_t,int64_t){++cancelled;}
+void QueueCancel(int32_t layer,int64_t event_ns){++cancelled;cancel_layer=layer;cancel_epoch=event_ns;}
 bool WarmIconRenderer(){return true;}
 void RetainIconSurface(void* surface,const void*) {
     if(surface==&child||surface==&new_child)++retained;
@@ -893,7 +932,11 @@ GroupPreparation PrepareContentGroupStatus(void*,void*,genie::model::Rect*,const
 }
 bool PrepareIcon(void*,void* surface,void* parent,int tw,int th,int ww,int wh,const Transition& transition) {
     prepared_transition=transition;
-    ++prepared;Check(surface==&child&&parent==&icon,"central registration uses exact retained capabilities");
+    stop_prime_order.push_back(1);
+    ++prepared;Check(std::any_of(g_icons.begin(),g_icons.end(),
+        [&](const IconBuffer& entry){return entry.surface==surface&&g_layer&&parent&&
+            entry.parent==g_layer(parent);}),
+        "central registration uses exact retained capabilities");
     Check(tw==171&&th==171&&ww==1120&&wh==2436,"central registration preserves texture/window domains");
     const bool unlocked=g_mutex.try_lock();Check(unlocked,"no launcher registry lock crosses Binder");
     if(unlocked)g_mutex.unlock();Check(retained==released+1,"independent lease held during RPC");
@@ -976,6 +1019,18 @@ int main(){
         }
         const int prior_prepared=prepared;
         TuneParent(reinterpret_cast<void*>(0x9090),&bound_icon_control,fallback_icon.Reference());
+        if(fallback==1) {
+            // The synchronous prepare gap holds the presented viewport/crop;
+            // it never hides the icon and never republishes its mesh.
+            Check(prepared==prior_prepared&&alpha_writes==0&&!suppressed,
+                  "the prepare gap never hides parent/icon and never republishes its mesh");
+            for(const char* key:{"centerX","width","ratio","cornerTLX"}) {
+                const auto spring=Spring(fallback_icon.Reference(),key);
+                Check(spring.valid&&spring.start==spring.end&&spring.velocity==0&&spring.delay==0,
+                      "the prepare gap holds presented viewport/crop instead of the bare OEM spring");
+            }
+            continue;
+        }
         Check(prepared==prior_prepared&&Properties(fallback_icon)==Properties(expected_icon),
               "fallback changes only alpha of an established custom icon and never republishes its mesh");
         Check(alpha_writes==(customized?1:0),
@@ -1041,6 +1096,20 @@ int main(){
     Param closing_icon;Reverse(closing_icon);
     TuneParent(reinterpret_cast<void*>(0x789a),&icon_control,closing_icon.Reference());
     Check(prepared==2&&alpha_writes==0,"reused close keeps paired icon on the custom route");
+    {
+        const auto& geometry=g_last[0].transition.geometry;
+        const auto rect=[](Param& p) {
+            const float w=Spring(p.Reference(),"width").start,h=Spring(p.Reference(),"height").start;
+            return std::array<float,4>{Spring(p.Reference(),"centerX").start-w/2,
+                Spring(p.Reference(),"centerY").start-h/2,w,h};
+        };
+        const auto app_rect=rect(reused_close),icon_rect=rect(closing_icon);
+        Check(app_rect[0]==geometry[0]&&app_rect[1]==geometry[1]&&
+              app_rect[2]==geometry[2]&&app_rect[3]==geometry[3],
+              "first closing host transform starts at the donor-presented request rect");
+        Check(icon_rect==app_rect,
+              "icon and App host transforms share one screen-space start at closing publication");
+    }
 
     Reset();AnchorPrestart();accept_preview=false;Param rejected_preview(2);
     Observe(&prestart_control,rejected_preview.Reference(),false);
@@ -1052,13 +1121,96 @@ int main(){
     Observe(&prestart_control,rejected_group.Reference(),false);
     TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,rejected_group.Reference());
     Check(preview_prepared==0&&group_prepared==1&&queued==0,"failed closing group never attempts opening preview or publishes geometry");
-    CheckStock(rejected_group);
+    CheckHeld(rejected_group);
 
     Reset();Param unanchored_close(2);Reverse(unanchored_close);
     Observe(&prestart_control,unanchored_close.Reference(),false);
     TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,unanchored_close.Reference());
     Check(preview_prepared==0&&group_prepared==1&&queued==0,"unanchored pre-start close requires a verified group instead of publishing unprepared geometry");
-    CheckStock(unanchored_close);
+    CheckHeld(unanchored_close);
+    Check(cancelled==1&&cancel_layer==prestart.id&&cancel_epoch==g_last[0].transition.event_ns,
+          "unanchored pre-start close cancels the stale opening session with its exact epoch and no render dispatch");
+    Reset();Param unanchored_open(2);
+    Observe(&prestart_control,unanchored_open.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,unanchored_open.Reference());
+    Check(queued==1&&cancelled==0&&g_last[0].supported,"an unanchored opening admission never cancels its own publication");
+    AddChild();Param established_custom_icon;
+    TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,established_custom_icon.Reference());
+    Check(prepared==1&&alpha_writes==0,"the unanchored opening establishes its custom icon before the failed close");
+    Param clone_unready(2);Reverse(clone_unready);accept_clone=false;
+    Observe(&prestart_control,clone_unready.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x2345),&prestart_control,clone_unready.Reference());
+    Check(prepared==2,
+          "the close observation re-primes the established icon mask when no closing registration can arrive");
+    Check(prepared_transition.event_ns==g_last[0].transition.event_ns,
+          "the mask re-prime carries the presented closing contour basis");
+    Check(g_icons[0].request_ns<g_last[0].transition.event_ns,
+          "the mask re-prime preserves the existing binding until a real registration");
+    Param late_custom_icon;Reverse(late_custom_icon);
+    TuneParent(reinterpret_cast<void*>(0x3456),&icon_control,late_custom_icon.Reference());
+    Check(alpha_writes==0&&!suppressed,
+          "an established custom icon in a failed close generation never takes the alpha0 hide");
+    CheckHeld(late_custom_icon);
+    CheckHeld(clone_unready);
+    Param second_app_callback(2);Reverse(second_app_callback);
+    TuneParent(reinterpret_cast<void*>(0x3567),&prestart_control,second_app_callback.Reference());
+    CheckHeld(second_app_callback);
+    Check(alpha_writes==0&&!suppressed,
+          "second and later App host callbacks in a failed close generation hold, never run bare springs");
+    Check(cancelled==1&&cancel_layer==prestart.id&&cancel_epoch==g_last[0].transition.event_ns&&
+          group_prepared==0&&queued==1&&!g_last[0].supported,
+          "a failed closing parameter clone still supersedes the live opening ordering on an unanchored pre-start leash");
+    const auto close_epoch=g_last[0].transition.event_ns;
+    const int before_land=prepared;
+    Stop(nullptr,&prestart_control,77);
+    Check(prepared==before_land+1,
+          "landing re-primes the retained child inside the same completion");
+    Check(g_icons[0].request_ns==close_epoch&&g_icons[0].closing&&g_icons[0].landed,
+          "the retained child basis targets the landed closing epoch immediately");
+    HomePayload landed_payload;HomeParams(&icon_listener,landed_payload.bytes.data(),88);
+    Check(home_pointer!=landed_payload.bytes.data()&&home_bytes==HiddenReadback(landed_payload,{},0),
+          "post-landing readback is the true landed square, not deferred to a later registration");
+    Check(prepared==before_land+1,
+          "no later unrelated registration participates in the landing convergence");
+    Reset();Param stop_seed(2);Seed(stop_seed);AddChild();
+    Param stop_icon;TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,stop_icon.Reference());
+    Check(prepared==1,"established icon is registered before the opening stop");
+    const int before_stop=prepared;
+    Stop(nullptr,&app_control,77);
+    Check(prepared==before_stop+1,
+          "the opening stop re-primes the established icon mask in its own transaction");
+    Reset();Param batch_open(2);Seed(batch_open);AddChild();
+    Param batch_icon;TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,batch_icon.Reference());
+    Check(prepared==1,"established icon before the OEM stop batch");
+    const int before_batch=prepared;stop_prime_order.clear();
+    Stop(nullptr,&icon_control,77);
+    Check(prepared==before_batch+1,
+          "the icon-parent stop re-primes the established icon mask before any close generation arrives");
+    Check(stop_prime_order==std::vector<int>({0,1}),
+          "the icon mask re-prime lands after the OEM stop in the same transaction");
+    Reset();AnchorPrestart();accept_group=false;defer_group=true;Param pending_close(2);Reverse(pending_close);
+    Observe(&prestart_control,pending_close.Reference(),false);
+    TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,pending_close.Reference());
+    Check(g_last[0].retry_pending&&!g_last[0].admitted&&queued==0&&
+          Spring(pending_close.Reference(),"width").start==Spring(pending_close.Reference(),"width").end&&
+          Spring(pending_close.Reference(),"width").velocity==0&&
+          Spring(pending_close.Reference(),"ratio").start==Spring(pending_close.Reference(),"ratio").end&&
+          Spring(pending_close.Reference(),"cornerTLX").start==Spring(pending_close.Reference(),"cornerTLX").end,
+          "a deferred pending close holds its presented viewport and crop until its publication lands");
+    Reset();Param gap_source(2);Seed(gap_source);AddChild();
+    Param gap_app;Reverse(gap_app);Param gap_icon;Reverse(gap_icon);
+    { std::lock_guard<std::mutex> lock(g_mutex); g_last[0].preparing=true; }
+    const void* gap_app_control=&app;
+    TuneParent(reinterpret_cast<void*>(0x1234),&gap_app_control,gap_app.Reference());
+    const void* gap_icon_control=&icon;
+    TuneParent(reinterpret_cast<void*>(0x2345),&gap_icon_control,gap_icon.Reference());
+    Check(alpha_writes==0&&!suppressed,
+          "the synchronous prepare gap never hides the presented parent or icon");
+    for(auto* held:{&gap_app,&gap_icon}) for(const char* key:{"centerX","width","ratio","cornerTLX"}) {
+        const auto spring=Spring(held->Reference(),key);
+        Check(spring.valid&&spring.start==spring.end&&spring.velocity==0&&spring.delay==0,
+              "the prepare gap holds parent and icon presented viewport instead of the bare OEM close spring");
+    }
 
     Reset();Param fresh_preview(2);
     Observe(&prestart_control,fresh_preview.Reference(),false);
@@ -1075,7 +1227,7 @@ int main(){
     Check(g_last[0].adjusting&&g_last[0].transition.closing,"higher-ID reverse callback retains continuation dynamics");
     Check(preview_prepared==1&&group_prepared==1&&queued==1&&!g_last[0].admitted,
           "a reversal cannot borrow the opening preview's admission when its own group is unavailable");
-    CheckStock(reversal);
+    CheckHeld(reversal);
     Control shell{41,"Surface(name=Task=7#11)/@test_transition-leash#41"};
     const void* shell_control=&shell;
     Reset();accept_group=false;Param not_ready(2);
