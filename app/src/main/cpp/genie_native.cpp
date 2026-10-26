@@ -15,7 +15,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -784,7 +786,9 @@ void HoldForGeneration(void* parameters,const Last& snapshot) {
     genie::model::Rect minimized;
     if(Now()-snapshot.transition.event_ns>=kHoldGapNs &&
        genie::model::HostViewportForIcon(icon,window,&minimized))
-        HoldPresentedSprings(parameters,true,&minimized);
+        // Release toward the content's own icon-side endpoint (the landed
+        // square), never the virtual-crop fit.
+        HoldPresentedSprings(parameters,true,&icon);
     else HoldPresentedSprings(parameters,false);
 }
 void TuneParent(void* transaction,const void* surface,const void* parameters) {
@@ -1081,11 +1085,25 @@ void TuneParent(void* transaction,const void* surface,const void* parameters) {
             }
         }
         const genie::model::Rect original_start{geometry[0],geometry[1],geometry[2],geometry[3]};
-        const auto start=snapshot.adjusting?snapshot.presentation_start:
-            (snapshot.transition.closing?original_start:minimized);
-        const auto end=snapshot.transition.closing?minimized:window;
-        SetSpring(parameters,"centerX",start.left+start.width/2,end.left+end.width/2);
-        SetSpring(parameters,"centerY",start.top+start.height/2,end.top+end.height/2);
+        const genie::model::Rect original_end{geometry[4],geometry[5],geometry[6],geometry[7]};
+        // The icon face must morph along the content's exact rect path: the
+        // request's declared start/end rects ARE the content's endpoints. The
+        // icon's virtual crop is texture padding, never a morph endpoint.
+        // Both faces are drawn by the same SF routine from their AnimTarget's
+        // live rect springs, so the icon's springs mirror the content's choice
+        // exactly — including the preserved presentation on an adjust.
+        const auto start=snapshot.adjusting?snapshot.presentation_start:original_start;
+        const auto end=snapshot.transition.closing?original_end:window;
+        // The icon's rect centre composes as centerY + centerYOffset, and that
+        // offset keeps the glyph aligned inside the face. Compensate the
+        // spring instead of clearing the offset: the face lands on the
+        // content's rect while the glyph placement stays intact.
+        const float center_x_offset=Fixed(parameters,"centerXOffset");
+        const float center_y_offset=Fixed(parameters,"centerYOffset");
+        SetSpring(parameters,"centerX",start.left+start.width/2-center_x_offset,
+                                   end.left+end.width/2-center_x_offset);
+        SetSpring(parameters,"centerY",start.top+start.height/2-center_y_offset,
+                                   end.top+end.height/2-center_y_offset);
         SetSpring(parameters,"width",start.width,end.width);
         SetSpring(parameters,"height",start.height,end.height);
         const float aspect=window.height/window.width;
@@ -1310,6 +1328,113 @@ void SuppressStoppedIcons(void* transaction,const void* control,int32_t animatio
             static_cast<long long>(icon.request_ns),animation_id);
     }
 }
+// Deferred mask re-assertion. The OEM stop only flags the layer state; SF
+// tears the mask down inside its own snapshot passes (the stop flag even
+// overwrites the mask fields from the parent snapshot), so a re-prime merged
+// into the stop's own transaction survives only when the pass order happens
+// to favor it. A batch stop or an asynchronous stop transaction can land
+// later and wipe it. Re-assert the mask from standalone transactions after
+// the caller's stop transaction has applied: the deferred write lands in a
+// later SF pass than every teardown of that batch. The window is bounded and
+// the action is idempotent; a newer generation's registration retires the
+// keeper immediately. This is a kill switch, not a correctness knob: the
+// deferred path must stay inert only when the whole module is not installed.
+constexpr int64_t kReprimeKeeperWindowNs=150000000LL;
+constexpr int64_t kReprimeKeeperTickNs=30000000LL;
+bool g_keeper_enabled=false;
+struct KeeperRequest {
+    bool active=false;
+    void* surface=nullptr;
+    void* parent_control=nullptr;
+    int32_t parent=-1;
+    int32_t source_leash=-1;
+    int width=0,height=0;
+    genie::model::Rect window{};
+    genie::Transition transition{};
+    int64_t event_ns=0;
+    int64_t deadline_ns=0;
+};
+std::mutex g_keeper_mutex;
+std::condition_variable g_keeper_cv;
+KeeperRequest g_keeper;
+
+void DisarmReprimeKeeper() {
+    std::lock_guard<std::mutex> lock(g_keeper_mutex);
+    g_keeper.active=false;
+}
+void ArmReprimeKeeper(const IconBuffer& icon,const genie::model::Rect& window,
+                      const genie::Transition& transition,int64_t event_ns) {
+    if(!g_keeper_enabled) return;
+    {
+        std::lock_guard<std::mutex> lock(g_keeper_mutex);
+        g_keeper.active=true;
+        g_keeper.surface=icon.surface;
+        g_keeper.parent_control=icon.parent_control;
+        g_keeper.parent=icon.parent;
+        g_keeper.source_leash=icon.source_leash;
+        g_keeper.width=icon.width;
+        g_keeper.height=icon.height;
+        g_keeper.window=window;
+        g_keeper.transition=transition;
+        g_keeper.event_ns=event_ns;
+        g_keeper.deadline_ns=Now()+kReprimeKeeperWindowNs;
+    }
+    g_keeper_cv.notify_all();
+}
+void ReprimeKeeperApply() {
+    KeeperRequest request;
+    {
+        std::lock_guard<std::mutex> lock(g_keeper_mutex);
+        if(!g_keeper.active || !g_keeper_enabled) return;
+        request=g_keeper;
+    }
+    if(Now()>=request.deadline_ns) {DisarmReprimeKeeper();return;}
+    IconBuffer lease;void* parent=nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for(auto& icon:g_icons) if(icon.surface && icon.surface==request.surface &&
+            icon.surface==icon.readback_child && icon.parent==request.parent &&
+            icon.source_leash==request.source_leash && icon.parent_control && ValidIconChild(icon) &&
+            icon.request_ns>0 && icon.request_ns<=request.event_ns && icon.width>0 && icon.height>0 &&
+            g_layer(icon.parent_control)==icon.parent && g_layer(icon.surface)>=0) {
+            lease=icon;parent=icon.parent_control;
+            genie::RetainIconSurface(lease.surface,&lease);
+            break;
+        }
+    }
+    // The armed generation is gone or a newer one took over: retire silently.
+    if(!lease.surface) {DisarmReprimeKeeper();return;}
+    // Standalone transaction: its pass cannot share the OEM stop's teardown
+    // ordering, and only the caller of this apply releases the commit listener.
+    if(ASurfaceTransaction* standalone=ASurfaceTransaction_create()) {
+        genie::PrepareIcon(standalone,lease.surface,parent,lease.width,lease.height,
+            static_cast<int>(request.window.width),static_cast<int>(request.window.height),
+            request.transition);
+        ASurfaceTransaction_apply(standalone);
+        ASurfaceTransaction_delete(standalone);
+    }
+    genie::ReleaseIconSurface(lease.surface,&lease);
+}
+void ReprimeKeeperThread() {
+    for(;;) {
+        {
+            std::unique_lock<std::mutex> lock(g_keeper_mutex);
+            g_keeper_cv.wait(lock,[]{return g_keeper.active;});
+        }
+        // The first tick waits for the caller's stop transaction to apply; the
+        // bounded repeats outlive a late batch member's asynchronous teardown.
+        while(true) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(kReprimeKeeperTickNs));
+            bool active=false;
+            {
+                std::lock_guard<std::mutex> lock(g_keeper_mutex);
+                active=g_keeper.active && Now()<g_keeper.deadline_ns;
+            }
+            if(!active) break;
+            ReprimeKeeperApply();
+        }
+    }
+}
 // Re-prime the established custom icon's morph mask for a generation going
 // down. The OEM's animation stop resets that mask; this call must run after
 // the reset in the same transaction to survive it. The icon keeps its existing
@@ -1350,6 +1475,7 @@ void ReprimeStoppedIcon(void* transaction,const Last& completed,int32_t source_i
             current.landed=true;
         }
     }
+    ArmReprimeKeeper(lease,window,completed.transition,completed.transition.event_ns);
     genie::ReleaseIconSurface(lease.surface,&lease);
 }
 void* Stop(void* transaction,const void* surface,int32_t animation_id) {
@@ -1492,6 +1618,10 @@ void Install(void* handle) {
     std::thread([] {
         g_icon_ready.store(genie::WarmIconRenderer(),std::memory_order_release);
     }).detach();
+    // The deferred mask keeper exists only in the hooked launcher process;
+    // its worker is started here so unhooked test builds stay deterministic.
+    g_keeper_enabled=true;
+    std::thread(ReprimeKeeperThread).detach();
     __android_log_print(ANDROID_LOG_INFO,kTag,"central Genie launcher hooks installed pid=%d uid=%d",getpid(),getuid());
 }
 void OnLoaded(const char* name,void* handle) {

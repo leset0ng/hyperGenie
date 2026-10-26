@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 static int alpha_writes=0;
+static int deferred_applies=0;
 static ASurfaceControl* suppressed=nullptr;
 struct AlphaWrite {ASurfaceTransaction* transaction;ASurfaceControl* surface;float value;};
 static std::vector<AlphaWrite> alpha_calls;
@@ -18,9 +19,12 @@ static void ObserveAlpha(ASurfaceTransaction* transaction,ASurfaceControl* surfa
     if(value!=0) std::abort();
     ++alpha_writes;suppressed=surface;alpha_calls.push_back({transaction,surface,value});
 }
+static void ObserveApply(ASurfaceTransaction*) {++deferred_applies;}
 #define ASurfaceTransaction_setBufferAlpha ObserveAlpha
+#define ASurfaceTransaction_apply ObserveApply
 #include "../app/src/main/cpp/genie_native.cpp"
 #undef ASurfaceTransaction_setBufferAlpha
+#undef ASurfaceTransaction_apply
 namespace {
 int assertions=0, prepared=0, retained=0, released=0, queued=0, cancelled=0, local_cancels=0;
 int32_t cancel_layer=-1;int64_t cancel_epoch=0;
@@ -30,6 +34,7 @@ int parent_retained=0,parent_released=0,home_calls=0,set_callback_calls=0;
 int owned_retained=0,owned_released=0,publication_issued=0,publication_released=0;
 int clone_calls=0,parameters_issued=0,parameters_released=0;
 genie::Transition prepared_transition;
+void* prepared_transaction=nullptr;
 bool accept=true,reenter_replace=false,accept_preview=true,accept_group=true,defer_group=false;
 bool accept_clone=true,shallow_clone=false;
 genie::PublicationKind publication_kind=genie::PublicationKind::NormalGroup;
@@ -226,6 +231,8 @@ void Reset() {
     owned_retained=owned_released=publication_issued=publication_released=0;publication_leases.clear();
     clone_calls=parameters_issued=parameters_released=0;accept_clone=true;shallow_clone=false;parameter_leases.clear();
     prepared_transition={};
+    prepared_transaction=nullptr;deferred_applies=0;
+    DisarmReprimeKeeper();g_keeper_enabled=false;
     parent_retained=parent_released=home_calls=set_callback_calls=0;
     home_pointer=nullptr;home_listener=nullptr;home_id=0;home_bytes={};
     setter_control=nullptr;setter_callback=nullptr;setter_install=nullptr;
@@ -930,8 +937,8 @@ GroupPreparation PrepareContentGroupStatus(void*,void*,genie::model::Rect*,const
     }
     return defer_group ? GroupPreparation::Deferred : GroupPreparation::Rejected;
 }
-bool PrepareIcon(void*,void* surface,void* parent,int tw,int th,int ww,int wh,const Transition& transition) {
-    prepared_transition=transition;
+bool PrepareIcon(void* transaction,void* surface,void* parent,int tw,int th,int ww,int wh,const Transition& transition) {
+    prepared_transition=transition;prepared_transaction=transaction;
     stop_prime_order.push_back(1);
     ++prepared;Check(std::any_of(g_icons.begin(),g_icons.end(),
         [&](const IconBuffer& entry){return entry.surface==surface&&g_layer&&parent&&
@@ -1188,6 +1195,71 @@ int main(){
           "the icon-parent stop re-primes the established icon mask before any close generation arrives");
     Check(stop_prime_order==std::vector<int>({0,1}),
           "the icon mask re-prime lands after the OEM stop in the same transaction");
+    // The icon face must morph along the content's exact rect path: the
+    // request's declared start/end rects are the content's own endpoints; the
+    // icon's virtual crop is texture padding, never a morph endpoint.
+    Reset();Param path_open(2);Seed(path_open);AddChild();
+    Param path_open_icon;
+    TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,path_open_icon.Reference());
+    Check(Spring(path_open_icon.Reference(),"width").start==171&&
+          Spring(path_open_icon.Reference(),"height").start==171&&
+          Spring(path_open_icon.Reference(),"centerX").start==165.5f&&
+          Spring(path_open_icon.Reference(),"centerY").start==885.5f&&
+          Spring(path_open_icon.Reference(),"width").end==1120&&
+          Spring(path_open_icon.Reference(),"height").end==2436,
+          "the opening icon face morphs along the content's declared rect path");
+    Reset();Param path_close(2);Reverse(path_close);Seed(path_close);AddChild();
+    Param path_close_icon;Reverse(path_close_icon);
+    TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,path_close_icon.Reference());
+    Check(Spring(path_close_icon.Reference(),"width").end==171&&
+          Spring(path_close_icon.Reference(),"height").end==171&&
+          Spring(path_close_icon.Reference(),"centerX").end==165.5f&&
+          Spring(path_close_icon.Reference(),"centerY").end==885.5f,
+          "the closing icon face lands on the content's declared square");
+    // The icon face must mirror the content face's rect springs exactly: both
+    // faces are drawn by the same SF routine from their AnimTarget's live
+    // springs, so a preserved presentation on the icon's own snapshot may
+    // never divert its springs from the content's declared path.
+    Reset();Param mirror_app(2);Seed(mirror_app);AddChild();
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_last[0].adjusting=true;
+        g_last[0].presentation_start={326,709,326,709};
+    }
+    Param mirror_app_tune(2);
+    TuneParent(reinterpret_cast<void*>(0x2020),&app_control,mirror_app_tune.Reference());
+    Param mirror_icon;
+    TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,mirror_icon.Reference());
+    Check(Spring(mirror_icon.Reference(),"width").start==Spring(mirror_app_tune.Reference(),"width").start&&
+          Spring(mirror_icon.Reference(),"height").start==Spring(mirror_app_tune.Reference(),"height").start&&
+          Spring(mirror_icon.Reference(),"centerX").start==Spring(mirror_app_tune.Reference(),"centerX").start&&
+          Spring(mirror_icon.Reference(),"centerY").start==Spring(mirror_app_tune.Reference(),"centerY").start&&
+          Spring(mirror_icon.Reference(),"width").end==Spring(mirror_app_tune.Reference(),"width").end&&
+          Spring(mirror_icon.Reference(),"height").end==Spring(mirror_app_tune.Reference(),"height").end,
+          "the icon face mirrors the content's rect springs exactly");
+    // The SF teardown is flag-driven: an asynchronous batch member's stop can
+    // wipe the mask after both same-transaction re-primes of the batch have
+    // already landed. Only a deferred re-assertion in a later standalone
+    // transaction survives that teardown pass.
+    auto race_scenario=[&](bool keeper,intptr_t txn_source,intptr_t txn_icon) {
+        Reset();g_keeper_enabled=keeper;
+        Param race_open(2);Seed(race_open);AddChild();
+        Param race_icon;TuneParent(reinterpret_cast<void*>(0x5678),&icon_control,race_icon.Reference());
+        Check(prepared==1,"established icon before the racing stop batch");
+        Stop(reinterpret_cast<void*>(txn_source),&app_control,77);
+        Stop(reinterpret_cast<void*>(txn_icon),&icon_control,77);
+        stop_prime_order.push_back(0); // the late async member's teardown pass
+        deferred_applies=0;
+        ReprimeKeeperApply();
+    };
+    race_scenario(false,0xB1,0xB2);
+    Check(stop_prime_order.back()==0&&deferred_applies==0,
+          "without the deferred re-assert a late stop teardown leaves the icon mask dead");
+    race_scenario(true,0xB3,0xB4);
+    Check(stop_prime_order.back()==1&&deferred_applies==1&&prepared_transaction!=nullptr&&
+          prepared_transaction!=reinterpret_cast<void*>(0xB3)&&
+          prepared_transaction!=reinterpret_cast<void*>(0xB4),
+          "the deferred keeper re-asserts the icon mask after the late stop teardown");
     Reset();AnchorPrestart();accept_group=false;defer_group=true;Param pending_close(2);Reverse(pending_close);
     Observe(&prestart_control,pending_close.Reference(),false);
     TuneParent(reinterpret_cast<void*>(0x1234),&prestart_control,pending_close.Reference());
